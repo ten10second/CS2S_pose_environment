@@ -57,7 +57,7 @@ VIGOR dataset from https://github.com/Jeff-Zilence/VIGOR & https://github.com/tu
 KITTI_location dataset from https://github.com/YujiaoShi/HighlyAccurate
 ```
 ## :three: Checkpoints Downloading
-Checkpoints can be found from [this url](http://pan.njust.edu.cn/#/link/zgGzHgpgIuoBBFGIv22v).
+Checkpoints can be found from [this url](http://pan.njust.edu.cn/#/link/zgGzHgpgIuoBBFGIv22v) or [this url](https://1drv.ms/f/c/86d953bfc66eb903/IgBZnCNAt101TJhiB-uc49pSAbAkpVMQoeo3frjvjTkueXA?e=c9baJ8).
 
 ## :four: Test and visualization
 ```bash
@@ -96,8 +96,6 @@ If our work is useful for your research, please consider citing:
 # :sparkles: Acknowledgement
 
 - This project is based on [Stable Diffusion](https://github.com/CompVis/stable-diffusion)
-
-- This Readme is inspired by [CodeFormer](https://github.com/sczhou/CodeFormer) and [RobustSIRR](https://github.com/ZhenboSong/RobustSIRR)
 
 - For More Awesome Sat2Grd methods, you can refer to :+1: [Sat2Den](https://github.com/qianmingduowan/Sat2Density), [Sat2Str](https://github.com/YujiaoShi/Sat2StrPanoramaSynthesis)
 
