@@ -133,11 +133,8 @@ class KITTI_DDIMSampler(object):
         self.scale_factor = scale_factor
         self.ddpm_num_timesteps = model.timesteps
         self.schedule = schedule
-        self.clip_model = (
-            clip.load("ViT-B/16", device=self.model.device, jit=False)[0].eval().requires_grad_(False)
-        )
-        
-        self.clip_size = self.clip_model.visual.input_resolution
+        self.clip_model = None
+        self.clip_size = 224
         self.clip_normalize = transforms.Normalize(
             mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
         )
@@ -150,6 +147,13 @@ class KITTI_DDIMSampler(object):
             self.grd_solver = grd_solve(pth_path=grd_solve_pth).to(self.model.device)
         if sat_solve_pth != None:
             self.sat_solver = sat_solve(pth_path=sat_solve_pth, encoder_model = pre_AE_model.encoder, quant_conv = pre_AE_model.quant_conv).to(self.model.device)
+
+    def ensure_clip_model(self):
+        if self.clip_model is None:
+            self.clip_model = (
+                clip.load("ViT-B/16", device=self.model.device, jit=False)[0].eval().requires_grad_(False)
+            )
+            self.clip_size = self.clip_model.visual.input_resolution
 
     def d_clip_loss(self, x, y, use_cosine=False):
         x = F.normalize(x, dim=-1)
@@ -424,10 +428,12 @@ class KITTI_DDIMSampler(object):
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
                left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None,
+               cond_init_grd=None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
-               **kwargs
+        **kwargs
                ):
         if txt is not None:
+            self.ensure_clip_model()
             txt = self.clip_model.encode_text(
                 clip.tokenize(txt).to(conditioning.device)
             ).float()
@@ -462,7 +468,8 @@ class KITTI_DDIMSampler(object):
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
-                                                    left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta
+                                                    left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta,
+                                                    cond_init_grd = cond_init_grd
                                                     )
         return samples, intermediates
 
@@ -472,7 +479,8 @@ class KITTI_DDIMSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None,
+                      cond_init_grd=None):
         device = self.model.device
         b = shape[0]
         if x_T is None:
@@ -508,7 +516,8 @@ class KITTI_DDIMSampler(object):
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
-                                      unconditional_conditioning=unconditional_conditioning,left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+                                      unconditional_conditioning=unconditional_conditioning,left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta,
+                                      cond_init_grd = cond_init_grd)
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -523,19 +532,28 @@ class KITTI_DDIMSampler(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+                      left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None,
+                      cond_init_grd=None):
         b, *_, device = *x.shape, x.device
 
-        # control_grd_para = self.model.control_grd(x, t, cond_init_grd = cond_grd, cond_txt = c)
+        control_grd_para = None
+        if cond_init_grd is not None:
+            control_grd_para = self.model.control_grd(x, t, cond_init_grd = cond_init_grd, cond_txt = c)
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.denoise_model(x, t, context = c, control_grd = None, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            e_t = self.model.denoise_model(x, t, context = c, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
-            cond_sat = torch.cat([cond_sat] * 2)
-            cond_grd = torch.cat([cond_grd] * 2)
             c_in = torch.cat([unconditional_conditioning, c])
-            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, cond_sat = cond_sat, cond_grd = cond_grd,cond_txt = c_in).chunk(2)
+            left_camera_k_in = torch.cat([left_camera_k] * 2) if left_camera_k is not None else None
+            gt_shift_x_in = torch.cat([gt_shift_x] * 2) if gt_shift_x is not None else None
+            gt_shift_y_in = torch.cat([gt_shift_y] * 2) if gt_shift_y is not None else None
+            theta_in = torch.cat([theta] * 2) if theta is not None else None
+            control_grd_para = None
+            if cond_init_grd is not None:
+                cond_init_grd_in = torch.cat([cond_init_grd] * 2)
+                control_grd_para = self.model.control_grd(x_in, t_in, cond_init_grd = cond_init_grd_in, cond_txt = c_in)
+            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, context = c_in, control_grd = control_grd_para, left_camera_k = left_camera_k_in, gt_shift_x = gt_shift_x_in, gt_shift_y = gt_shift_y_in, theta = theta_in).chunk(2)
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:
@@ -570,7 +588,8 @@ class KITTI_DDIMSampler(object):
 
     def condition_score(self, x, c, txt_embed, orin_sat_feat, inter_ref, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None,
+                      cond_init_grd=None):
         if index<=1:
             txt_embed = None
             orin_sat_feat = None
@@ -626,5 +645,6 @@ class KITTI_DDIMSampler(object):
                                     noise_dropout=noise_dropout, score_corrector=score_corrector,
                                     corrector_kwargs=corrector_kwargs,
                                     unconditional_guidance_scale=unconditional_guidance_scale,
-                                    unconditional_conditioning=unconditional_conditioning,left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+                                    unconditional_conditioning=unconditional_conditioning,left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta,
+                                    cond_init_grd = cond_init_grd)
             return x_prev, pred_x0

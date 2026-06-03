@@ -1,5 +1,5 @@
 import os,sys
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
 
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
@@ -94,8 +94,9 @@ if __name__ == "__main__":
 
     step = 0
     if 'KITTI' in config.data.params.test.target:
-        opt.grd_solve_pth = 'result/localization_corr/KITTI/grd_solver.pth'
-        opt.sat_solve_pth = 'result/localization_corr/KITTI/sat_solver.pth'
+        if opt.function > 1:
+            opt.grd_solve_pth = 'result/localization_corr/KITTI/grd_solver.pth'
+            opt.sat_solve_pth = 'result/localization_corr/KITTI/sat_solver.pth'
         sampler = KITTI_DDIMSampler(model.DDPM, model.pre_AE_model, model.scale_factor, grd_solve_pth=opt.grd_solve_pth, sat_solve_pth=opt.sat_solve_pth)
     elif 'CVUSA' in config.data.params.test.target:
         opt.grd_solve_pth = 'result/localization_corr/CVUSA/grd_solver.pth'

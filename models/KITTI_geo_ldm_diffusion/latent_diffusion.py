@@ -130,19 +130,120 @@ class DDPM(pl.LightningModule):
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
 
-    def t_losses(self, x_start, cond_init_grd=None, cond_sat=None, cond_txt = None, noise=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None):
+    def t_losses(self, x_start, cond_init_grd=None, cond_sat=None, cond_txt = None, noise=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0):
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],), device=x_start.device).long()
-        return self.p_losses(x_start, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat, cond_txt = cond_txt,  left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+        return self.p_losses(x_start, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat, cond_txt = cond_txt,  left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, loss_mask=loss_mask, loss_mask_weight=loss_mask_weight, x0_loss_weight=x0_loss_weight, extra_loss_mask=extra_loss_mask, extra_loss_mask_weight=extra_loss_mask_weight, extra_x0_loss_weight=extra_x0_loss_weight, image_x0_loss_weight=image_x0_loss_weight, crop_image_x0_loss_weight=crop_image_x0_loss_weight, point_image_x0_loss_weight=point_image_x0_loss_weight, object_lpips_loss_weight=object_lpips_loss_weight, x0_image_target=x0_image_target, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=object_lpips_model, object_lpips_padding=object_lpips_padding, object_lpips_size=object_lpips_size, object_lpips_max_boxes=object_lpips_max_boxes, image_decoder=image_decoder, latent_scale_factor=latent_scale_factor)
 
-    def p_losses(self, x_start, t, cond_init_grd = None, cond_sat = None, cond_txt = None, noise=None,  left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None):
+    def _prepare_loss_mask(self, loss_mask, loss_raw):
+        if loss_mask is None:
+            return None
+        if loss_mask.ndim == 3:
+            loss_mask = loss_mask[:, None]
+        if loss_mask.shape[-2:] != loss_raw.shape[-2:]:
+            loss_mask = F.interpolate(loss_mask.float(), size=loss_raw.shape[-2:], mode="area")
+        return loss_mask.to(device=loss_raw.device, dtype=loss_raw.dtype).clamp(0.0, 1.0)
+
+    def _masked_loss_mean(self, loss_raw, loss_mask):
+        loss_mask = self._prepare_loss_mask(loss_mask, loss_raw)
+        if loss_mask is None:
+            return loss_raw.mean(dim=[1, 2, 3]).mean()
+        masked = loss_raw * loss_mask
+        denom = loss_mask.mean(dim=[1, 2, 3]).clamp_min(1e-6)
+        return (masked.mean(dim=[1, 2, 3]) / denom).mean()
+
+    def _object_lpips_loss(self, pred_image, target_image, object_boxes, object_box_valid, lpips_model, padding, crop_size, max_boxes):
+        if lpips_model is None or object_boxes is None or object_box_valid is None:
+            return pred_image.new_tensor(0.0)
+        losses = []
+        _, _, h, w = pred_image.shape
+        boxes = object_boxes.to(device=pred_image.device)
+        valid = object_box_valid.to(device=pred_image.device)
+        for batch_idx in range(pred_image.shape[0]):
+            valid_indices = torch.nonzero(valid[batch_idx] > 0.5, as_tuple=False).flatten()
+            if valid_indices.numel() == 0:
+                continue
+            if max_boxes > 0:
+                valid_indices = valid_indices[:max_boxes]
+            for box_idx in valid_indices:
+                box = boxes[batch_idx, box_idx]
+                x0 = max(0, int(torch.floor(box[0]).detach().cpu()) - int(padding))
+                y0 = max(0, int(torch.floor(box[1]).detach().cpu()) - int(padding))
+                x1 = min(w - 1, int(torch.ceil(box[2]).detach().cpu()) + int(padding))
+                y1 = min(h - 1, int(torch.ceil(box[3]).detach().cpu()) + int(padding))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                pred_crop = pred_image[batch_idx : batch_idx + 1, :, y0 : y1 + 1, x0 : x1 + 1]
+                target_crop = target_image[batch_idx : batch_idx + 1, :, y0 : y1 + 1, x0 : x1 + 1]
+                if crop_size > 0:
+                    pred_crop = F.interpolate(pred_crop, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+                    target_crop = F.interpolate(target_crop, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+                losses.append(lpips_model(target_crop, pred_crop).mean())
+        if not losses:
+            return pred_image.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
+    def p_losses(self, x_start, t, cond_init_grd = None, cond_sat = None, cond_txt = None, noise=None,  left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0):
         noise = default(noise, lambda: torch.randn_like(x_start)) 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        # control_grd_para =  self.control_grd(x_noisy, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat)
-        model_out = self.denoise_model(x_noisy, t, context = cond_txt, control_grd = None, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+        control_grd_para = None
+        if cond_init_grd is not None:
+            control_grd_para = self.control_grd(x_noisy, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat, cond_txt = cond_txt)
+        model_out = self.denoise_model(x_noisy, t, context = cond_txt, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
 
         target = noise
         # loss = (target - model_out).abs().mean()
-        loss = F.mse_loss(target, model_out, reduction='none').mean(dim=[1, 2, 3]).mean()
+        loss_raw = F.mse_loss(target, model_out, reduction='none')
+        if loss_mask is not None and loss_mask_weight > 0.0:
+            prepared_mask = self._prepare_loss_mask(loss_mask, loss_raw)
+            weight = 1.0 + float(loss_mask_weight) * prepared_mask
+            loss_per_sample = (loss_raw * weight).mean(dim=[1, 2, 3]) / weight.mean(dim=[1, 2, 3]).clamp_min(1e-6)
+            loss = loss_per_sample.mean()
+        else:
+            loss = loss_raw.mean(dim=[1, 2, 3]).mean()
+        if extra_loss_mask is not None and extra_loss_mask_weight > 0.0:
+            loss = loss + float(extra_loss_mask_weight) * self._masked_loss_mean(loss_raw, extra_loss_mask)
+        needs_pred_x0 = (
+            (loss_mask is not None and x0_loss_weight > 0.0)
+            or (extra_loss_mask is not None and extra_x0_loss_weight > 0.0)
+            or (image_x0_loss_weight > 0.0 and x0_image_target is not None and image_loss_mask is not None and image_decoder is not None)
+            or (crop_image_x0_loss_weight > 0.0 and x0_image_target is not None and crop_image_loss_mask is not None and image_decoder is not None)
+            or (point_image_x0_loss_weight > 0.0 and x0_image_target is not None and point_image_loss_mask is not None and image_decoder is not None)
+            or (object_lpips_loss_weight > 0.0 and x0_image_target is not None and object_boxes is not None and object_box_valid is not None and object_lpips_model is not None and image_decoder is not None)
+        )
+        pred_x0 = self.predict_start_from_noise(x_noisy, t=t, noise=model_out) if needs_pred_x0 else None
+        if loss_mask is not None and x0_loss_weight > 0.0:
+            x0_loss_raw = F.mse_loss(x_start, pred_x0, reduction="none")
+            loss = loss + float(x0_loss_weight) * self._masked_loss_mean(x0_loss_raw, loss_mask)
+        if extra_loss_mask is not None and extra_x0_loss_weight > 0.0:
+            x0_loss_raw = F.mse_loss(x_start, pred_x0, reduction="none")
+            loss = loss + float(extra_x0_loss_weight) * self._masked_loss_mean(x0_loss_raw, extra_loss_mask)
+        needs_image_x0 = x0_image_target is not None and image_decoder is not None and (
+            (image_x0_loss_weight > 0.0 and image_loss_mask is not None)
+            or (crop_image_x0_loss_weight > 0.0 and crop_image_loss_mask is not None)
+            or (point_image_x0_loss_weight > 0.0 and point_image_loss_mask is not None)
+            or (object_lpips_loss_weight > 0.0 and object_boxes is not None and object_box_valid is not None and object_lpips_model is not None)
+        )
+        if needs_image_x0:
+            pred_image = image_decoder.decode(pred_x0 * (1.0 / float(latent_scale_factor)))
+            image_loss_raw = F.l1_loss(pred_image, x0_image_target, reduction="none")
+        if image_x0_loss_weight > 0.0 and x0_image_target is not None and image_loss_mask is not None and image_decoder is not None:
+            loss = loss + float(image_x0_loss_weight) * self._masked_loss_mean(image_loss_raw, image_loss_mask)
+        if crop_image_x0_loss_weight > 0.0 and x0_image_target is not None and crop_image_loss_mask is not None and image_decoder is not None:
+            loss = loss + float(crop_image_x0_loss_weight) * self._masked_loss_mean(image_loss_raw, crop_image_loss_mask)
+        if point_image_x0_loss_weight > 0.0 and x0_image_target is not None and point_image_loss_mask is not None and image_decoder is not None:
+            loss = loss + float(point_image_x0_loss_weight) * self._masked_loss_mean(image_loss_raw, point_image_loss_mask)
+        if object_lpips_loss_weight > 0.0 and x0_image_target is not None and object_boxes is not None and object_box_valid is not None and object_lpips_model is not None and image_decoder is not None:
+            object_lpips = self._object_lpips_loss(
+                pred_image,
+                x0_image_target,
+                object_boxes,
+                object_box_valid,
+                object_lpips_model,
+                object_lpips_padding,
+                object_lpips_size,
+                object_lpips_max_boxes,
+            )
+            loss = loss + float(object_lpips_loss_weight) * object_lpips
         # loss = F.mse_loss(target, model_out)
 
         return loss

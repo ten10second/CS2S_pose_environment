@@ -312,7 +312,7 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        return checkpoint(self._forward, (x,), self.parameters(), self.use_checkpoint)
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):
@@ -555,7 +555,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, checkpoint=use_checkpoint
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -610,7 +610,7 @@ class UNetModel(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, checkpoint=use_checkpoint
                         ),
             ResBlock(
                 ch,
@@ -656,7 +656,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, checkpoint=use_checkpoint
                         )
                     )
                 if level and i == num_res_blocks:
@@ -733,16 +733,25 @@ class UNetModel(nn.Module):
             hs.append(h)
         h = self.middle_block(h, emb, context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
 
+        def add_control(feature):
+            residual = control_grd.pop()
+            if residual.shape[-2:] != feature.shape[-2:]:
+                residual = F.interpolate(residual, size=feature.shape[-2:], mode="bilinear", align_corners=False)
+            if residual.shape[1] != feature.shape[1]:
+                raise RuntimeError(f"control channels {residual.shape[1]} do not match feature channels {feature.shape[1]}")
+            return feature + residual.type_as(feature)
+
         if control_grd is not None:
-            h += control_grd.pop()
+            h = add_control(h)
 
         for module in self.output_blocks:
-            # h = th.cat([h, hs.pop() + control_grd.pop()], dim=1)
-            h = th.cat([h, hs.pop()], dim=1)
+            skip = hs.pop()
+            if control_grd is not None and len(control_grd) > 0:
+                skip = add_control(skip)
+            h = th.cat([h, skip], dim=1)
             h = module(h, emb, context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)
         else:
             return self.out(h)
-
