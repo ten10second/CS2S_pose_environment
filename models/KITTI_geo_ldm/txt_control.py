@@ -58,6 +58,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 dynamic_object_lpips_size=64,
                 dynamic_object_lpips_max_boxes=4,
                 dynamic_mask_key="dynamic_mask",
+                static_teacher_consistency_weight=0.0,
+                static_teacher_gate_channel=-1,
                 dynamic_class_token_weight=0.0,
                 dynamic_class_hist_key="dynamic_class_hist",
                 dynamic_class_token_count=8,
@@ -95,6 +97,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.dynamic_object_lpips_size = dynamic_object_lpips_size
         self.dynamic_object_lpips_max_boxes = dynamic_object_lpips_max_boxes
         self.dynamic_mask_key = dynamic_mask_key
+        self.static_teacher_consistency_weight = float(static_teacher_consistency_weight)
+        self.static_teacher_gate_channel = int(static_teacher_gate_channel)
         self.dynamic_class_token_weight = dynamic_class_token_weight
         self.dynamic_class_hist_key = dynamic_class_hist_key
         if dynamic_class_token_weight > 0.0:
@@ -167,7 +171,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
     def dynamic_point_mask(self, lidar_cond, latent_shape):
         if lidar_cond is None or lidar_cond.shape[1] < 2:
             return None
-        mask = (lidar_cond[:, 1:2].float() > 0.0).float()
+        point_channel = 7 if lidar_cond.shape[1] >= 8 else 1
+        mask = (lidar_cond[:, point_channel : point_channel + 1].float() > 0.0).float()
         dilation = int(self.dynamic_point_dilation)
         if dilation > 0:
             kernel = 2 * dilation + 1
@@ -177,7 +182,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
     def dynamic_point_image_mask(self, lidar_cond, image_shape):
         if lidar_cond is None or lidar_cond.shape[1] < 2:
             return None
-        mask = (lidar_cond[:, 1:2].float() > 0.0).float()
+        point_channel = 7 if lidar_cond.shape[1] >= 8 else 1
+        mask = (lidar_cond[:, point_channel : point_channel + 1].float() > 0.0).float()
         target_h, target_w = image_shape[-2:]
         if mask.shape[-2:] != (target_h, target_w):
             mask = F.interpolate(mask, size=(target_h, target_w), mode="nearest")
@@ -186,6 +192,20 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             kernel = 2 * dilation + 1
             mask = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=dilation)
         return mask.clamp(0.0, 1.0)
+
+    def static_teacher_loss_mask(self, lidar_cond, latent_shape):
+        if (
+            lidar_cond is None
+            or self.static_teacher_consistency_weight <= 0.0
+            or self.static_teacher_gate_channel < 0
+            or self.static_teacher_gate_channel >= lidar_cond.shape[1]
+        ):
+            return None
+        gate = lidar_cond[:, self.static_teacher_gate_channel : self.static_teacher_gate_channel + 1].float()
+        gate = gate.clamp(0.0, 1.0)
+        if gate.shape[-2:] != latent_shape[-2:]:
+            gate = F.interpolate(gate, size=latent_shape[-2:], mode="area")
+        return (1.0 - gate).clamp(0.0, 1.0)
 
     def append_dynamic_class_token(self, cond_label, batch=None):
         if self.dynamic_class_tokens is None or self.dynamic_class_token_weight <= 0.0:
@@ -431,6 +451,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         crop_image_loss_mask = self.dynamic_crop_mask(batch[self.dynamic_mask_key].to(outputs.device), outputs.shape) if self.dynamic_crop_image_loss_weight > 0.0 and self.dynamic_mask_key in batch else None
         point_loss_mask = self.dynamic_point_mask(lidar_cond, pre_residual_laten.shape) if (self.dynamic_point_loss_weight > 0.0 or self.dynamic_point_x0_loss_weight > 0.0) else None
         point_image_loss_mask = self.dynamic_point_image_mask(lidar_cond, outputs.shape) if self.dynamic_point_image_loss_weight > 0.0 else None
+        static_teacher_loss_mask = self.static_teacher_loss_mask(lidar_cond, pre_residual_laten.shape)
         object_boxes = batch.get("dynamic_boxes")
         object_box_valid = batch.get("dynamic_box_valid")
         if object_boxes is not None:
@@ -439,7 +460,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             object_box_valid = object_box_valid.to(outputs.device)
         if self.dynamic_object_lpips_weight > 0.0:
             self.evaluate.loss_fn_alex.eval()
-        loss = self.DDPM.t_losses(pre_residual_laten, cond_init_grd=lidar_cond, cond_sat=None, cond_txt = cond_label, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, loss_mask=loss_mask, loss_mask_weight=self.dynamic_loss_weight, x0_loss_weight=self.dynamic_x0_loss_weight, extra_loss_mask=point_loss_mask, extra_loss_mask_weight=self.dynamic_point_loss_weight, extra_x0_loss_weight=self.dynamic_point_x0_loss_weight, image_x0_loss_weight=self.dynamic_image_loss_weight, crop_image_x0_loss_weight=self.dynamic_crop_image_loss_weight, point_image_x0_loss_weight=self.dynamic_point_image_loss_weight, object_lpips_loss_weight=self.dynamic_object_lpips_weight, x0_image_target=outputs, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=self.evaluate.loss_fn_alex, object_lpips_padding=self.dynamic_object_lpips_padding, object_lpips_size=self.dynamic_object_lpips_size, object_lpips_max_boxes=self.dynamic_object_lpips_max_boxes, image_decoder=self.pre_AE_model, latent_scale_factor=self.scale_factor)
+        loss = self.DDPM.t_losses(pre_residual_laten, cond_init_grd=lidar_cond, cond_sat=None, cond_txt = cond_label, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, loss_mask=loss_mask, loss_mask_weight=self.dynamic_loss_weight, x0_loss_weight=self.dynamic_x0_loss_weight, extra_loss_mask=point_loss_mask, extra_loss_mask_weight=self.dynamic_point_loss_weight, extra_x0_loss_weight=self.dynamic_point_x0_loss_weight, image_x0_loss_weight=self.dynamic_image_loss_weight, crop_image_x0_loss_weight=self.dynamic_crop_image_loss_weight, point_image_x0_loss_weight=self.dynamic_point_image_loss_weight, object_lpips_loss_weight=self.dynamic_object_lpips_weight, x0_image_target=outputs, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=self.evaluate.loss_fn_alex, object_lpips_padding=self.dynamic_object_lpips_padding, object_lpips_size=self.dynamic_object_lpips_size, object_lpips_max_boxes=self.dynamic_object_lpips_max_boxes, image_decoder=self.pre_AE_model, latent_scale_factor=self.scale_factor, static_teacher_loss_mask=static_teacher_loss_mask, static_teacher_consistency_weight=self.static_teacher_consistency_weight)
         self.log("L1_loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         return loss
         
@@ -676,7 +697,18 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         if "dynamic_mask" in batch:
             log["dynamic_mask"] = batch["dynamic_mask"].to(pre_residual.device).float()
         if lidar_cond is not None:
-            log["lidar_cond"] = lidar_cond[:, :3].clamp(0, 1)
+            if lidar_cond.shape[1] >= 10:
+                log["lidar_cond"] = torch.cat(
+                    [lidar_cond[:, 0:1], lidar_cond[:, 8:9], lidar_cond[:, 9:10]],
+                    dim=1,
+                ).clamp(0, 1)
+            elif lidar_cond.shape[1] >= 8:
+                log["lidar_cond"] = torch.cat(
+                    [lidar_cond[:, 0:1], lidar_cond[:, 4:5], lidar_cond[:, 7:8]],
+                    dim=1,
+                ).clamp(0, 1)
+            else:
+                log["lidar_cond"] = lidar_cond[:, :3].clamp(0, 1)
         # log["end_reconstructions"] = (pre_residual).clamp(0, 1)
 
         # z = samples_ddim

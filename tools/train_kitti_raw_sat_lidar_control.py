@@ -1,8 +1,8 @@
 import argparse
 import gc
 import json
+import os
 import sys
-from itertools import cycle
 from pathlib import Path
 
 import torch
@@ -13,19 +13,43 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from dataloader.KITTI_raw_sat_lidar import SatLidarRawDataset  # noqa: E402
+from dataloader.kitti_raw_lidar_utils import lidar_condition_channels, lidar_condition_gate_channel  # noqa: E402
+from tools.eval_kitti_raw_sat_lidar_runs import (  # noqa: E402
+    generate_prediction,
+    make_cond_rgb,
+    make_lidar_overlay,
+    make_panel,
+    safe_sample_id,
+    sample_to_batch,
+    save_tensor_image,
+)
 from utils.util import instantiate_from_config  # noqa: E402
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Lightweight KITTI raw sat-lidar training loop.")
     parser.add_argument("--config", default="configs/Boost_Sat2Den/train/KITTI_raw_sat_lidar_dynamic.yaml")
-    parser.add_argument("--condition-mode", default="dynamic_full", choices=["none", "bbox_dynamic", "dynamic_points", "raw_lidar", "dynamic_full"])
+    parser.add_argument("--train-manifest", default="", help="Override train manifest in the config.")
+    parser.add_argument("--val-manifest", default="", help="Override validation manifest in the config.")
+    parser.add_argument(
+        "--condition-mode",
+        default="raw_lidar",
+        choices=[
+            "none",
+            "bbox_dynamic",
+            "dynamic_points",
+            "raw_lidar",
+            "dynamic_full",
+        ],
+    )
     parser.add_argument("--run-name", default="")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=7e-5)
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--save-relative-to-resume", action="store_true", help="Apply --save-every relative to the resume step instead of absolute step numbers.")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--base-model-ckpt", default="", help="Optional full-model checkpoint used as the frozen base for control modes.")
     parser.add_argument("--resume-ckpt", default="", help="Resume model/optimizer state and continue from checkpoint step.")
@@ -33,13 +57,27 @@ def parse_args():
     parser.add_argument("--shuffle", action="store_true", help="Shuffle the train manifest instead of iterating drives in manifest order.")
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--pin-memory", action="store_true", help="Enable DataLoader pinned memory.")
-    parser.add_argument("--dynamic-loss-weight", type=float, default=0.0, help="Extra latent diffusion MSE weight on dynamic_mask pixels.")
-    parser.add_argument("--dynamic-x0-loss-weight", type=float, default=0.0, help="Extra dynamic-mask latent x0 reconstruction loss weight.")
+    parser.add_argument("--prefetch-factor", type=int, default=1, help="DataLoader prefetch factor when workers are enabled.")
+    parser.add_argument(
+        "--dataloader-multiprocessing-context",
+        default="spawn",
+        choices=["", "fork", "spawn", "forkserver"],
+        help="Multiprocessing context for DataLoader workers. spawn avoids forking after CUDA/model init.",
+    )
+    parser.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive between epochs.")
+    parser.add_argument(
+        "--min-system-mem-available-gb",
+        type=float,
+        default=4.0,
+        help="Save an emergency checkpoint and stop if host available memory drops below this value. <=0 disables.",
+    )
+    parser.add_argument("--dynamic-loss-weight", type=float, default=None, help="Extra latent diffusion MSE weight on dynamic_mask pixels.")
+    parser.add_argument("--dynamic-x0-loss-weight", type=float, default=None, help="Extra dynamic-mask latent x0 reconstruction loss weight.")
     parser.add_argument("--dynamic-image-loss-weight", type=float, default=0.0, help="Extra dynamic-mask image-space x0 L1 loss weight.")
     parser.add_argument("--dynamic-crop-image-loss-weight", type=float, default=0.0, help="Extra image-space x0 L1 loss on a padded dynamic crop mask.")
     parser.add_argument("--dynamic-crop-padding", type=int, default=8, help="Pixel padding used to dilate dynamic boxes for --dynamic-crop-image-loss-weight.")
-    parser.add_argument("--dynamic-point-loss-weight", type=float, default=0.0, help="Extra diffusion MSE on dilated dynamic LiDAR point pixels.")
-    parser.add_argument("--dynamic-point-x0-loss-weight", type=float, default=0.0, help="Extra latent x0 loss on dilated dynamic LiDAR point pixels.")
+    parser.add_argument("--dynamic-point-loss-weight", type=float, default=None, help="Extra diffusion MSE on dilated dynamic LiDAR point pixels.")
+    parser.add_argument("--dynamic-point-x0-loss-weight", type=float, default=None, help="Extra latent x0 loss on dilated dynamic LiDAR point pixels.")
     parser.add_argument("--dynamic-point-image-loss-weight", type=float, default=0.0, help="Extra image-space x0 L1 loss on dilated dynamic LiDAR point pixels.")
     parser.add_argument("--dynamic-point-dilation", type=int, default=4, help="Image-pixel dilation radius for dynamic point loss masks.")
     parser.add_argument("--dynamic-object-lpips-weight", type=float, default=0.0, help="Extra LPIPS loss on projected dynamic object crops from predicted x0.")
@@ -51,7 +89,9 @@ def parse_args():
     parser.add_argument("--min-dynamic-mask-coverage", type=float, default=0.0, help="When >0, redraw batches until dynamic_mask coverage reaches this value.")
     parser.add_argument("--max-sample-attempts", type=int, default=1, help="Maximum draws per optimizer step when dynamic batch filters are enabled.")
     parser.add_argument("--control-hidden-channels", type=int, default=128, help="Hidden channels for multi-scale LiDAR control.")
-    parser.add_argument("--control-scale", type=float, default=1.0, help="Multiplier applied to LiDAR control residuals.")
+    parser.add_argument("--control-scale", type=float, default=None, help="Multiplier applied to LiDAR control residuals.")
+    parser.add_argument("--static-teacher-consistency-weight", type=float, default=None, help="MSE weight that keeps LiDAR epsilon prediction close to satellite-only teacher outside the gate.")
+    parser.add_argument("--static-teacher-gate-channel", type=int, default=None, help="LiDAR condition channel used as geometry modification gate for static teacher consistency.")
     parser.add_argument("--control-semantic-class-count", type=int, default=0, help="When >0, add trainable per-class embeddings to multiscale LiDAR control.")
     parser.add_argument("--control-semantic-class-scale", type=float, default=1.0, help="Scale for per-class LiDAR control embeddings.")
     parser.add_argument("--dynamic-class-token-weight", type=float, default=0.0, help="Append a trainable dynamic class summary token to cross-attention when > 0.")
@@ -59,6 +99,14 @@ def parse_args():
     parser.add_argument("--lidar-unfreeze-out", action="store_true", help="Also train the final UNet output layer in LiDAR control mode.")
     parser.add_argument("--lidar-unfreeze-transformers", default="none", choices=["none", "input", "middle", "output", "output_middle", "all"], help="Also train selected UNet SpatialTransformer modules in LiDAR control mode.")
     parser.add_argument("--lidar-unet-lr-scale", type=float, default=0.25, help="LR multiplier for locally unfrozen UNet params.")
+    parser.add_argument("--snapshot-every", type=int, default=0, help="When >0, save generated validation panels every N steps.")
+    parser.add_argument("--snapshot-manifest", default="", help="Manifest used for fixed validation snapshot panels.")
+    parser.add_argument("--snapshot-num-samples", type=int, default=4)
+    parser.add_argument("--snapshot-ddim-steps", type=int, default=20)
+    parser.add_argument("--snapshot-seed", type=int, default=2026)
+    parser.add_argument("--snapshot-guidance-scale", type=float, default=7.5)
+    parser.add_argument("--snapshot-eta", type=float, default=1.0)
+    parser.add_argument("--snapshot-temperature", type=float, default=1.0)
     parser.add_argument("--out-root", default="results/sat_lidar_dynamic")
     return parser.parse_args()
 
@@ -76,6 +124,42 @@ def scalar(value):
     return float(value)
 
 
+def _proc_rss_mb():
+    try:
+        with Path("/proc/self/statm").open("r") as handle:
+            fields = handle.readline().split()
+        rss_pages = int(fields[1])
+        return rss_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (OSError, IndexError, ValueError):
+        return -1.0
+
+
+def _mem_available_mb():
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return -1.0
+
+
+def resource_metrics():
+    metrics = {
+        "cpu_rss_mb": round(_proc_rss_mb(), 2),
+        "mem_available_mb": round(_mem_available_mb(), 2),
+    }
+    if torch.cuda.is_available():
+        metrics.update(
+            {
+                "cuda_allocated_mb": round(torch.cuda.memory_allocated() / (1024 * 1024), 2),
+                "cuda_reserved_mb": round(torch.cuda.memory_reserved() / (1024 * 1024), 2),
+                "cuda_max_allocated_mb": round(torch.cuda.max_memory_allocated() / (1024 * 1024), 2),
+            }
+        )
+    return metrics
+
+
 def configure_for_mode(cfg, mode, batch_size, num_workers):
     cfg.data.params.batch_size = batch_size
     cfg.data.params.num_workers = num_workers
@@ -90,19 +174,25 @@ def configure_for_mode(cfg, mode, batch_size, num_workers):
     return cfg
 
 
-def configure_multiscale_control(cfg, hidden_channels, control_scale, semantic_class_count=0, semantic_class_scale=1.0):
+def configure_multiscale_control(cfg, mode, hidden_channels, control_scale, semantic_class_count=0, semantic_class_scale=1.0):
     control = cfg.model.params.DDPM_config.params.control_grd
     unet = cfg.model.params.DDPM_config.params.unet_config.params
+    gate_channel = lidar_condition_gate_channel(mode)
+    is_geometry = gate_channel >= 0
+    semantic_free_modes = {"none", "dynamic_points"}
+    semantic_class_count = 0 if mode in semantic_free_modes else int(semantic_class_count)
     control.target = "models.KITTI_geo_ldm.lidar_condition_model.LidarMultiScaleControl"
-    control.params.in_channels = 4
+    control.params.in_channels = lidar_condition_channels(mode)
     control.params.model_channels = unet.model_channels
     control.params.channel_mult = list(unet.channel_mult)
     control.params.num_res_blocks = unet.num_res_blocks
     control.params.hidden_channels = hidden_channels
     control.params.middle_channels = unet.model_channels * list(unet.channel_mult)[-1]
-    control.params.control_scale = control_scale
+    control.params.control_scale = float(control_scale)
     control.params.semantic_class_count = int(semantic_class_count)
     control.params.semantic_class_scale = float(semantic_class_scale)
+    control.params.gate_channel = gate_channel
+    control.params.gate_residuals = bool(is_geometry)
     return cfg
 
 
@@ -204,19 +294,50 @@ def build_sample_order(dataset, shuffle, seed, start_step, batch_size, dynamic_o
     return order[start_offset:] + order[:start_offset]
 
 
-def build_train_loader(dataset, batch_size, num_workers, shuffle, seed, start_step, pin_memory, dynamic_oversample_factor):
+def build_train_loader(
+    dataset,
+    batch_size,
+    num_workers,
+    shuffle,
+    seed,
+    start_step,
+    pin_memory,
+    dynamic_oversample_factor,
+    multiprocessing_context,
+    prefetch_factor,
+    persistent_workers,
+):
     if shuffle:
         dataset = Subset(dataset, build_sample_order(dataset, shuffle, seed, start_step, batch_size, dynamic_oversample_factor))
     elif dynamic_oversample_factor > 1.0:
         dataset = Subset(dataset, build_sample_order(dataset, True, seed, start_step, batch_size, dynamic_oversample_factor))
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        drop_last=False,
-        pin_memory=pin_memory,
-    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "drop_last": False,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        if multiprocessing_context:
+            loader_kwargs["multiprocessing_context"] = multiprocessing_context
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def next_loader_batch(loader, iterator):
+    try:
+        return next(iterator), iterator
+    except StopIteration:
+        iterator = iter(loader)
+        return next(iterator), iterator
+
+
+def shutdown_loader_iterator(iterator):
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if shutdown is not None:
+        shutdown()
 
 
 def trim_metrics_for_resume(metrics_path, start_step):
@@ -233,8 +354,103 @@ def trim_metrics_for_resume(metrics_path, start_step):
     metrics_path.write_text(("\n".join(kept) + "\n") if kept else "")
 
 
+def interval_due(step, start_step, every, relative_to_resume=False):
+    if every <= 0:
+        return False
+    offset = step - start_step if relative_to_resume else step
+    return offset > 0 and offset % every == 0
+
+
+def save_validation_snapshots(model, args, out_dir, step):
+    if not args.snapshot_manifest or args.snapshot_num_samples <= 0:
+        return
+    manifest_path = Path(args.snapshot_manifest)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Snapshot manifest not found: {manifest_path}")
+
+    snapshot_root = out_dir / "val_snapshots" / f"step_{step:06d}"
+    dataset = SatLidarRawDataset(
+        manifest=str(manifest_path),
+        condition_mode=args.condition_mode,
+        image_height=128,
+        image_width=512,
+        sat_size=256,
+        max_depth=80.0,
+        align_satellite_to_camera=True,
+    )
+    was_training = model.training
+    model.eval()
+    records = []
+    try:
+        with torch.no_grad():
+            for idx in range(min(args.snapshot_num_samples, len(dataset))):
+                sample = dataset[idx]
+                sample_id = sample["sample_id"]
+                batch = sample_to_batch(sample)
+                pred, target = generate_prediction(
+                    model,
+                    batch,
+                    args.condition_mode,
+                    ddim_steps=args.snapshot_ddim_steps,
+                    seed=args.snapshot_seed + idx,
+                    guidance_scale=args.snapshot_guidance_scale,
+                    eta=args.snapshot_eta,
+                    temperature=args.snapshot_temperature,
+                    lidar_probe="normal",
+                )
+
+                safe_id = safe_sample_id(sample_id)
+                gt_path = snapshot_root / "images" / "gt" / f"{safe_id}.png"
+                pred_path = snapshot_root / "images" / args.condition_mode / f"{safe_id}.png"
+                overlay_path = snapshot_root / "images" / "lidar_overlay" / f"{safe_id}.png"
+                cond_path = snapshot_root / "images" / "lidar_cond" / f"{safe_id}.png"
+
+                save_tensor_image(target[0], gt_path)
+                save_tensor_image(pred[0], pred_path)
+                overlay_path.parent.mkdir(parents=True, exist_ok=True)
+                make_lidar_overlay(target[0], sample["lidar_cond"], sample["dynamic_mask"]).save(overlay_path)
+                save_tensor_image(make_cond_rgb(sample["lidar_cond"]), cond_path)
+                panel_path = make_panel(snapshot_root, sample_id, gt_path, overlay_path, {args.condition_mode: pred_path})
+                records.append(
+                    {
+                        "step": step,
+                        "sample_index": idx,
+                        "sample_id": sample_id,
+                        "gt_path": str(gt_path),
+                        "pred_path": str(pred_path),
+                        "overlay_path": str(overlay_path),
+                        "cond_path": str(cond_path),
+                        "panel_path": panel_path,
+                    }
+                )
+                del batch, pred, target
+    finally:
+        if was_training:
+            model.train()
+        torch.cuda.empty_cache()
+
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    (snapshot_root / "snapshot_records.json").write_text(json.dumps(records, indent=2, sort_keys=True))
+    print(json.dumps({"snapshot_step": step, "snapshot_dir": str(snapshot_root), "num_samples": len(records)}, sort_keys=True))
+
+
 def main():
     args = parse_args()
+    raw_geometry_modes = set()
+    if args.control_scale is None:
+        args.control_scale = 1.0
+    if args.dynamic_loss_weight is None:
+        args.dynamic_loss_weight = 0.0 if args.condition_mode in raw_geometry_modes else 4.0
+    if args.dynamic_x0_loss_weight is None:
+        args.dynamic_x0_loss_weight = 0.0 if args.condition_mode in raw_geometry_modes else 0.25
+    if args.dynamic_point_loss_weight is None:
+        args.dynamic_point_loss_weight = 0.0 if args.condition_mode in raw_geometry_modes else 2.0
+    if args.dynamic_point_x0_loss_weight is None:
+        args.dynamic_point_x0_loss_weight = 0.0 if args.condition_mode in raw_geometry_modes else 0.25
+    if args.static_teacher_consistency_weight is None:
+        args.static_teacher_consistency_weight = 0.25 if args.condition_mode in raw_geometry_modes else 0.0
+    if args.static_teacher_gate_channel is None:
+        args.static_teacher_gate_channel = lidar_condition_gate_channel(args.condition_mode)
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -242,9 +458,14 @@ def main():
     torch.manual_seed(args.seed)
 
     cfg = OmegaConf.load(args.config)
+    if args.train_manifest:
+        cfg.data.params.train.params.manifest = args.train_manifest
+    if args.val_manifest:
+        cfg.data.params.test.params.manifest = args.val_manifest
     cfg = configure_for_mode(cfg, args.condition_mode, args.batch_size, args.num_workers)
     cfg = configure_multiscale_control(
         cfg,
+        args.condition_mode,
         args.control_hidden_channels,
         args.control_scale,
         args.control_semantic_class_count,
@@ -263,7 +484,14 @@ def main():
     cfg.model.params.dynamic_object_lpips_padding = args.dynamic_object_lpips_padding
     cfg.model.params.dynamic_object_lpips_size = args.dynamic_object_lpips_size
     cfg.model.params.dynamic_object_lpips_max_boxes = args.dynamic_object_lpips_max_boxes
-    cfg.model.params.dynamic_class_token_weight = args.dynamic_class_token_weight
+    cfg.model.params.static_teacher_consistency_weight = args.static_teacher_consistency_weight
+    cfg.model.params.static_teacher_gate_channel = args.static_teacher_gate_channel
+    effective_dynamic_class_token_weight = (
+        0.0
+        if args.condition_mode in {"none", "dynamic_points"}
+        else args.dynamic_class_token_weight
+    )
+    cfg.model.params.dynamic_class_token_weight = effective_dynamic_class_token_weight
     cfg.model.params.lidar_unfreeze_output_blocks = args.lidar_unfreeze_output_blocks
     cfg.model.params.lidar_unfreeze_out = args.lidar_unfreeze_out
     cfg.model.params.lidar_unfreeze_transformers = args.lidar_unfreeze_transformers
@@ -317,8 +545,11 @@ def main():
         start_step,
         args.pin_memory,
         args.dynamic_oversample_factor,
+        args.dataloader_multiprocessing_context,
+        args.prefetch_factor,
+        args.persistent_workers,
     )
-    iterator = cycle(loader)
+    iterator = iter(loader)
 
     metrics_path = metrics_dir / "train_metrics.jsonl"
     if args.resume_ckpt:
@@ -327,7 +558,9 @@ def main():
         for step in range(start_step + 1, args.steps + 1):
             sample_attempts = 0
             while True:
-                batch = move_batch_to_cuda(next(iterator))
+                batch_cpu, iterator = next_loader_batch(loader, iterator)
+                batch = move_batch_to_cuda(batch_cpu)
+                del batch_cpu
                 sample_attempts += 1
                 num_dynamic_points = int(batch["num_projected_dynamic_points"].sum().detach().cpu()) if "num_projected_dynamic_points" in batch else 0
                 dynamic_mask_coverage = float(batch["dynamic_mask"].float().mean().detach().cpu()) if "dynamic_mask" in batch else 0.0
@@ -335,16 +568,19 @@ def main():
                 enough_mask = dynamic_mask_coverage >= args.min_dynamic_mask_coverage
                 if (enough_points and enough_mask) or sample_attempts >= max(1, args.max_sample_attempts):
                     break
+                del batch
             optimizer.zero_grad(set_to_none=True)
             loss = model.training_step(batch, step)
             loss.backward()
             optimizer.step()
+            loss_value = scalar(loss)
+            num_dynamic_boxes = int(batch["num_dynamic_boxes"].sum().detach().cpu()) if "num_dynamic_boxes" in batch else 0
 
             record = {
                 "step": step,
                 "condition_mode": args.condition_mode,
-                "loss": scalar(loss),
-                "num_dynamic_boxes": int(batch["num_dynamic_boxes"].sum().detach().cpu()) if "num_dynamic_boxes" in batch else 0,
+                "loss": loss_value,
+                "num_dynamic_boxes": num_dynamic_boxes,
                 "num_projected_dynamic_points": num_dynamic_points,
                 "dynamic_mask_coverage": dynamic_mask_coverage,
                 "dynamic_loss_weight": args.dynamic_loss_weight,
@@ -360,9 +596,13 @@ def main():
                 "dynamic_object_lpips_padding": args.dynamic_object_lpips_padding,
                 "dynamic_object_lpips_size": args.dynamic_object_lpips_size,
                 "dynamic_object_lpips_max_boxes": args.dynamic_object_lpips_max_boxes,
+                "static_teacher_consistency_weight": args.static_teacher_consistency_weight,
+                "static_teacher_gate_channel": args.static_teacher_gate_channel,
                 "dynamic_oversample_factor": args.dynamic_oversample_factor,
-                "dynamic_class_token_weight": args.dynamic_class_token_weight,
-                "control_semantic_class_count": args.control_semantic_class_count,
+                "dynamic_class_token_weight": effective_dynamic_class_token_weight,
+                "control_semantic_class_count": int(
+                    cfg.model.params.DDPM_config.params.control_grd.params.semantic_class_count
+                ),
                 "control_semantic_class_scale": args.control_semantic_class_scale,
                 "lidar_unfreeze_output_blocks": args.lidar_unfreeze_output_blocks,
                 "lidar_unfreeze_out": args.lidar_unfreeze_out,
@@ -371,15 +611,41 @@ def main():
                 "min_dynamic_points": args.min_dynamic_points,
                 "min_dynamic_mask_coverage": args.min_dynamic_mask_coverage,
                 "sample_attempts": sample_attempts,
+                "num_workers": args.num_workers,
+                "prefetch_factor": args.prefetch_factor,
+                "dataloader_multiprocessing_context": args.dataloader_multiprocessing_context,
+                "pin_memory": args.pin_memory,
+                "persistent_workers": args.persistent_workers,
             }
+            record.update(resource_metrics())
             metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
             metrics_file.flush()
             if args.log_every > 0 and (step == 1 or step % args.log_every == 0 or step == args.steps):
                 print(json.dumps(record, sort_keys=True))
 
-            if args.save_every > 0 and step % args.save_every == 0:
+            checkpoint_due = interval_due(step, start_step, args.save_every, args.save_relative_to_resume)
+            snapshot_due = interval_due(step, start_step, args.snapshot_every, args.save_relative_to_resume)
+            mem_available_mb = float(record.get("mem_available_mb", -1.0))
+            if (
+                args.min_system_mem_available_gb > 0
+                and mem_available_mb >= 0
+                and mem_available_mb < args.min_system_mem_available_gb * 1024.0
+            ):
+                emergency_path = ckpt_dir / f"emergency_step_{step:06d}.pt"
+                shutdown_loader_iterator(iterator)
+                save_checkpoint(emergency_path, model, optimizer, step, args.condition_mode, args.base_model_ckpt)
+                raise SystemExit(
+                    f"stopped at step {step}: MemAvailable={mem_available_mb:.1f} MB below "
+                    f"{args.min_system_mem_available_gb:.1f} GB; saved {emergency_path}"
+                )
+            del batch, loss
+            if checkpoint_due:
                 save_checkpoint(ckpt_dir / f"step_{step:06d}.pt", model, optimizer, step, args.condition_mode, args.base_model_ckpt)
+            if snapshot_due:
+                torch.cuda.empty_cache()
+                save_validation_snapshots(model, args, out_dir, step)
 
+    shutdown_loader_iterator(iterator)
     save_checkpoint(ckpt_dir / "last.pt", model, optimizer, args.steps, args.condition_mode, args.base_model_ckpt)
     print(f"saved {metrics_path}")
     print(f"saved {ckpt_dir / 'last.pt'}")

@@ -130,9 +130,9 @@ class DDPM(pl.LightningModule):
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
 
-    def t_losses(self, x_start, cond_init_grd=None, cond_sat=None, cond_txt = None, noise=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0):
+    def t_losses(self, x_start, cond_init_grd=None, cond_sat=None, cond_txt = None, noise=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0, static_teacher_loss_mask=None, static_teacher_consistency_weight=0.0):
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],), device=x_start.device).long()
-        return self.p_losses(x_start, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat, cond_txt = cond_txt,  left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, loss_mask=loss_mask, loss_mask_weight=loss_mask_weight, x0_loss_weight=x0_loss_weight, extra_loss_mask=extra_loss_mask, extra_loss_mask_weight=extra_loss_mask_weight, extra_x0_loss_weight=extra_x0_loss_weight, image_x0_loss_weight=image_x0_loss_weight, crop_image_x0_loss_weight=crop_image_x0_loss_weight, point_image_x0_loss_weight=point_image_x0_loss_weight, object_lpips_loss_weight=object_lpips_loss_weight, x0_image_target=x0_image_target, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=object_lpips_model, object_lpips_padding=object_lpips_padding, object_lpips_size=object_lpips_size, object_lpips_max_boxes=object_lpips_max_boxes, image_decoder=image_decoder, latent_scale_factor=latent_scale_factor)
+        return self.p_losses(x_start, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat, cond_txt = cond_txt,  left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, loss_mask=loss_mask, loss_mask_weight=loss_mask_weight, x0_loss_weight=x0_loss_weight, extra_loss_mask=extra_loss_mask, extra_loss_mask_weight=extra_loss_mask_weight, extra_x0_loss_weight=extra_x0_loss_weight, image_x0_loss_weight=image_x0_loss_weight, crop_image_x0_loss_weight=crop_image_x0_loss_weight, point_image_x0_loss_weight=point_image_x0_loss_weight, object_lpips_loss_weight=object_lpips_loss_weight, x0_image_target=x0_image_target, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=object_lpips_model, object_lpips_padding=object_lpips_padding, object_lpips_size=object_lpips_size, object_lpips_max_boxes=object_lpips_max_boxes, image_decoder=image_decoder, latent_scale_factor=latent_scale_factor, static_teacher_loss_mask=static_teacher_loss_mask, static_teacher_consistency_weight=static_teacher_consistency_weight)
 
     def _prepare_loss_mask(self, loss_mask, loss_raw):
         if loss_mask is None:
@@ -182,7 +182,7 @@ class DDPM(pl.LightningModule):
             return pred_image.new_tensor(0.0)
         return torch.stack(losses).mean()
 
-    def p_losses(self, x_start, t, cond_init_grd = None, cond_sat = None, cond_txt = None, noise=None,  left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0):
+    def p_losses(self, x_start, t, cond_init_grd = None, cond_sat = None, cond_txt = None, noise=None,  left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0, static_teacher_loss_mask=None, static_teacher_consistency_weight=0.0):
         noise = default(noise, lambda: torch.randn_like(x_start)) 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         control_grd_para = None
@@ -202,6 +202,27 @@ class DDPM(pl.LightningModule):
             loss = loss_raw.mean(dim=[1, 2, 3]).mean()
         if extra_loss_mask is not None and extra_loss_mask_weight > 0.0:
             loss = loss + float(extra_loss_mask_weight) * self._masked_loss_mean(loss_raw, extra_loss_mask)
+        if (
+            static_teacher_loss_mask is not None
+            and static_teacher_consistency_weight > 0.0
+            and cond_init_grd is not None
+        ):
+            with torch.no_grad():
+                teacher_out = self.denoise_model(
+                    x_noisy,
+                    t,
+                    context=cond_txt,
+                    control_grd=None,
+                    left_camera_k=left_camera_k,
+                    gt_shift_x=gt_shift_x,
+                    gt_shift_y=gt_shift_y,
+                    theta=theta,
+                )
+            teacher_loss_raw = F.mse_loss(model_out, teacher_out, reduction="none")
+            loss = loss + float(static_teacher_consistency_weight) * self._masked_loss_mean(
+                teacher_loss_raw,
+                static_teacher_loss_mask,
+            )
         needs_pred_x0 = (
             (loss_mask is not None and x0_loss_weight > 0.0)
             or (extra_loss_mask is not None and extra_x0_loss_weight > 0.0)

@@ -20,6 +20,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from dataloader.KITTI_raw_sat_lidar import SatLidarRawDataset  # noqa: E402
 from dataloader.kitti_raw_lidar_utils import (  # noqa: E402
+    lidar_condition_channels,
+    lidar_condition_gate_channel,
     load_raw_calibration,
     load_velodyne_points,
     parse_tracklet_xml,
@@ -33,7 +35,14 @@ from models.eval.evaluate import Evaluate_indic  # noqa: E402
 from utils.util import instantiate_from_config  # noqa: E402
 
 
-MODES = ("none", "bbox_dynamic", "dynamic_full")
+PRIMARY_MODES = ("none",)
+PANEL_MODE_ORDER = (
+    "none",
+    "dynamic_points",
+    "bbox_dynamic",
+    "raw_lidar",
+    "dynamic_full",
+)
 
 
 def parse_args():
@@ -41,20 +50,29 @@ def parse_args():
     parser.add_argument("--config", default="configs/Boost_Sat2Den/train/KITTI_raw_sat_lidar_dynamic.yaml")
     parser.add_argument("--manifest", default="dataset/kitti_raw_sat_lidar/val_manifest.jsonl")
     parser.add_argument("--none-ckpt", default="")
+    parser.add_argument("--dynamic-points-ckpt", default="")
     parser.add_argument("--bbox-dynamic-ckpt", default="")
+    parser.add_argument("--raw-lidar-ckpt", default="")
     parser.add_argument("--dynamic-full-ckpt", default="")
     parser.add_argument("--out-dir", default="results/sat_lidar_dynamic/eval_compare")
-    parser.add_argument("--num-samples", type=int, default=4)
-    parser.add_argument("--ddim-steps", type=int, default=10)
+    parser.add_argument("--num-samples", type=int, default=64)
+    parser.add_argument("--min-eval-dynamic-points", type=int, default=100)
+    parser.add_argument("--ddim-steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--guidance-scale", type=float, default=7.5)
     parser.add_argument("--control-scale-override", type=float, default=None, help="Override LiDAR control residual scale at eval time.")
+    parser.add_argument(
+        "--lidar-probe",
+        default="normal",
+        choices=["normal", "zero", "shift_x"],
+        help="Probe non-none LiDAR modes by zeroing or horizontally shifting lidar_cond at inference.",
+    )
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--skip-metrics", action="store_true", help="Only generate and save images; skip full/dynamic metric computation.")
     parser.add_argument("--depth-consistency", action="store_true", help="Run MiDaS/DPT-vs-LiDAR depth consistency sanity metrics.")
     parser.add_argument("--depth-images-dir", default="", help="Existing eval images directory. Defaults to <out-dir>/images.")
-    parser.add_argument("--depth-modes", default="none,dynamic_full", help="Comma-separated modes to read when --depth-consistency is used without checkpoints.")
+    parser.add_argument("--depth-modes", default="none,raw_lidar", help="Comma-separated modes to read when --depth-consistency is used without checkpoints.")
     parser.add_argument("--midas-model", default="MiDaS_small", help="torch.hub MiDaS model name, e.g. MiDaS_small or DPT_Hybrid.")
     parser.add_argument("--midas-hub-dir", default="ckpt/midas_torch/hub", help="Local torch hub cache directory for MiDaS.")
     parser.add_argument("--depth-device", default="cuda")
@@ -69,7 +87,9 @@ def parse_args():
 def mode_ckpts(args):
     return {
         "none": args.none_ckpt,
+        "dynamic_points": args.dynamic_points_ckpt,
         "bbox_dynamic": args.bbox_dynamic_ckpt,
+        "raw_lidar": args.raw_lidar_ckpt,
         "dynamic_full": args.dynamic_full_ckpt,
     }
 
@@ -85,6 +105,8 @@ def configure_for_mode(cfg, mode):
     else:
         cfg.model.params.use_lidar_cond = True
         cfg.model.params.freeze_for_lidar_control = True
+    semantic_free_modes = {"none", "dynamic_points"}
+    cfg.model.params.dynamic_class_token_weight = 0.0 if mode in semantic_free_modes else cfg.model.params.get("dynamic_class_token_weight", 0.0)
     return cfg
 
 
@@ -96,7 +118,10 @@ def configure_from_checkpoint(cfg, mode, payload):
             unet = cfg.model.params.DDPM_config.params.unet_config.params
             control = cfg.model.params.DDPM_config.params.control_grd
             control.target = "models.KITTI_geo_ldm.lidar_condition_model.LidarMultiScaleControl"
-            control.params.in_channels = 4
+            if "stem.0.weight" in control_state:
+                control.params.in_channels = int(control_state["stem.0.weight"].shape[1])
+            else:
+                control.params.in_channels = lidar_condition_channels(mode)
             control.params.model_channels = unet.model_channels
             control.params.channel_mult = list(unet.channel_mult)
             control.params.num_res_blocks = unet.num_res_blocks
@@ -105,10 +130,23 @@ def configure_from_checkpoint(cfg, mode, payload):
                 control.params.hidden_channels = int(control_state["stem.0.weight"].shape[0])
             elif "hidden_channels" not in control.params:
                 control.params.hidden_channels = 128
-            if "class_embedding.weight" in control_state:
+            semantic_free_modes = {"dynamic_points"}
+            if "class_embedding.weight" in control_state and mode not in semantic_free_modes:
                 control.params.semantic_class_count = int(control_state["class_embedding.weight"].shape[0])
                 control.params.semantic_class_scale = 1.0
-        if "dynamic_class_tokens" in payload:
+            else:
+                control.params.semantic_class_count = 0
+            gate_channel = lidar_condition_gate_channel(mode)
+            if gate_channel < 0:
+                if int(control.params.in_channels) >= 16:
+                    gate_channel = 15
+                elif int(control.params.in_channels) >= 10:
+                    gate_channel = 9
+                elif int(control.params.in_channels) >= 8:
+                    gate_channel = 0
+            control.params.gate_channel = gate_channel
+            control.params.gate_residuals = gate_channel >= 0
+        if "dynamic_class_tokens" in payload and mode not in {"dynamic_points"}:
             tokens = payload["dynamic_class_tokens"]
             cfg.model.params.dynamic_class_token_weight = 1.0
             cfg.model.params.dynamic_class_token_count = int(tokens.shape[0])
@@ -183,33 +221,63 @@ def make_lidar_overlay(gt, lidar_cond, dynamic_mask):
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     mask = dynamic_mask.detach().cpu()[0] > 0.5
-    point = lidar_cond.detach().cpu()[1] > 0.5
-    depth = lidar_cond.detach().cpu()[2].clamp(0, 1)
+    cond = lidar_cond.detach().cpu()
+    if cond.shape[0] >= 10:
+        point = cond[7] > 0.5
+        depth = cond[4].clamp(0, 1)
+        confidence = cond[9].clamp(0, 1)
+    elif cond.shape[0] >= 8:
+        point = cond[7] > 0.5
+        depth = cond[4].clamp(0, 1)
+        confidence = cond[0].clamp(0, 1)
+    else:
+        point = cond[1] > 0.5
+        depth = cond[2].clamp(0, 1)
+        confidence = None
     width, height = base.size
     for y in range(height):
         for x in range(width):
             if bool(mask[y, x]):
                 draw.point((x, y), fill=(255, 32, 32, 70))
+            if confidence is not None and float(confidence[y, x]) > 0.03:
+                a = int(120 * float(confidence[y, x]))
+                draw.point((x, y), fill=(32, 160, 255, a))
             if bool(point[y, x]):
                 d = int(255 * float(depth[y, x]))
-                draw.point((x, y), fill=(32, 220, max(64, d), 220))
+                draw.point((x, y), fill=(32, 240, max(64, d), 230))
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
 def make_cond_rgb(lidar_cond):
     cond = lidar_cond.detach().cpu().clamp(0, 1)
+    if cond.shape[0] >= 10:
+        return torch.cat([cond[0:1], cond[8:9], cond[9:10]], dim=0)
+    if cond.shape[0] >= 8:
+        return torch.cat([cond[0:1], cond[4:5], cond[7:8]], dim=0)
     if cond.shape[0] < 3:
         cond = F.pad(cond, (0, 0, 0, 0, 0, 3 - cond.shape[0]))
     return cond[:3]
 
 
+def apply_lidar_probe(lidar_cond, probe):
+    if lidar_cond is None or probe == "normal":
+        return lidar_cond
+    if probe == "zero":
+        return torch.zeros_like(lidar_cond)
+    if probe == "shift_x":
+        shift = max(1, lidar_cond.shape[-1] // 4)
+        return torch.roll(lidar_cond, shifts=shift, dims=-1)
+    raise ValueError(f"Unsupported lidar probe: {probe}")
+
+
 @torch.no_grad()
-def generate_prediction(model, batch, mode, ddim_steps, seed, guidance_scale, eta, temperature):
+def generate_prediction(model, batch, mode, ddim_steps, seed, guidance_scale, eta, temperature, lidar_probe="normal"):
     inputs = model.get_input(batch, "sat_map").cuda()
     outputs = model.get_input(batch, "grd_left_imgs").cuda()
     lidar_cond = None
     if mode != "none" and model.lidar_condition_key in batch:
         lidar_cond = model.get_input(batch, model.lidar_condition_key).cuda()
+        lidar_cond = apply_lidar_probe(lidar_cond, lidar_probe)
 
     left_camera_k = model.get_input(batch, "left_camera_k").squeeze(-1).cuda()
     gt_shift_x = batch["gt_shift_x"].cuda()
@@ -263,15 +331,78 @@ def full_metrics(evaluator, pred, target):
     }
 
 
-def dynamic_metrics(evaluator, pred, target, mask):
+def masked_region_metrics(evaluator, pred, target, mask, prefix):
     log = dynamic_masked_metrics(pred, target, mask.to(pred.device), evaluator.loss_fn_alex)
     return {
-        "dynamic_psnr": tensor_to_float(log["dynamic_psnr"]),
-        "dynamic_ssim": tensor_to_float(log["dynamic_ssim"]),
-        "dynamic_lpips": tensor_to_float(log["dynamic_lpips"]),
-        "dynamic_mask_coverage": tensor_to_float(log["dynamic_mask_coverage"]),
-        "dynamic_valid_images": int(log["dynamic_valid_images"].detach().cpu()),
+        f"{prefix}_psnr": tensor_to_float(log["dynamic_psnr"]),
+        f"{prefix}_ssim": tensor_to_float(log["dynamic_ssim"]),
+        f"{prefix}_lpips": tensor_to_float(log["dynamic_lpips"]),
+        f"{prefix}_mask_coverage": tensor_to_float(log["dynamic_mask_coverage"]),
+        f"{prefix}_valid_images": int(log["dynamic_valid_images"].detach().cpu()),
     }
+
+
+def dynamic_metrics(evaluator, pred, target, mask):
+    return masked_region_metrics(evaluator, pred, target, mask, "dynamic")
+
+
+def static_metrics(evaluator, pred, target, dynamic_mask):
+    static_mask = (1.0 - dynamic_mask.float()).clamp(0.0, 1.0)
+    return masked_region_metrics(evaluator, pred, target, static_mask, "static")
+
+
+def masked_mean(value, mask):
+    mask = mask.float()
+    if mask.ndim == 2:
+        mask = mask[None]
+    while mask.ndim < value.ndim:
+        mask = mask.unsqueeze(0)
+    mask = mask.to(value)
+    denom = mask.sum()
+    if float(denom) <= 0.0:
+        return float("nan")
+    return float((value * mask).sum() / denom.clamp_min(1e-6))
+
+
+def condition_gate_mask(lidar_cond):
+    cond = lidar_cond.detach().cpu().float()
+    if cond.ndim == 4:
+        cond = cond[0]
+    if cond.shape[0] >= 16:
+        return cond[15:16].clamp(0.0, 1.0)
+    if cond.shape[0] >= 10:
+        return cond[9:10].clamp(0.0, 1.0)
+    if cond.shape[0] >= 8:
+        return cond[0:1].clamp(0.0, 1.0)
+    if cond.shape[0] >= 2:
+        return cond[1:2].clamp(0.0, 1.0)
+    return torch.zeros((1, cond.shape[-2], cond.shape[-1]), dtype=torch.float32)
+
+
+def compute_change_records(pred_tensors_by_sample, gate_masks_by_sample):
+    records = []
+    for sample_id, preds in pred_tensors_by_sample.items():
+        if "none" not in preds or sample_id not in gate_masks_by_sample:
+            continue
+        for mode, pred in preds.items():
+            if mode == "none" or mode not in gate_masks_by_sample[sample_id]:
+                continue
+            pixel_diff = (pred - preds["none"]).abs().mean(dim=0, keepdim=True)
+            gate_mask = gate_masks_by_sample[sample_id][mode].float().clamp(0.0, 1.0)
+            nongate_mask = (1.0 - gate_mask).clamp(0.0, 1.0)
+            gate_change = masked_mean(pixel_diff, gate_mask)
+            nongate_change = masked_mean(pixel_diff, nongate_mask)
+            ratio = gate_change / max(nongate_change, 1e-6) if math.isfinite(gate_change) and math.isfinite(nongate_change) else float("nan")
+            records.append(
+                {
+                    "mode": mode,
+                    "sample_id": sample_id,
+                    "gate_change_mean_abs": gate_change,
+                    "nongate_change_mean_abs": nongate_change,
+                    "gate_to_nongate_change_ratio": ratio,
+                }
+            )
+    return records
 
 
 def mean_finite(values):
@@ -292,28 +423,34 @@ def aggregate(records):
 
 
 def build_success_checks(summary):
-    required = set(MODES)
+    required = set(PRIMARY_MODES)
     if not required.issubset(summary):
-        return {"ready": False, "reason": "missing one or more required modes"}
+        return {"ready": False, "reason": "missing one or more primary modes"}
+    target_mode = "raw_lidar" if "raw_lidar" in summary else "dynamic_points" if "dynamic_points" in summary else ""
+    if not target_mode:
+        return {"ready": False, "reason": "missing LiDAR comparison mode"}
     none = summary["none"]
-    bbox = summary["bbox_dynamic"]
-    full = summary["dynamic_full"]
-    metric_keys = {"dynamic_lpips", "dynamic_psnr", "dynamic_ssim", "full_lpips_alex", "full_psnr"}
-    if any(not metric_keys.issubset(record) for record in (none, bbox, full)):
+    raw = summary[target_mode]
+    metric_keys = {"dynamic_lpips", "dynamic_psnr", "dynamic_ssim", "static_lpips"}
+    if any(not metric_keys.issubset(record) for record in (none, raw)):
         return {"ready": False, "reason": "metrics were skipped or incomplete"}
+    raw_vs_none_dynamic_improved = [
+        raw["dynamic_lpips"] < none["dynamic_lpips"],
+        raw["dynamic_psnr"] > none["dynamic_psnr"],
+        raw["dynamic_ssim"] > none["dynamic_ssim"],
+    ]
     checks = {
         "ready": True,
-        "dynamic_full_lpips_lt_none": full["dynamic_lpips"] < none["dynamic_lpips"],
-        "dynamic_full_psnr_gt_none": full["dynamic_psnr"] > none["dynamic_psnr"],
-        "dynamic_full_better_than_bbox_any": (
-            full["dynamic_lpips"] < bbox["dynamic_lpips"]
-            or full["dynamic_psnr"] > bbox["dynamic_psnr"]
-            or full["dynamic_ssim"] > bbox["dynamic_ssim"]
-        ),
-        "dynamic_full_full_lpips_le_none_plus_0_03": full["full_lpips_alex"] <= none["full_lpips_alex"] + 0.03,
-        "dynamic_full_full_psnr_ge_none_minus_1db": full["full_psnr"] >= none["full_psnr"] - 1.0,
+        f"{target_mode}_vs_none_dynamic_metrics_improved_count": int(sum(raw_vs_none_dynamic_improved)),
+        f"{target_mode}_vs_none_at_least_2_dynamic_metrics": int(sum(raw_vs_none_dynamic_improved)) >= 2,
+        f"{target_mode}_static_lpips_le_none_plus_0_03": raw["static_lpips"] <= none["static_lpips"] + 0.03,
+        f"{target_mode}_gate_to_nongate_change_ratio_ge_2": raw.get("gate_to_nongate_change_ratio", float("nan")) >= 2.0,
     }
-    checks["passed"] = all(value for key, value in checks.items() if key not in {"ready", "passed"})
+    checks["passed"] = all(
+        value
+        for key, value in checks.items()
+        if key not in {"ready", "passed", f"{target_mode}_vs_none_dynamic_metrics_improved_count"}
+    )
     return checks
 
 
@@ -411,6 +548,29 @@ def make_object_crop_panels(out_dir, sample_id, gt_path, overlay_path, pred_path
 
 def parse_mode_list(value):
     return [mode.strip() for mode in value.split(",") if mode.strip()]
+
+
+def select_eval_indices(manifest_path, num_samples, min_dynamic_points):
+    records = []
+    with Path(manifest_path).open("r") as handle:
+        for line in handle:
+            if line.strip():
+                records.append(json.loads(line))
+    has_projected_counts = any("num_projected_dynamic_points" in record for record in records)
+    if min_dynamic_points > 0 and has_projected_counts:
+        selected = [
+            idx
+            for idx, record in enumerate(records)
+            if int(record.get("num_projected_dynamic_points", 0)) >= int(min_dynamic_points)
+        ]
+    elif min_dynamic_points > 0:
+        selected = [idx for idx, record in enumerate(records) if int(record.get("num_dynamic_boxes", 0)) > 0]
+    else:
+        selected = list(range(len(records)))
+    if len(selected) < num_samples:
+        fallback = [idx for idx in range(len(records)) if idx not in set(selected)]
+        selected.extend(fallback)
+    return selected[: min(num_samples, len(selected))]
 
 
 def torch_hub_load(repo, name):
@@ -558,16 +718,22 @@ def compare_depth_modes(depth_records):
     by_mode = {}
     for record in depth_records:
         by_mode.setdefault(record["mode"], {})[record["sample_id"]] = record
-    if "none" not in by_mode or "dynamic_full" not in by_mode:
+    if "raw_lidar" in by_mode:
+        target_mode = "raw_lidar"
+    elif "dynamic_points" in by_mode:
+        target_mode = "dynamic_points"
+    else:
+        target_mode = "dynamic_full"
+    if "none" not in by_mode or target_mode not in by_mode:
         return {}
 
     comparison = {}
-    common = sorted(set(by_mode["none"]) & set(by_mode["dynamic_full"]))
+    common = sorted(set(by_mode["none"]) & set(by_mode[target_mode]))
     for metric in ("depth_all_abs_mean", "depth_static_abs_mean", "depth_dynamic_abs_mean", "depth_all_rel_mean", "depth_dynamic_rel_mean"):
         deltas = []
         for sample_id in common:
             a = by_mode["none"][sample_id].get(metric, float("nan"))
-            b = by_mode["dynamic_full"][sample_id].get(metric, float("nan"))
+            b = by_mode[target_mode][sample_id].get(metric, float("nan"))
             if math.isfinite(a) and math.isfinite(b):
                 deltas.append(b - a)
         if not deltas:
@@ -576,8 +742,8 @@ def compare_depth_modes(depth_records):
         n = len(deltas)
         tail = sum(math.comb(n, k) for k in range(0, min(wins, n - wins) + 1)) / float(2**n)
         comparison[metric] = {
-            "mean_delta_dynamic_full_minus_none": float(sum(deltas) / n),
-            "dynamic_full_better_count": int(wins),
+            f"mean_delta_{target_mode}_minus_none": float(sum(deltas) / n),
+            f"{target_mode}_better_count": int(wins),
             "paired_count": int(n),
             "sign_test_two_sided_p": float(min(1.0, 2.0 * tail)),
         }
@@ -587,12 +753,13 @@ def compare_depth_modes(depth_records):
 def run_depth_consistency_from_images(args, out_dir):
     records = []
     manifest_records = []
+    selected_indices = set(select_eval_indices(args.manifest, args.num_samples, args.min_eval_dynamic_points))
     with Path(args.manifest).open("r") as handle:
-        for line in handle:
+        for idx, line in enumerate(handle):
             if line.strip():
-                manifest_records.append(json.loads(line))
-            if len(manifest_records) >= args.num_samples:
-                break
+                record = json.loads(line)
+                if idx in selected_indices:
+                    manifest_records.append(record)
 
     midas_model, midas_transform, device = load_midas_depth_model(args.midas_model, args.depth_device, args.midas_hub_dir)
     modes = parse_mode_list(args.depth_modes)
@@ -634,6 +801,18 @@ def main():
             return
         raise SystemExit("At least one checkpoint path is required.")
 
+    selected_indices = select_eval_indices(args.manifest, args.num_samples, args.min_eval_dynamic_points)
+    if not selected_indices:
+        raise SystemExit(f"No samples found in {args.manifest}")
+    write_json(
+        metrics_dir / "selected_eval_indices.json",
+        {
+            "indices": selected_indices,
+            "num_samples": len(selected_indices),
+            "min_eval_dynamic_points": args.min_eval_dynamic_points,
+        },
+    )
+
     evaluator = None if args.skip_metrics else Evaluate_indic().cuda().eval()
     midas_model = midas_transform = midas_device = None
     depth_records = []
@@ -643,15 +822,20 @@ def main():
     all_records = {}
     gt_paths = {}
     overlay_paths = {}
+    overlay_modes_by_sample = {}
     pred_paths_by_sample = {}
     object_boxes_by_sample = {}
+    pred_tensors_by_sample = {}
+    dynamic_masks_by_sample = {}
+    gate_masks_by_sample = {}
 
     for mode, ckpt_path in ckpts.items():
         dataset = SatLidarRawDataset(args.manifest, condition_mode=mode)
         model = load_model(args.config, mode, ckpt_path, args.control_scale_override)
         mode_records = []
-        limit = min(args.num_samples, len(dataset))
-        for sample_idx in range(limit):
+        for eval_pos, sample_idx in enumerate(selected_indices):
+            if sample_idx >= len(dataset):
+                continue
             sample = dataset[sample_idx]
             batch = sample_to_batch(sample)
             sample_id = sample["sample_id"]
@@ -668,15 +852,17 @@ def main():
                 batch,
                 mode=mode,
                 ddim_steps=args.ddim_steps,
-                seed=args.seed + sample_idx,
+                seed=args.seed + eval_pos,
                 guidance_scale=args.guidance_scale,
                 eta=args.eta,
                 temperature=args.temperature,
+                lidar_probe=args.lidar_probe if mode != "none" else "normal",
             )
             record = {
                 "mode": mode,
                 "sample_id": sample_id,
                 "checkpoint": ckpt_path,
+                "lidar_probe": args.lidar_probe if mode != "none" else "normal",
                 "ddim_steps": args.ddim_steps,
                 "num_dynamic_boxes": int(batch["num_dynamic_boxes"].detach().cpu().item()),
                 "num_projected_dynamic_points": int(batch["num_projected_dynamic_points"].detach().cpu().item()),
@@ -685,6 +871,7 @@ def main():
             if not args.skip_metrics:
                 record.update(full_metrics(evaluator, pred, target))
                 record.update(dynamic_metrics(evaluator, pred, target, batch["dynamic_mask"]))
+                record.update(static_metrics(evaluator, pred, target, batch["dynamic_mask"]))
             if args.depth_consistency:
                 pred_image = transforms.functional.to_pil_image(pred[0].detach().cpu().clamp(0, 1)).convert("RGB")
                 depth_record = {
@@ -706,6 +893,12 @@ def main():
                 depth_records.append(depth_record)
             mode_records.append(record)
             print(json.dumps(record, sort_keys=True))
+            pred_tensors_by_sample.setdefault(sample_id, {})[mode] = pred[0].detach().cpu()
+            dynamic_masks_by_sample.setdefault(sample_id, batch["dynamic_mask"][0].detach().cpu())
+            if mode != "none" and "lidar_cond" in batch:
+                gate_masks_by_sample.setdefault(sample_id, {})[mode] = condition_gate_mask(
+                    batch["lidar_cond"][0].detach().cpu()
+                )
 
             rel = Path(sample_id)
             pred_path = image_dir / mode / "pred" / rel.with_suffix(".png")
@@ -716,13 +909,22 @@ def main():
                 gt_path = image_dir / "gt" / rel.with_suffix(".png")
                 save_tensor_image(target[0], gt_path)
                 gt_paths[sample_id] = gt_path
-            if mode == "dynamic_full" or sample_id not in overlay_paths:
+            should_save_overlay = (
+                sample_id not in overlay_paths
+                or (
+                    overlay_modes_by_sample.get(sample_id)
+                    not in {"dynamic_points", "dynamic_full", "raw_lidar"}
+                    and mode in {"dynamic_points", "dynamic_full", "raw_lidar"}
+                )
+            )
+            if should_save_overlay:
                 overlay_path = image_dir / "lidar_overlay" / mode / rel.with_suffix(".png")
                 overlay_path.parent.mkdir(parents=True, exist_ok=True)
                 make_lidar_overlay(sample["grd_left_imgs"], sample["lidar_cond"], sample["dynamic_mask"]).save(overlay_path)
                 cond_path = image_dir / "lidar_cond_rgb" / mode / rel.with_suffix(".png")
                 save_tensor_image(make_cond_rgb(sample["lidar_cond"]), cond_path)
                 overlay_paths[sample_id] = overlay_path
+                overlay_modes_by_sample[sample_id] = mode
 
         all_records[mode] = mode_records
         del model
@@ -730,11 +932,29 @@ def main():
 
     rows = [record for records in all_records.values() for record in records]
     summary = {mode: aggregate(records) for mode, records in all_records.items()}
+    change_records = compute_change_records(pred_tensors_by_sample, gate_masks_by_sample)
+    for mode in sorted({record["mode"] for record in change_records}):
+        if mode not in summary:
+            continue
+        mode_records = [record for record in change_records if record["mode"] == mode]
+        summary[mode].update(
+            {
+                "gate_change_mean_abs": mean_finite([record["gate_change_mean_abs"] for record in mode_records]),
+                "nongate_change_mean_abs": mean_finite([record["nongate_change_mean_abs"] for record in mode_records]),
+                "gate_to_nongate_change_ratio": mean_finite(
+                    [record["gate_to_nongate_change_ratio"] for record in mode_records]
+                ),
+            }
+        )
     checks = build_success_checks(summary)
 
     write_json(metrics_dir / "per_sample_metrics.json", rows)
+    write_json(metrics_dir / "gate_to_nongate_change.json", change_records)
+    write_json(metrics_dir / "dynamic_to_static_change.json", change_records)
     write_json(metrics_dir / "summary.json", {"summary": summary, "success_checks": checks})
     write_csv(metrics_dir / "per_sample_metrics.csv", rows)
+    write_csv(metrics_dir / "gate_to_nongate_change.csv", change_records)
+    write_csv(metrics_dir / "dynamic_to_static_change.csv", change_records)
     summary_rows = [dict({"mode": mode}, **metrics) for mode, metrics in summary.items()]
     write_csv(metrics_dir / "summary.csv", summary_rows)
     if args.depth_consistency:
@@ -752,7 +972,11 @@ def main():
     panel_paths = []
     object_panel_records = []
     for sample_id in sample_ids:
-        pred_paths = {mode: pred_paths_by_sample[sample_id][mode] for mode in MODES if mode in pred_paths_by_sample[sample_id]}
+        pred_paths = {
+            mode: pred_paths_by_sample[sample_id][mode]
+            for mode in PANEL_MODE_ORDER
+            if mode in pred_paths_by_sample[sample_id]
+        }
         panel_paths.append(make_panel(out_dir, sample_id, gt_paths[sample_id], overlay_paths[sample_id], pred_paths))
         if args.object_crop_panels:
             object_panel_records.extend(

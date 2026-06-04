@@ -74,6 +74,8 @@ model:
                 control_scale: 1.0
                 semantic_class_count: 0
                 semantic_class_scale: 1.0
+                gate_channel: -1
+                gate_residuals: false
     Condition_config_grd:
         target: ldm.modules.encoders.modules.CLIPVisionEmbedder
     Condition_config_sat:
@@ -86,6 +88,12 @@ model:
     use_lidar_cond: true
     lidar_condition_key: lidar_cond
     freeze_for_lidar_control: true
+    dynamic_loss_weight: 0.0
+    dynamic_x0_loss_weight: 0.0
+    dynamic_point_loss_weight: 0.0
+    dynamic_point_x0_loss_weight: 0.0
+    static_teacher_consistency_weight: 0.0
+    static_teacher_gate_channel: -1
 
 data:
   target: dataloader.dataload.DataModuleFromConfig
@@ -97,20 +105,22 @@ data:
       target: dataloader.KITTI_raw_sat_lidar.SatLidarRawDataset
       params:
         manifest: dataset/kitti_raw_sat_lidar/train_manifest.jsonl
-        condition_mode: dynamic_full
+        condition_mode: raw_lidar
         image_height: 128
         image_width: 512
         sat_size: 256
         max_depth: 80.0
+        align_satellite_to_camera: true
     test:
       target: dataloader.KITTI_raw_sat_lidar.SatLidarRawDatasetTest
       params:
         manifest: dataset/kitti_raw_sat_lidar/val_manifest.jsonl
-        condition_mode: dynamic_full
+        condition_mode: raw_lidar
         image_height: 128
         image_width: 512
         sat_size: 256
         max_depth: 80.0
+        align_satellite_to_camera: true
 
 lightning:
   callbacks:

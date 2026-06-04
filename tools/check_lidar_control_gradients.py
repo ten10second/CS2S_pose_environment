@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dataloader.KITTI_raw_sat_lidar import SatLidarRawDataset  # noqa: E402
+from dataloader.kitti_raw_lidar_utils import lidar_condition_channels, lidar_condition_gate_channel  # noqa: E402
 from utils.util import instantiate_from_config  # noqa: E402
 
 
@@ -22,7 +23,11 @@ def parse_args():
     parser.add_argument("--manifest", default="dataset/kitti_raw_sat_lidar/val_manifest.jsonl")
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--compare-ckpt", default="")
-    parser.add_argument("--mode", default="dynamic_full", choices=["bbox_dynamic", "dynamic_points", "raw_lidar", "dynamic_full"])
+    parser.add_argument(
+        "--mode",
+        default="raw_lidar",
+        choices=["bbox_dynamic", "dynamic_points", "raw_lidar", "dynamic_full"],
+    )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--out", default="")
@@ -36,6 +41,28 @@ def configure_for_mode(cfg, mode):
     cfg.data.params.test.params.condition_mode = mode
     cfg.model.params.use_lidar_cond = True
     cfg.model.params.freeze_for_lidar_control = True
+    raw_geometry_modes = set()
+    semantic_free_modes = {"dynamic_points"}
+    geometry_gate_channel = lidar_condition_gate_channel(mode)
+    cfg.model.params.dynamic_class_token_weight = 0.0 if mode in semantic_free_modes else cfg.model.params.get("dynamic_class_token_weight", 0.0)
+    cfg.model.params.static_teacher_consistency_weight = 0.25 if mode in raw_geometry_modes else 0.0
+    cfg.model.params.static_teacher_gate_channel = geometry_gate_channel
+    if mode in raw_geometry_modes:
+        cfg.model.params.dynamic_loss_weight = 0.0
+        cfg.model.params.dynamic_x0_loss_weight = 0.0
+        cfg.model.params.dynamic_point_loss_weight = 0.0
+        cfg.model.params.dynamic_point_x0_loss_weight = 0.0
+    control = cfg.model.params.DDPM_config.params.control_grd
+    unet = cfg.model.params.DDPM_config.params.unet_config.params
+    control.target = "models.KITTI_geo_ldm.lidar_condition_model.LidarMultiScaleControl"
+    control.params.in_channels = lidar_condition_channels(mode)
+    control.params.model_channels = unet.model_channels
+    control.params.channel_mult = list(unet.channel_mult)
+    control.params.num_res_blocks = unet.num_res_blocks
+    control.params.middle_channels = unet.model_channels * list(unet.channel_mult)[-1]
+    control.params.semantic_class_count = 0 if mode in semantic_free_modes else int(control.params.get("semantic_class_count", 0))
+    control.params.gate_channel = geometry_gate_channel
+    control.params.gate_residuals = geometry_gate_channel >= 0
     return cfg
 
 

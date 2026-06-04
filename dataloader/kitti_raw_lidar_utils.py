@@ -21,6 +21,24 @@ DYNAMIC_CLASS_TO_ID = {
 }
 
 IGNORED_TRACKLET_CLASSES = {"Misc", "DontCare"}
+CONDITION_CHANNELS_BY_MODE = {
+    "none": 4,
+    "bbox_dynamic": 4,
+    "dynamic_points": 4,
+    "raw_lidar": 4,
+    "dynamic_full": 4,
+}
+
+
+def lidar_condition_channels(mode: str) -> int:
+    mode = mode.lower()
+    if mode not in CONDITION_CHANNELS_BY_MODE:
+        raise ValueError(f"Unsupported lidar condition mode: {mode}")
+    return CONDITION_CHANNELS_BY_MODE[mode]
+
+
+def lidar_condition_gate_channel(mode: str) -> int:
+    return -1
 
 
 @dataclass(frozen=True)
@@ -64,7 +82,7 @@ def _parse_int(node: ET.Element, key: str, default: int = -1) -> int:
 def parse_tracklet_xml(xml_path: str) -> Dict[int, List[TrackletBox]]:
     """Parse KITTI raw tracklet_labels.xml into frame-indexed dynamic boxes."""
     xml_file = Path(xml_path)
-    if not xml_file.exists():
+    if not xml_path or not xml_file.is_file():
         return {}
 
     root = ET.parse(xml_file).getroot()
@@ -134,29 +152,70 @@ def read_calib_file(path: str) -> Dict[str, np.ndarray]:
     return data
 
 
+def _transform_from_rt(calib: Dict[str, np.ndarray]) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float32)
+    transform[:3, :3] = calib["R"].reshape(3, 3)
+    transform[:3, 3] = calib["T"].reshape(3)
+    return transform
+
+
+def _camera_center_from_projection(projection: np.ndarray) -> np.ndarray:
+    intrinsics = projection[:3, :3]
+    translation = np.linalg.inv(intrinsics) @ projection[:, 3]
+    return (-translation).astype(np.float32)
+
+
 def load_raw_calibration(calib_dir: str) -> Dict[str, np.ndarray]:
     calib_path = Path(calib_dir)
+    if not (calib_path / "calib_cam_to_cam.txt").exists():
+        for candidate in calib_path.rglob("calib_cam_to_cam.txt"):
+            if (candidate.parent / "calib_velo_to_cam.txt").exists():
+                calib_path = candidate.parent
+                break
     cam = read_calib_file(str(calib_path / "calib_cam_to_cam.txt"))
     velo = read_calib_file(str(calib_path / "calib_velo_to_cam.txt"))
+    imu_path = calib_path / "calib_imu_to_velo.txt"
+    imu = read_calib_file(str(imu_path)) if imu_path.exists() else {}
 
     p_rect_02 = cam["P_rect_02"].reshape(3, 4)
     r_rect_00 = cam.get("R_rect_00", np.eye(3, dtype=np.float32).reshape(-1)).reshape(3, 3)
     s_rect_02 = cam.get("S_rect_02", np.asarray([1242.0, 375.0], dtype=np.float32))
 
-    tr_velo_to_cam = np.eye(4, dtype=np.float32)
-    tr_velo_to_cam[:3, :3] = velo["R"].reshape(3, 3)
-    tr_velo_to_cam[:3, 3] = velo["T"].reshape(3)
+    tr_velo_to_cam = _transform_from_rt(velo)
 
     r_rect_00_ext = np.eye(4, dtype=np.float32)
     r_rect_00_ext[:3, :3] = r_rect_00
 
-    return {
+    result = {
+        "calib_dir": str(calib_path),
         "P_rect_02": p_rect_02.astype(np.float32),
         "R_rect_00": r_rect_00.astype(np.float32),
         "R_rect_00_ext": r_rect_00_ext.astype(np.float32),
         "Tr_velo_to_cam": tr_velo_to_cam.astype(np.float32),
         "S_rect_02": s_rect_02.astype(np.float32),
     }
+    if imu:
+        tr_imu_to_velo = _transform_from_rt(imu)
+        tr_imu_to_rect_00 = r_rect_00_ext @ tr_velo_to_cam @ tr_imu_to_velo
+        cam0_rect_in_imu = np.linalg.inv(tr_imu_to_rect_00) @ np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        cam2_rect_in_rect0 = _camera_center_from_projection(p_rect_02)
+        cam2_rect_in_imu = np.linalg.inv(tr_imu_to_rect_00) @ np.concatenate(
+            [cam2_rect_in_rect0, np.asarray([1.0], dtype=np.float32)]
+        )
+        result.update(
+            {
+                "Tr_imu_to_velo": tr_imu_to_velo.astype(np.float32),
+                "Tr_imu_to_rect_00": tr_imu_to_rect_00.astype(np.float32),
+                "cam0_rect_in_imu": cam0_rect_in_imu[:3].astype(np.float32),
+                "cam2_rect_in_rect0": cam2_rect_in_rect0.astype(np.float32),
+                "cam2_rect_in_imu": cam2_rect_in_imu[:3].astype(np.float32),
+                "cam2_imu_forward_right": np.asarray(
+                    [cam2_rect_in_imu[0], -cam2_rect_in_imu[1]],
+                    dtype=np.float32,
+                ),
+            }
+        )
+    return result
 
 
 def scaled_camera_k(calib: Dict[str, np.ndarray], output_size: Tuple[int, int]) -> np.ndarray:
@@ -181,6 +240,17 @@ def load_velodyne_points(path: str) -> np.ndarray:
     return points.reshape(-1, 4)
 
 
+def velo_to_rect(points_xyz: np.ndarray, calib: Dict[str, np.ndarray]) -> np.ndarray:
+    if points_xyz.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    pts_h = np.concatenate(
+        [points_xyz[:, :3], np.ones((points_xyz.shape[0], 1), dtype=np.float32)],
+        axis=1,
+    ).T
+    rect = (calib["R_rect_00_ext"] @ calib["Tr_velo_to_cam"] @ pts_h).T
+    return rect[:, :3].astype(np.float32)
+
+
 def project_velo_to_image(
     points_xyz: np.ndarray,
     calib: Dict[str, np.ndarray],
@@ -196,9 +266,12 @@ def project_velo_to_image(
     out_h, out_w = output_size
     src_w, src_h = calib["S_rect_02"]
 
-    pts_h = np.concatenate([points_xyz[:, :3], np.ones((points_xyz.shape[0], 1), dtype=np.float32)], axis=1).T
-    rect = calib["R_rect_00_ext"] @ calib["Tr_velo_to_cam"] @ pts_h
-    pix = calib["P_rect_02"] @ rect
+    rect_xyz = velo_to_rect(points_xyz, calib)
+    rect_h = np.concatenate(
+        [rect_xyz, np.ones((rect_xyz.shape[0], 1), dtype=np.float32)],
+        axis=1,
+    ).T
+    pix = calib["P_rect_02"] @ rect_h
 
     depth = pix[2]
     safe_depth = np.where(np.abs(depth) < 1e-6, 1e-6, depth)
@@ -343,11 +416,11 @@ def generate_lidar_condition(
     max_dynamic_boxes: int = 32,
 ) -> Dict[str, np.ndarray]:
     mode = mode.lower()
-    if mode not in {"none", "bbox_dynamic", "dynamic_points", "raw_lidar", "dynamic_full"}:
+    if mode not in CONDITION_CHANNELS_BY_MODE:
         raise ValueError(f"Unsupported lidar condition mode: {mode}")
 
     out_h, out_w = output_size
-    cond = np.zeros((4, out_h, out_w), dtype=np.float32)
+    cond = np.zeros((lidar_condition_channels(mode), out_h, out_w), dtype=np.float32)
     points = load_velodyne_points(velodyne_path)
     points_xyz = points[:, :3] if points.size else np.zeros((0, 3), dtype=np.float32)
     dynamic_class_hist = np.zeros((max(DYNAMIC_CLASS_TO_ID.values()) + 1,), dtype=np.float32)

@@ -40,10 +40,14 @@ class LidarMultiScaleControl(nn.Module):
         control_scale: float = 1.0,
         semantic_class_count: int = 0,
         semantic_class_scale: float = 1.0,
+        gate_channel: int = -1,
+        gate_residuals: bool = False,
     ):
         super().__init__()
         self.control_scale = control_scale
         self.semantic_class_count = int(semantic_class_count)
+        self.gate_channel = int(gate_channel)
+        self.gate_residuals = bool(gate_residuals)
         self.register_buffer(
             "semantic_class_scale_state",
             torch.tensor(float(semantic_class_scale), dtype=torch.float32),
@@ -85,6 +89,9 @@ class LidarMultiScaleControl(nn.Module):
             return None
 
         cond = F.interpolate(cond_init_grd.float(), size=x.shape[-2:], mode="nearest")
+        gate_source = None
+        if self.gate_residuals and 0 <= self.gate_channel < cond_init_grd.shape[1]:
+            gate_source = cond_init_grd[:, self.gate_channel : self.gate_channel + 1].float().clamp(0.0, 1.0)
         h = self.stem(cond)
         if self.class_embedding is not None and cond.shape[1] >= 4:
             class_mask = (cond[:, 3:4] > 0.0).to(dtype=h.dtype)
@@ -106,8 +113,16 @@ class LidarMultiScaleControl(nn.Module):
             if feature is None:
                 size = (max(1, x.shape[-2] // target_ds), max(1, x.shape[-1] // target_ds))
                 feature = F.interpolate(features[self.max_downsample], size=size, mode="bilinear", align_corners=False)
-            outs.append(zero_conv(feature).type_as(x) * self.control_scale)
+            residual = zero_conv(feature).type_as(x) * self.control_scale
+            if gate_source is not None:
+                gate = F.interpolate(gate_source, size=residual.shape[-2:], mode="bilinear", align_corners=False)
+                residual = residual * gate.to(device=residual.device, dtype=residual.dtype)
+            outs.append(residual)
 
         middle_feature = features[self.max_downsample]
-        outs.append(self.middle_out(middle_feature).type_as(x) * self.control_scale)
+        middle_residual = self.middle_out(middle_feature).type_as(x) * self.control_scale
+        if gate_source is not None:
+            gate = F.interpolate(gate_source, size=middle_residual.shape[-2:], mode="bilinear", align_corners=False)
+            middle_residual = middle_residual * gate.to(device=middle_residual.device, dtype=middle_residual.dtype)
+        outs.append(middle_residual)
         return outs

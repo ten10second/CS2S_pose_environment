@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -5,7 +6,9 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 
+from dataloader import KITTI_utils as kitti_utils
 from dataloader.kitti_raw_lidar_utils import (
     generate_lidar_condition,
     load_raw_calibration,
@@ -21,26 +24,25 @@ class SatLidarRawDataset(Dataset):
     def __init__(
         self,
         manifest: str,
-        condition_mode: str = "dynamic_full",
+        condition_mode: str = "raw_lidar",
         image_height: int = 128,
         image_width: int = 512,
         sat_size: int = 256,
         max_depth: float = 80.0,
         max_dynamic_boxes: int = 32,
+        align_satellite_to_camera: bool = True,
     ):
         self.manifest = manifest
         self.records = read_jsonl(manifest)
         self.condition_mode = condition_mode
         self.image_size: Tuple[int, int] = (image_height, image_width)
+        self.sat_size = sat_size
         self.max_depth = max_depth
         self.max_dynamic_boxes = max_dynamic_boxes
+        self.align_satellite_to_camera = align_satellite_to_camera
+        self.meter_per_pixel = kitti_utils.get_meter_per_pixel()
 
-        self.sat_transform = transforms.Compose(
-            [
-                transforms.Resize((sat_size, sat_size)),
-                transforms.ToTensor(),
-            ]
-        )
+        self.sat_to_tensor = transforms.ToTensor()
         self.grd_transform = transforms.Compose(
             [
                 transforms.Resize((image_height, image_width)),
@@ -66,6 +68,51 @@ class SatLidarRawDataset(Dataset):
             self._tracklet_cache[xml_path] = parse_tracklet_xml(xml_path)
         return self._tracklet_cache[xml_path]
 
+    @staticmethod
+    def _read_heading(oxts_path: str) -> float:
+        with Path(oxts_path).open("r") as handle:
+            values = handle.readline().strip().split()
+        if len(values) < 6:
+            raise ValueError(f"Malformed OXTS packet: {oxts_path}")
+        return float(values[5])
+
+    @staticmethod
+    def _camera_forward_right(calib: Dict[str, object]) -> Tuple[float, float]:
+        if "cam2_imu_forward_right" in calib:
+            offset = calib["cam2_imu_forward_right"]
+            return float(offset[0]), float(offset[1])
+        return float(kitti_utils.CameraGPS_shift_left[0]), float(kitti_utils.CameraGPS_shift_left[1])
+
+    def _satellite_image(self, sat_img: Image.Image, oxts_path: str, calib: Dict[str, object]) -> Image.Image:
+        sat_rgb = sat_img.convert("RGB")
+        if not self.align_satellite_to_camera:
+            return sat_rgb.resize((self.sat_size, self.sat_size), Image.BILINEAR)
+
+        heading = self._read_heading(oxts_path)
+        camera_forward, camera_right = self._camera_forward_right(calib)
+        sat_map = sat_rgb.resize(
+            (kitti_utils.SatMap_process_sidelength, kitti_utils.SatMap_process_sidelength),
+            Image.BILINEAR,
+        )
+        sat_rot = sat_map.rotate(-heading / math.pi * 180.0, resample=Image.BILINEAR)
+        sat_align_cam = sat_rot.transform(
+            sat_rot.size,
+            Image.AFFINE,
+            (
+                1,
+                0,
+                camera_forward / self.meter_per_pixel,
+                0,
+                1,
+                camera_right / self.meter_per_pixel,
+            ),
+            resample=Image.BILINEAR,
+        )
+        sat_crop = TF.center_crop(sat_align_cam, kitti_utils.SatMap_end_sidelength)
+        if self.sat_size != kitti_utils.SatMap_end_sidelength:
+            sat_crop = sat_crop.resize((self.sat_size, self.sat_size), Image.BILINEAR)
+        return sat_crop
+
     def __getitem__(self, idx):
         record = self.records[idx]
         calib = self._calib(record["calib_dir"])
@@ -74,7 +121,7 @@ class SatLidarRawDataset(Dataset):
         boxes = boxes_by_frame.get(frame_index, [])
 
         with Image.open(record["satellite_path"]) as sat_img:
-            sat_map = self.sat_transform(sat_img.convert("RGB"))
+            sat_map = self.sat_to_tensor(self._satellite_image(sat_img, record["oxts_path"], calib))
         with Image.open(record["image_02_path"]) as grd_img:
             grd_left_img = self.grd_transform(grd_img.convert("RGB"))
 
@@ -96,6 +143,7 @@ class SatLidarRawDataset(Dataset):
             "gt_shift_x": torch.tensor([0.0], dtype=torch.float32),
             "gt_shift_y": torch.tensor([0.0], dtype=torch.float32),
             "theta": torch.tensor([0.0], dtype=torch.float32),
+            "camera_imu_forward_right": torch.tensor(self._camera_forward_right(calib), dtype=torch.float32),
             "file_name": f"{record['sample_id']}.png",
             "sample_id": record["sample_id"],
             "lidar_cond": torch.from_numpy(lidar["lidar_cond"]).float(),
