@@ -77,12 +77,12 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None):
+    def forward(self, x, emb, context=None, lidar_context=None, lidar_evidence=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+                x = layer(x, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
             else:
                 x = layer(x)
         return x
@@ -464,6 +464,12 @@ class UNetModel(nn.Module):
         use_spatial_transformer=False,    # custom transformer support
         transformer_depth=1,              # custom transformer support
         context_dim=None,                 # custom transformer support
+        use_lidar_cross_attention=False,
+        lidar_context_dim=None,
+        lidar_gate_init=1e-3,
+        lidar_evidence_channels=0,
+        lidar_attention_mode="token",
+        lidar_reference_window=3,
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
     ):
@@ -502,6 +508,14 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.predict_codebook_ids = n_embed is not None
+        self.use_lidar_cross_attention = bool(use_lidar_cross_attention)
+        self.lidar_context_dim = lidar_context_dim
+        self.lidar_gate_init = float(lidar_gate_init)
+        self.lidar_evidence_channels = int(lidar_evidence_channels or 0)
+        self.lidar_attention_mode = str(lidar_attention_mode or "token")
+        if self.lidar_attention_mode not in {"token", "reference"}:
+            raise ValueError(f"unknown lidar_attention_mode: {self.lidar_attention_mode}")
+        self.lidar_reference_window = max(1, int(lidar_reference_window))
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -555,7 +569,18 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, checkpoint=use_checkpoint
+                            ch,
+                            num_heads,
+                            dim_head,
+                            depth=transformer_depth,
+                            context_dim=context_dim,
+                            checkpoint=use_checkpoint,
+                            use_lidar_cross_attention=self.use_lidar_cross_attention,
+                            lidar_context_dim=self.lidar_context_dim,
+                            lidar_gate_init=self.lidar_gate_init,
+                            lidar_evidence_channels=self.lidar_evidence_channels,
+                            lidar_attention_mode=self.lidar_attention_mode,
+                            lidar_reference_window=self.lidar_reference_window,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -610,7 +635,18 @@ class UNetModel(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, checkpoint=use_checkpoint
+                            ch,
+                            num_heads,
+                            dim_head,
+                            depth=transformer_depth,
+                            context_dim=context_dim,
+                            checkpoint=use_checkpoint,
+                            use_lidar_cross_attention=self.use_lidar_cross_attention,
+                            lidar_context_dim=self.lidar_context_dim,
+                            lidar_gate_init=self.lidar_gate_init,
+                            lidar_evidence_channels=self.lidar_evidence_channels,
+                            lidar_attention_mode=self.lidar_attention_mode,
+                            lidar_reference_window=self.lidar_reference_window,
                         ),
             ResBlock(
                 ch,
@@ -622,8 +658,16 @@ class UNetModel(nn.Module):
             ),
         )
         self._feature_size += ch
+        middle_ch = ch
+
+        self.lidar_bottleneck_depth_head = nn.Sequential(
+            normalization(middle_ch),
+            nn.SiLU(),
+            conv_nd(dims, middle_ch, 1, 3, padding=1),
+        )
 
         self.output_blocks = nn.ModuleList([])
+        self.output_block_channels = []
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
                 ich = input_block_chans.pop()
@@ -656,7 +700,18 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, checkpoint=use_checkpoint
+                            ch,
+                            num_heads,
+                            dim_head,
+                            depth=transformer_depth,
+                            context_dim=context_dim,
+                            checkpoint=use_checkpoint,
+                            use_lidar_cross_attention=self.use_lidar_cross_attention,
+                            lidar_context_dim=self.lidar_context_dim,
+                            lidar_gate_init=self.lidar_gate_init,
+                            lidar_evidence_channels=self.lidar_evidence_channels,
+                            lidar_attention_mode=self.lidar_attention_mode,
+                            lidar_reference_window=self.lidar_reference_window,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -677,6 +732,7 @@ class UNetModel(nn.Module):
                     )
                     ds //= 2
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
+                self.output_block_channels.append(ch)
                 self._feature_size += ch
 
         self.out = nn.Sequential(
@@ -684,6 +740,13 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
         )
+        self.lidar_depth_head = nn.Sequential(
+            normalization(ch),
+            nn.SiLU(),
+            conv_nd(dims, ch, 1, 3, padding=1),
+        )
+        self.last_lidar_depth_pred = None
+        self.last_lidar_bottleneck_depth_pred = None
         if self.predict_codebook_ids:
             self.id_predictor = nn.Sequential(
             normalization(ch),
@@ -707,7 +770,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, control_grd = None, y=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, **kwargs):
+    def forward(self, x, timesteps=None, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, control_grd = None, y=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -729,9 +792,12 @@ class UNetModel(nn.Module):
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb, context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
             hs.append(h)
-        h = self.middle_block(h, emb, context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+        h = self.middle_block(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+        self.last_lidar_bottleneck_depth_pred = th.sigmoid(
+            self.lidar_bottleneck_depth_head(h.float())
+        ).type_as(h)
 
         def add_control(feature):
             residual = control_grd.pop()
@@ -749,8 +815,9 @@ class UNetModel(nn.Module):
             if control_grd is not None and len(control_grd) > 0:
                 skip = add_control(skip)
             h = th.cat([h, skip], dim=1)
-            h = module(h, emb, context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         h = h.type(x.dtype)
+        self.last_lidar_depth_pred = th.sigmoid(self.lidar_depth_head(h.float())).type_as(h)
         if self.predict_codebook_ids:
             return self.id_predictor(h)
         else:

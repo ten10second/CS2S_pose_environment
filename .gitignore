@@ -1,5 +1,8 @@
 ckpt/
 results/
+result/KITTI.ckpt
+todo/
 dataset/
+yolo*.pt
 *.pyc
 __pycache__/

@@ -329,6 +329,9 @@ def check_record(record, args, out_dir):
     points = load_velodyne_points(record["velodyne_path"])
     points_xyz = points[:, :3] if points.size else np.zeros((0, 3), dtype=np.float32)
     _, _, valid = project_velo_to_image(points_xyz, calib, (args.image_height, args.image_width))
+    lidar_cond = lidar["lidar_cond"]
+    point_channel = 7 if lidar_cond.shape[0] >= 8 else 1
+    confidence_channel = 0 if lidar_cond.shape[0] > 0 else point_channel
     summary = {
         "sample_id": record["sample_id"],
         "panel_path": str(panel_path),
@@ -354,8 +357,8 @@ def check_record(record, args, out_dir):
         "projected_lidar_points": int(valid.sum()),
         "num_dynamic_boxes": len(boxes),
         "num_projected_dynamic_points": int(lidar["num_projected_dynamic_points"]),
-        "dynamic_seed_pixels": int(lidar["lidar_cond"][7].sum()),
-        "dynamic_confidence_pixels": int((lidar["lidar_cond"][0] > 0.0).sum()),
+        "dynamic_seed_pixels": int(lidar_cond[point_channel].sum()) if point_channel < lidar_cond.shape[0] else 0,
+        "dynamic_confidence_pixels": int((lidar_cond[confidence_channel] > 0.0).sum()),
         "timestamp": timestamp_report(record),
         "satellite_neighbor_shift": satellite_neighbor_shift(record),
     }

@@ -260,8 +260,358 @@ class CrossAttention(nn.Module):
             return self.sample_to_out(gen_img.transpose(1, 2))
 
 
+class TokenCrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        self.center_context_tokens = True
+        self.norm_context_tokens = True
+        self.coord_pos_encoding = True
+        self.coord_pos_scale = 0.25
+        self.coord_logit_bias_scale = 0.75
+        self.context_norm = nn.LayerNorm(context_dim)
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_out = nn.Sequential(
+            zero_module(nn.Linear(inner_dim, query_dim)),
+            nn.Dropout(dropout),
+        )
+
+    def prepare_context(self, context):
+        if getattr(self, "center_context_tokens", True):
+            context = context - context.mean(dim=1, keepdim=True)
+        if getattr(self, "norm_context_tokens", True):
+            context = self.context_norm(context)
+        return context
+
+    @staticmethod
+    def infer_kitti_grid(token_count):
+        token_count = int(token_count)
+        if token_count <= 0:
+            return 1, 1
+        token_h = max(1, int(round(math.sqrt(float(token_count) / 4.0))))
+        while token_h > 1 and token_count % token_h != 0:
+            token_h -= 1
+        token_w = max(1, token_count // token_h)
+        return token_h, token_w
+
+    @staticmethod
+    def coord_encoding_2d(height, width, dim, device, dtype):
+        height = int(height)
+        width = int(width)
+        dim = int(dim)
+        y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype).view(height, 1)
+        x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype).view(1, width)
+        x = x.expand(height, width)
+        y = y.expand(height, width)
+        features = [x, y, x * y, x.square(), y.square()]
+        for freq in (1.0, 2.0, 4.0, 8.0):
+            features.extend(
+                [
+                    torch.sin(math.pi * freq * x),
+                    torch.cos(math.pi * freq * x),
+                    torch.sin(math.pi * freq * y),
+                    torch.cos(math.pi * freq * y),
+                ]
+            )
+        base = torch.stack(features, dim=-1).reshape(1, height * width, -1)
+        base = base - base.mean(dim=1, keepdim=True)
+        base = base / base.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
+        repeat = int(math.ceil(float(dim) / float(base.shape[-1])))
+        return base.repeat(1, 1, repeat)[..., :dim]
+
+    def add_coord_pos_encoding(self, tensor, spatial_hw=None):
+        if not getattr(self, "coord_pos_encoding", True) or tensor is None:
+            return tensor
+        if spatial_hw is None:
+            h, w = self.infer_kitti_grid(tensor.shape[1])
+        else:
+            h, w = int(spatial_hw[0]), int(spatial_hw[1])
+            if h * w != int(tensor.shape[1]):
+                return tensor
+        pos = self.coord_encoding_2d(
+            h,
+            w,
+            tensor.shape[-1],
+            device=tensor.device,
+            dtype=tensor.dtype,
+        )
+        return tensor + float(getattr(self, "coord_pos_scale", 0.25)) * pos
+
+    def coordinate_logit_bias(self, query_count, token_count, query_hw, device, dtype):
+        if query_hw is None or float(getattr(self, "coord_logit_bias_scale", 0.0)) == 0.0:
+            return None
+        query_h, query_w = int(query_hw[0]), int(query_hw[1])
+        if query_h * query_w != int(query_count):
+            return None
+        token_h, token_w = self.infer_kitti_grid(token_count)
+        if token_h * token_w != int(token_count):
+            return None
+        qx = torch.linspace(-1.0, 1.0, query_w, device=device, dtype=dtype).view(1, query_w)
+        qy = torch.linspace(-1.0, 1.0, query_h, device=device, dtype=dtype).view(query_h, 1)
+        qx = qx.expand(query_h, query_w).reshape(query_count, 1)
+        qy = qy.expand(query_h, query_w).reshape(query_count, 1)
+        tx = torch.linspace(-1.0, 1.0, token_w, device=device, dtype=dtype).view(1, token_w)
+        ty = torch.linspace(-1.0, 1.0, token_h, device=device, dtype=dtype).view(token_h, 1)
+        tx = tx.expand(token_h, token_w).reshape(1, token_count)
+        ty = ty.expand(token_h, token_w).reshape(1, token_count)
+        dist2 = (qx - tx).square() + (qy - ty).square()
+        return -float(getattr(self, "coord_logit_bias_scale", 0.75)) * dist2
+
+    def forward(self, x, context, mask=None, query_hw=None):
+        h = self.heads
+        context = self.prepare_context(context)
+        context = self.add_coord_pos_encoding(context)
+        x_for_q = self.add_coord_pos_encoding(x, spatial_hw=query_hw)
+        q = self.to_q(x_for_q)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value(sim))
+        coord_bias = self.coordinate_logit_bias(
+            query_count=sim.shape[-2],
+            token_count=sim.shape[-1],
+            query_hw=query_hw,
+            device=sim.device,
+            dtype=sim.dtype,
+        )
+        if coord_bias is not None:
+            sim = sim + coord_bias.unsqueeze(0)
+
+        attn = sim.softmax(dim=-1)
+        route_tensors = self._compute_route_tensors(attn, query_hw=query_hw)
+        with torch.no_grad():
+            sim_float = sim.detach().float()
+            attn_float = attn.detach().float()
+            token_count = max(1, int(attn_float.shape[-1]))
+            entropy = -(attn_float.clamp_min(1e-12) * attn_float.clamp_min(1e-12).log()).sum(dim=-1)
+            entropy_norm = entropy / math.log(max(2, token_count))
+            self.last_sim_std_mean = sim_float.std(dim=-1, unbiased=False).mean().detach()
+            self.last_sim_range_mean = (sim_float.max(dim=-1).values - sim_float.min(dim=-1).values).mean().detach()
+            self.last_attn_entropy_norm = entropy_norm.mean().detach()
+            self.last_attn_max_mean = attn_float.max(dim=-1).values.mean().detach()
+            self.last_attn_std_mean = attn_float.std(dim=-1, unbiased=False).mean().detach()
+            self.last_attn_token_count = float(token_count)
+            self.last_attn_query_count = float(attn_float.shape[-2])
+            self._record_route_stats(route_tensors, query_hw=query_hw)
+        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+
+    def _compute_route_tensors(self, attn, query_hw=None):
+        token_count = int(attn.shape[-1])
+        query_count = int(attn.shape[-2])
+        batch_heads = int(attn.shape[0])
+        batch = max(1, batch_heads // max(1, int(self.heads)))
+        if batch * int(self.heads) != batch_heads or token_count <= 1:
+            return None
+
+        # LiDAR tokens are produced from a camera-view grid. Infer the 4:1 KITTI
+        # token aspect ratio used by the current config, falling back gracefully.
+        token_h, token_w = self.infer_kitti_grid(token_count)
+        if token_h * token_w != token_count:
+            return None
+
+        attn_mean = attn.reshape(batch, int(self.heads), query_count, token_count).mean(dim=1)
+        token_x = torch.linspace(-1.0, 1.0, token_w, device=attn.device, dtype=attn.dtype).view(1, token_w)
+        token_y = torch.linspace(-1.0, 1.0, token_h, device=attn.device, dtype=attn.dtype).view(token_h, 1)
+        token_x = token_x.expand(token_h, token_w).reshape(1, 1, token_count)
+        token_y = token_y.expand(token_h, token_w).reshape(1, 1, token_count)
+        route_x = (attn_mean * token_x).sum(dim=-1)
+        route_y = (attn_mean * token_y).sum(dim=-1)
+        query_x = None
+        query_y = None
+        if query_hw is not None:
+            query_h, query_w = int(query_hw[0]), int(query_hw[1])
+            if query_h * query_w == query_count:
+                query_x = torch.linspace(-1.0, 1.0, query_w, device=attn.device, dtype=attn.dtype).view(1, query_w)
+                query_y = torch.linspace(-1.0, 1.0, query_h, device=attn.device, dtype=attn.dtype).view(query_h, 1)
+                query_x = query_x.expand(query_h, query_w).reshape(1, query_count).expand(batch, query_count)
+                query_y = query_y.expand(query_h, query_w).reshape(1, query_count).expand(batch, query_count)
+        return route_x, route_y, query_x, query_y
+
+    def _record_route_stats(self, route_tensors, query_hw=None):
+        if route_tensors is None:
+            return
+        route_x, route_y, query_x, query_y = route_tensors
+        route_x = route_x.detach().float()
+        route_y = route_y.detach().float()
+        self.last_route_token_x_mean = route_x.mean().detach()
+        self.last_route_token_y_mean = route_y.mean().detach()
+        self.last_route_token_x_std = route_x.std(unbiased=False).detach()
+        self.last_route_token_y_std = route_y.std(unbiased=False).detach()
+        self.last_route_query_x_corr = torch.zeros((), device=route_x.device)
+        self.last_route_query_y_corr = torch.zeros((), device=route_x.device)
+
+        if query_x is None or query_y is None:
+            return
+        self.last_route_query_x_corr = self._corrcoef(query_x.detach().float(), route_x).detach()
+        self.last_route_query_y_corr = self._corrcoef(query_y.detach().float(), route_y).detach()
+
+    @staticmethod
+    def _corrcoef(a, b):
+        a = a - a.mean(dim=-1, keepdim=True)
+        b = b - b.mean(dim=-1, keepdim=True)
+        denom = a.std(dim=-1, unbiased=False) * b.std(dim=-1, unbiased=False)
+        corr = (a * b).mean(dim=-1) / denom.clamp_min(1e-6)
+        return corr.mean()
+
+
+class LocalReferenceCrossAttention(TokenCrossAttention):
+    """Pointmap-style local reference attention over camera-view LiDAR tokens.
+
+    The token encoder already rasterizes LiDAR as a target camera-view pointmap
+    and pools it to a KITTI-aspect grid.  This attention keeps that grid as a
+    spatial reference: each street latent query samples K/V only from the
+    corresponding pointmap location and a small local neighborhood, instead of
+    attending globally over all LiDAR tokens.
+    """
+
+    def __init__(self, *args, reference_window: int = 3, **kwargs):
+        super().__init__(*args, **kwargs)
+        window = max(1, int(reference_window))
+        if window % 2 == 0:
+            window += 1
+        self.reference_window = window
+
+    @staticmethod
+    def _query_coordinates(query_hw, device, dtype):
+        query_h, query_w = int(query_hw[0]), int(query_hw[1])
+        qx = torch.linspace(-1.0, 1.0, query_w, device=device, dtype=dtype).view(1, query_w)
+        qy = torch.linspace(-1.0, 1.0, query_h, device=device, dtype=dtype).view(query_h, 1)
+        qx = qx.expand(query_h, query_w).reshape(query_h * query_w)
+        qy = qy.expand(query_h, query_w).reshape(query_h * query_w)
+        return qx, qy
+
+    def _reference_grid(self, query_hw, token_hw, batch_heads, device, dtype):
+        query_h, query_w = int(query_hw[0]), int(query_hw[1])
+        token_h, token_w = int(token_hw[0]), int(token_hw[1])
+        qx, qy = self._query_coordinates((query_h, query_w), device=device, dtype=dtype)
+        radius = int(self.reference_window // 2)
+        step_x = 2.0 / float(max(token_w - 1, 1))
+        step_y = 2.0 / float(max(token_h - 1, 1))
+        offsets = []
+        for oy in range(-radius, radius + 1):
+            for ox in range(-radius, radius + 1):
+                offsets.append((float(ox) * step_x, float(oy) * step_y))
+        offset = torch.tensor(offsets, device=device, dtype=dtype).view(1, len(offsets), 2)
+        base = torch.stack([qx, qy], dim=-1).unsqueeze(1)
+        grid = (base + offset).clamp(-1.0, 1.0)
+        return grid.unsqueeze(0).expand(int(batch_heads), -1, -1, -1)
+
+    def _record_local_stats(self, sim, attn, sample_grid, query_hw):
+        with torch.no_grad():
+            sim_float = sim.detach().float()
+            attn_float = attn.detach().float()
+            token_count = max(1, int(attn_float.shape[-1]))
+            entropy = -(attn_float.clamp_min(1e-12) * attn_float.clamp_min(1e-12).log()).sum(dim=-1)
+            entropy_norm = entropy / math.log(max(2, token_count))
+            self.last_sim_std_mean = sim_float.std(dim=-1, unbiased=False).mean().detach()
+            self.last_sim_range_mean = (sim_float.max(dim=-1).values - sim_float.min(dim=-1).values).mean().detach()
+            self.last_attn_entropy_norm = entropy_norm.mean().detach()
+            self.last_attn_max_mean = attn_float.max(dim=-1).values.mean().detach()
+            self.last_attn_std_mean = attn_float.std(dim=-1, unbiased=False).mean().detach()
+            self.last_attn_token_count = float(token_count)
+            self.last_attn_query_count = float(attn_float.shape[-2])
+
+            batch_heads, query_count, local_count = attn.shape
+            batch = max(1, int(batch_heads) // max(1, int(self.heads)))
+            if batch * int(self.heads) != batch_heads:
+                return
+            attn_mean = attn.reshape(batch, int(self.heads), query_count, local_count).mean(dim=1)
+            coords = sample_grid.reshape(batch, int(self.heads), query_count, local_count, 2).mean(dim=1)
+            route_x = (attn_mean * coords[..., 0]).sum(dim=-1)
+            route_y = (attn_mean * coords[..., 1]).sum(dim=-1)
+            query_x, query_y = self._query_coordinates(query_hw, device=attn.device, dtype=attn.dtype)
+            query_x = query_x.reshape(1, query_count).expand(batch, query_count)
+            query_y = query_y.reshape(1, query_count).expand(batch, query_count)
+            self._record_route_stats((route_x, route_y, query_x, query_y), query_hw=query_hw)
+
+    def forward(self, x, context, mask=None, query_hw=None):
+        if query_hw is None:
+            return super().forward(x, context, mask=mask, query_hw=query_hw)
+        query_count = int(x.shape[1])
+        query_h, query_w = int(query_hw[0]), int(query_hw[1])
+        if query_h * query_w != query_count:
+            return super().forward(x, context, mask=mask, query_hw=query_hw)
+
+        token_count = int(context.shape[1])
+        token_h, token_w = self.infer_kitti_grid(token_count)
+        if token_h * token_w != token_count:
+            return super().forward(x, context, mask=mask, query_hw=query_hw)
+
+        heads = self.heads
+        context = self.prepare_context(context)
+        context = self.add_coord_pos_encoding(context)
+        x_for_q = self.add_coord_pos_encoding(x, spatial_hw=query_hw)
+
+        q = self.to_q(x_for_q)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        q = rearrange(q, "b n (h d) -> (b h) n d", h=heads)
+        k_grid = rearrange(k, "b (th tw) (h d) -> (b h) d th tw", h=heads, th=token_h, tw=token_w)
+        v_grid = rearrange(v, "b (th tw) (h d) -> (b h) d th tw", h=heads, th=token_h, tw=token_w)
+
+        sample_grid = self._reference_grid(
+            query_hw=(query_h, query_w),
+            token_hw=(token_h, token_w),
+            batch_heads=q.shape[0],
+            device=q.device,
+            dtype=q.dtype,
+        )
+        sampled_k = F.grid_sample(
+            k_grid,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        sampled_v = F.grid_sample(
+            v_grid,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        sampled_k = rearrange(sampled_k, "bh d n k -> bh n k d")
+        sampled_v = rearrange(sampled_v, "bh d n k -> bh n k d")
+
+        sim = (q.unsqueeze(2) * sampled_k).sum(dim=-1) * self.scale
+        attn = sim.softmax(dim=-1)
+        self._record_local_stats(sim, attn, sample_grid, query_hw=(query_h, query_w))
+        out = (attn.unsqueeze(-1) * sampled_v).sum(dim=2)
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=heads)
+        return self.to_out(out)
+
+
 class BasicTransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=False):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        dropout=0.,
+        context_dim=None,
+        gated_ff=True,
+        checkpoint=False,
+        use_lidar_cross_attention=False,
+        lidar_context_dim=None,
+        lidar_gate_init=1e-3,
+        lidar_evidence_channels=0,
+        lidar_attention_mode="token",
+        lidar_reference_window=3,
+    ):
         super().__init__()
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
@@ -271,13 +621,90 @@ class BasicTransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
+        self.use_lidar_cross_attention = bool(use_lidar_cross_attention)
+        self.lidar_evidence_channels = int(lidar_evidence_channels or 0)
+        if self.use_lidar_cross_attention:
+            self.norm_lidar = nn.LayerNorm(dim)
+            self.lidar_attention_mode = str(lidar_attention_mode or "token")
+            if self.lidar_attention_mode not in {"token", "reference"}:
+                raise ValueError(f"unknown lidar_attention_mode: {self.lidar_attention_mode}")
+            if self.lidar_attention_mode == "reference":
+                self.attn_lidar = LocalReferenceCrossAttention(
+                    query_dim=dim,
+                    context_dim=default(lidar_context_dim, context_dim),
+                    heads=n_heads,
+                    dim_head=d_head,
+                    dropout=dropout,
+                    reference_window=lidar_reference_window,
+                )
+            else:
+                self.attn_lidar = TokenCrossAttention(
+                    query_dim=dim,
+                    context_dim=default(lidar_context_dim, context_dim),
+                    heads=n_heads,
+                    dim_head=d_head,
+                    dropout=dropout,
+                )
+            gate_init = min(max(float(lidar_gate_init), 1e-6), 1.0 - 1e-6)
+            self.lidar_gate = nn.Parameter(torch.tensor(math.log(gate_init / (1.0 - gate_init))))
+            if self.lidar_evidence_channels > 0:
+                self.evidence_router = nn.Sequential(
+                    nn.Linear(self.lidar_evidence_channels, dim),
+                    nn.SiLU(),
+                    zero_module(nn.Linear(dim, 1)),
+                )
+            self.lidar_gate_cap = 1.0
 
-    def forward(self, x, context=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
-        return checkpoint(self._forward, (x, context, left_camera_k,  gt_shift_x, gt_shift_y, theta), self.parameters(), self.checkpoint)
+    def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+        if self.use_lidar_cross_attention and lidar_context is not None:
+            return checkpoint(
+                self._forward,
+                (x, context, lidar_context, lidar_evidence, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta),
+                self.parameters(),
+                self.checkpoint,
+            )
+        return checkpoint(
+            self._forward_without_lidar,
+            (x, context, left_camera_k, gt_shift_x, gt_shift_y, theta),
+            self.parameters(),
+            self.checkpoint,
+        )
 
-    def _forward(self, x, context=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+    def _forward_without_lidar(self, x, context=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         x = self.attn1(self.norm1(x)) + x
         x = self.attn2(self.norm2(x), context=context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+
+    def _lidar_gate(self, x, lidar_evidence=None, latent_hw=None):
+        gate_cap = torch.as_tensor(
+            getattr(self, "lidar_gate_cap", 1.0),
+            dtype=x.dtype,
+            device=x.device,
+        ).clamp(0.0, 1.0)
+        gate = torch.sigmoid(self.lidar_gate.to(dtype=x.dtype, device=x.device))
+        if (
+            lidar_evidence is None
+            or self.lidar_evidence_channels <= 0
+            or not hasattr(self, "evidence_router")
+            or latent_hw is None
+        ):
+            return gate_cap * gate
+        h, w = latent_hw
+        evidence = F.interpolate(lidar_evidence.float(), size=(int(h), int(w)), mode="area")
+        evidence = rearrange(evidence, "b c h w -> b (h w) c").to(device=x.device, dtype=x.dtype)
+        if evidence.shape[-1] != self.lidar_evidence_channels:
+            return gate_cap * gate
+        return gate_cap * torch.sigmoid(
+            self.evidence_router(evidence) + self.lidar_gate.to(dtype=x.dtype, device=x.device)
+        )
+
+    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+        x = self.attn1(self.norm1(x)) + x
+        x = self.attn2(self.norm2(x), context=context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta) + x
+        if lidar_context is not None:
+            lidar_delta = self.attn_lidar(self.norm_lidar(x), lidar_context, query_hw=latent_hw)
+            x = self._lidar_gate(x, lidar_evidence=lidar_evidence, latent_hw=latent_hw) * lidar_delta + x
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -290,8 +717,22 @@ class SpatialTransformer(nn.Module):
     Then apply standard transformer action.
     Finally, reshape to image
     """
-    def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None, checkpoint=False):
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.,
+        context_dim=None,
+        checkpoint=False,
+        use_lidar_cross_attention=False,
+        lidar_context_dim=None,
+        lidar_gate_init=1e-3,
+        lidar_evidence_channels=0,
+        lidar_attention_mode="token",
+        lidar_reference_window=3,
+    ):
         super().__init__()
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
@@ -304,7 +745,20 @@ class SpatialTransformer(nn.Module):
                                  padding=0)
 
         self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim, checkpoint=checkpoint)
+            [BasicTransformerBlock(
+                inner_dim,
+                n_heads,
+                d_head,
+                dropout=dropout,
+                context_dim=context_dim,
+                checkpoint=checkpoint,
+                use_lidar_cross_attention=use_lidar_cross_attention,
+                lidar_context_dim=lidar_context_dim,
+                lidar_gate_init=lidar_gate_init,
+                lidar_evidence_channels=lidar_evidence_channels,
+                lidar_attention_mode=lidar_attention_mode,
+                lidar_reference_window=lidar_reference_window,
+            )
                 for d in range(depth)]
         )
 
@@ -314,7 +768,7 @@ class SpatialTransformer(nn.Module):
                                               stride=1,
                                               padding=0))
 
-    def forward(self, x, context=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+    def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         # note: if no context is given, cross-attention defaults to self-attention
         b, c, h, w = x.shape
         x_in = x
@@ -322,7 +776,7 @@ class SpatialTransformer(nn.Module):
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
         for block in self.transformer_blocks:
-            x = block(x, context=context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            x = block(x, context=context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, latent_hw=(h, w), left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in

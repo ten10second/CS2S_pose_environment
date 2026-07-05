@@ -1,0 +1,165 @@
+model:
+  base_learning_rate: 5.0e-05
+  target: models.KITTI_geo_ldm.txt_control.Boost_Sat2Den_ddpm
+  params:
+    AE_config:
+      target: models.autoencoder.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: models.loss_fun.LPIPSWithDiscriminator
+          params:
+            disc_start: 50001
+            kl_weight: 0.000001
+            disc_weight: 0.5
+    AE_ckpt_path: /home/shizhm/Downloads/sd-v1-4.ckpt
+    DDPM_config:
+      target: models.KITTI_geo_ldm_diffusion.latent_diffusion.DDPM
+      params:
+        linear_start: 0.00085
+        linear_end: 0.012
+        timesteps: 1000
+        unet_config:
+          target: models.KITTI_geo_ldm_diffusion.openaimodel.UNetModel
+          params:
+            image_size: 32
+            in_channels: 4
+            out_channels: 4
+            model_channels: 320
+            attention_resolutions:
+            - 4
+            - 2
+            - 1
+            num_res_blocks: 2
+            channel_mult:
+            - 1
+            - 2
+            - 4
+            - 4
+            num_heads: 8
+            use_spatial_transformer: true
+            transformer_depth: 1
+            context_dim: 768
+            use_checkpoint: false
+            legacy: false
+            use_lidar_cross_attention: true
+            lidar_context_dim: 768
+            lidar_gate_init: 0.001
+            lidar_evidence_channels: 8
+        control_grd: null
+    Condition_config_grd:
+      target: ldm.modules.encoders.modules.CLIPVisionEmbedder
+    Condition_config_sat:
+      target: models.KITTI_geo_ldm.condition_model.VIT_224
+    Lidar_context_config:
+      target: models.KITTI_geo_ldm.lidar_condition_model.LidarRangeTokenEncoder
+      params:
+        front_in_channels: 10
+        range_in_channels: 3
+        hidden_channels: 128
+        range_feature_channels: 192
+        token_dim: 768
+        token_grid:
+        - 8
+        - 32
+        range_depth_samples: 8
+        image_size:
+        - 128
+        - 512
+        use_evidence_maps: true
+        evidence_dilation: 4
+        evidence_free_space_dilation: 14
+        use_pointmap_pe: true
+    pre_sat2grd_model_path:
+    pre_ldm_model_path: /home/shizhm/Downloads/sd-v1-4.ckpt
+    scale_factor: 0.18215
+    Condition_config_txt:
+      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+    use_lidar_cond: true
+    lidar_condition_key: lidar_cond
+    freeze_for_lidar_control: true
+    dynamic_loss_weight: 0.0
+    dynamic_x0_loss_weight: 0.0
+    dynamic_image_loss_weight: 0.0
+    dynamic_crop_image_loss_weight: 0.0
+    dynamic_crop_padding: 8
+    dynamic_point_loss_weight: 1.0
+    dynamic_point_x0_loss_weight: 0.5
+    dynamic_point_image_loss_weight: 2.0
+    dynamic_point_dilation: 8
+    dynamic_object_lpips_weight: 0.0
+    dynamic_object_lpips_padding: 6
+    dynamic_object_lpips_size: 64
+    dynamic_object_lpips_max_boxes: 4
+    foreground_mask_key: foreground_mask
+    foreground_loss_weight: 0.0
+    foreground_x0_loss_weight: 0.0
+    foreground_image_loss_weight: 0.0
+    foreground_lpips_loss_weight: 0.0
+    foreground_lpips_padding: 8
+    foreground_lpips_size: 96
+    foreground_lidar_intersection: false
+    static_teacher_consistency_weight: 0.0
+    static_teacher_gate_channel: 1
+    dynamic_class_token_weight: 0.0
+    lidar_train_sat_condition: false
+    lidar_sat_lr_scale: 0.1
+    lidar_unfreeze_denoise_all: false
+    lidar_unfreeze_output_blocks: 0
+    lidar_unfreeze_out: false
+    lidar_unfreeze_transformers: none
+    lidar_unet_lr_scale: 1.0
+    lidar_context_lr_scale: 1.0
+
+data:
+  target: dataloader.dataload.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 2
+    wrap: false
+    train:
+      target: dataloader.KITTI_raw_sat_lidar.SatLidarRawDataset
+      params:
+        manifest: dataset/kitti_raw_sat_lidar/train_manifest.jsonl
+        condition_mode: raw_lidar_pointmap
+        image_height: 128
+        image_width: 512
+        sat_size: 256
+        max_depth: 80.0
+        align_satellite_to_camera: true
+        include_range_image: true
+        range_height: 64
+        range_width: 1024
+        foreground_mask_root: ''
+        foreground_mask_suffix: _foreground.png
+    test:
+      target: dataloader.KITTI_raw_sat_lidar.SatLidarRawDatasetTest
+      params:
+        manifest: dataset/kitti_raw_sat_lidar/test2_manifest.jsonl
+        condition_mode: raw_lidar_pointmap
+        image_height: 128
+        image_width: 512
+        sat_size: 256
+        max_depth: 80.0
+        align_satellite_to_camera: true
+        include_range_image: true
+        range_height: 64
+        range_width: 1024
+        foreground_mask_root: ''
+        foreground_mask_suffix: _foreground.png

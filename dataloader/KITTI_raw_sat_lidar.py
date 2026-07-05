@@ -10,7 +10,11 @@ import torchvision.transforms.functional as TF
 
 from dataloader import KITTI_utils as kitti_utils
 from dataloader.kitti_raw_lidar_utils import (
+    build_kitti_range_image,
+    camera2_to_lidar_matrix,
     generate_lidar_condition,
+    lidar_to_camera2_matrix,
+    scaled_lidar_to_image_matrix,
     load_raw_calibration,
     parse_tracklet_xml,
     read_jsonl,
@@ -31,6 +35,12 @@ class SatLidarRawDataset(Dataset):
         max_depth: float = 80.0,
         max_dynamic_boxes: int = 32,
         align_satellite_to_camera: bool = True,
+        include_range_image: bool = True,
+        range_height: int = 64,
+        range_width: int = 1024,
+        foreground_mask_root: str = "",
+        foreground_mask_suffix: str = "_foreground.png",
+        include_tracklets: bool = True,
     ):
         self.manifest = manifest
         self.records = read_jsonl(manifest)
@@ -40,6 +50,12 @@ class SatLidarRawDataset(Dataset):
         self.max_depth = max_depth
         self.max_dynamic_boxes = max_dynamic_boxes
         self.align_satellite_to_camera = align_satellite_to_camera
+        self.include_range_image = include_range_image
+        self.range_height = range_height
+        self.range_width = range_width
+        self.foreground_mask_root = Path(foreground_mask_root) if foreground_mask_root else None
+        self.foreground_mask_suffix = foreground_mask_suffix
+        self.include_tracklets = bool(include_tracklets)
         self.meter_per_pixel = kitti_utils.get_meter_per_pixel()
 
         self.sat_to_tensor = transforms.ToTensor()
@@ -53,6 +69,24 @@ class SatLidarRawDataset(Dataset):
         self._calib_cache: Dict[str, dict] = {}
         self._tracklet_cache: Dict[str, dict] = {}
 
+    def _foreground_mask_path(self, sample_id: str) -> Path:
+        safe_id = sample_id.replace("/", "__")
+        return self.foreground_mask_root / f"{safe_id}{self.foreground_mask_suffix}"
+
+    def _foreground_mask(self, sample_id: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        mask = torch.zeros((1, *self.image_size), dtype=torch.float32)
+        available = torch.tensor([0.0], dtype=torch.float32)
+        if self.foreground_mask_root is None:
+            return mask, available
+        mask_path = self._foreground_mask_path(sample_id)
+        if not mask_path.is_file():
+            return mask, available
+        with Image.open(mask_path) as mask_img:
+            mask_pil = mask_img.convert("L").resize((self.image_size[1], self.image_size[0]), Image.NEAREST)
+        mask = (TF.to_tensor(mask_pil) > 0.5).float()
+        available = torch.tensor([1.0], dtype=torch.float32)
+        return mask, available
+
     def __len__(self):
         return len(self.records)
 
@@ -62,6 +96,8 @@ class SatLidarRawDataset(Dataset):
         return self._calib_cache[calib_dir]
 
     def _boxes_by_frame(self, xml_path: str):
+        if not self.include_tracklets:
+            return {}
         if not xml_path:
             return {}
         if xml_path not in self._tracklet_cache:
@@ -124,6 +160,7 @@ class SatLidarRawDataset(Dataset):
             sat_map = self.sat_to_tensor(self._satellite_image(sat_img, record["oxts_path"], calib))
         with Image.open(record["image_02_path"]) as grd_img:
             grd_left_img = self.grd_transform(grd_img.convert("RGB"))
+        foreground_mask, foreground_mask_available = self._foreground_mask(record["sample_id"])
 
         lidar = generate_lidar_condition(
             record["velodyne_path"],
@@ -134,11 +171,22 @@ class SatLidarRawDataset(Dataset):
             max_depth=self.max_depth,
             max_dynamic_boxes=self.max_dynamic_boxes,
         )
+        range_lidar = None
+        if self.include_range_image:
+            range_lidar = build_kitti_range_image(
+                record["velodyne_path"],
+                height=self.range_height,
+                width=self.range_width,
+                max_range=self.max_depth,
+            )
 
         sample = {
             "sat_map_gt": sat_map,
             "sat_map": sat_map,
             "left_camera_k": torch.from_numpy(scaled_camera_k(calib, self.image_size)),
+            "lidar_to_image": torch.from_numpy(scaled_lidar_to_image_matrix(calib, self.image_size)),
+            "lidar_to_camera": torch.from_numpy(lidar_to_camera2_matrix(calib)),
+            "camera_to_lidar": torch.from_numpy(camera2_to_lidar_matrix(calib)),
             "grd_left_imgs": grd_left_img,
             "gt_shift_x": torch.tensor([0.0], dtype=torch.float32),
             "gt_shift_y": torch.tensor([0.0], dtype=torch.float32),
@@ -150,12 +198,24 @@ class SatLidarRawDataset(Dataset):
             "dynamic_mask": torch.from_numpy(lidar["dynamic_mask"]).float(),
             "dynamic_boxes": torch.from_numpy(lidar["dynamic_boxes"]).float(),
             "dynamic_box_valid": torch.from_numpy(lidar["dynamic_box_valid"]).float(),
+            "foreground_mask": foreground_mask,
+            "foreground_mask_available": foreground_mask_available,
             "dynamic_class_hist": torch.from_numpy(lidar["dynamic_class_hist"]).float(),
             "lidar_valid_mask": torch.from_numpy(lidar["lidar_valid_mask"]).float(),
             "num_dynamic_boxes": torch.as_tensor(lidar["num_dynamic_boxes"], dtype=torch.long),
             "num_projected_lidar_points": torch.as_tensor(lidar["num_projected_lidar_points"], dtype=torch.long),
             "num_projected_dynamic_points": torch.as_tensor(lidar["num_projected_dynamic_points"], dtype=torch.long),
         }
+        if range_lidar is not None:
+            sample.update(
+                {
+                    "range_img": torch.from_numpy(range_lidar["range_img"]).float(),
+                    "range_mask": torch.from_numpy(range_lidar["range_mask"]).float(),
+                    "range_depth": torch.from_numpy(range_lidar["range_depth"]).float(),
+                    "range_intensity": torch.from_numpy(range_lidar["range_intensity"]).float(),
+                    "num_range_points": torch.as_tensor(range_lidar["num_range_points"], dtype=torch.long),
+                }
+            )
         return sample
 
 

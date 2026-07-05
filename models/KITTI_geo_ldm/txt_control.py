@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import torch.nn.functional as F
-from contextlib import contextmanager
 import numpy as np
 
 from tqdm import tqdm
@@ -58,30 +57,59 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 dynamic_object_lpips_size=64,
                 dynamic_object_lpips_max_boxes=4,
                 dynamic_mask_key="dynamic_mask",
+                foreground_mask_key="foreground_mask",
+                foreground_loss_weight=0.0,
+                foreground_x0_loss_weight=0.0,
+                foreground_image_loss_weight=0.0,
+                foreground_lpips_loss_weight=0.0,
+                foreground_lpips_padding=8,
+                foreground_lpips_size=96,
+                foreground_lidar_intersection=False,
+                lidar_counterfactual_weight=0.0,
+                lidar_counterfactual_margin=0.02,
+                lidar_counterfactual_probes="zero",
+                lidar_counterfactual_stop_negative=True,
+                lidar_counterfactual_separation_weight=0.0,
+                lidar_counterfactual_point_fallback=True,
+                lidar_counterfactual_exist_weight=1.0,
+                lidar_depth_loss_weight=0.0,
+                lidar_depth_log_eps=1e-3,
+                lidar_zero_reconstruction_loss_weight=0.0,
+                lidar_zero_reconstruction_mask_mode="all",
                 static_teacher_consistency_weight=0.0,
                 static_teacher_gate_channel=-1,
                 dynamic_class_token_weight=0.0,
                 dynamic_class_hist_key="dynamic_class_hist",
                 dynamic_class_token_count=8,
                 dynamic_class_token_dim=768,
+                satellite_condition_dropout_prob=0.0,
+                lidar_train_sat_condition=False,
+                lidar_sat_lr_scale=1.0,
+                lidar_unfreeze_denoise_all=False,
                 lidar_unfreeze_output_blocks=0,
                 lidar_unfreeze_out=False,
                 lidar_unfreeze_transformers="none",
                 lidar_unet_lr_scale=0.25,
+                lidar_unet_new_lr_scale=1.0,
+                Lidar_context_config=None,
+                use_lidar_control_residual=False,
+                lidar_context_lr_scale=1.0,
                 # lossconfig
                  ):
         super().__init__()
 
         self.pre_AE_model = self.init_AE(AE_config, AE_ckpt_path)
         self.DDPM = instantiate_from_config(DDPM_config)
-        if pre_ldm_model_path is not None:
-            pre_ldm_model = torch.load(pre_ldm_model_path)
+        if pre_ldm_model_path:
+            pre_ldm_model = torch.load(pre_ldm_model_path, map_location="cpu")
             self.load_pre_ldm_model(pre_ldm_model['state_dict'])
 
         self.condition_model_sat = instantiate_from_config(Condition_config_sat)
+        self.lidar_context_model = instantiate_from_config(Lidar_context_config) if Lidar_context_config else None
         self.scale_factor = scale_factor
         self.use_lidar_cond = use_lidar_cond
         self.lidar_condition_key = lidar_condition_key
+        self.use_lidar_control_residual = False
         self.freeze_for_lidar_control = freeze_for_lidar_control
         self.dynamic_loss_weight = dynamic_loss_weight
         self.dynamic_x0_loss_weight = dynamic_x0_loss_weight
@@ -97,6 +125,33 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.dynamic_object_lpips_size = dynamic_object_lpips_size
         self.dynamic_object_lpips_max_boxes = dynamic_object_lpips_max_boxes
         self.dynamic_mask_key = dynamic_mask_key
+        self.foreground_mask_key = foreground_mask_key
+        self.foreground_loss_weight = float(foreground_loss_weight)
+        self.foreground_x0_loss_weight = float(foreground_x0_loss_weight)
+        self.foreground_image_loss_weight = float(foreground_image_loss_weight)
+        self.foreground_lpips_loss_weight = float(foreground_lpips_loss_weight)
+        self.foreground_lpips_padding = int(foreground_lpips_padding)
+        self.foreground_lpips_size = int(foreground_lpips_size)
+        self.foreground_lidar_intersection = bool(foreground_lidar_intersection)
+        self.lidar_counterfactual_weight = float(lidar_counterfactual_weight)
+        self.lidar_counterfactual_margin = float(lidar_counterfactual_margin)
+        self.lidar_counterfactual_probes = str(lidar_counterfactual_probes or "")
+        self.lidar_counterfactual_stop_negative = bool(lidar_counterfactual_stop_negative)
+        self.lidar_counterfactual_separation_weight = float(lidar_counterfactual_separation_weight)
+        self.lidar_counterfactual_point_fallback = bool(lidar_counterfactual_point_fallback)
+        self.lidar_counterfactual_exist_weight = float(lidar_counterfactual_exist_weight)
+        self.last_lidar_counterfactual_metrics = {}
+        self.lidar_depth_loss_weight = float(lidar_depth_loss_weight)
+        self.lidar_depth_log_eps = float(lidar_depth_log_eps)
+        self.lidar_zero_reconstruction_loss_weight = float(lidar_zero_reconstruction_loss_weight)
+        self.lidar_zero_reconstruction_mask_mode = str(lidar_zero_reconstruction_mask_mode or "all")
+        if self.lidar_zero_reconstruction_mask_mode not in {"all", "background"}:
+            raise ValueError(
+                "lidar_zero_reconstruction_mask_mode must be 'all' or 'background', "
+                f"got {self.lidar_zero_reconstruction_mask_mode!r}"
+            )
+        self.satellite_condition_dropout_prob = float(satellite_condition_dropout_prob)
+        self.last_satellite_condition_dropout_metrics = {}
         self.static_teacher_consistency_weight = float(static_teacher_consistency_weight)
         self.static_teacher_gate_channel = int(static_teacher_gate_channel)
         self.dynamic_class_token_weight = dynamic_class_token_weight
@@ -105,12 +160,17 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             self.dynamic_class_tokens = nn.Parameter(torch.zeros(dynamic_class_token_count, dynamic_class_token_dim))
         else:
             self.dynamic_class_tokens = None
+        self.lidar_train_sat_condition = bool(lidar_train_sat_condition)
+        self.lidar_sat_lr_scale = float(lidar_sat_lr_scale)
+        self.lidar_unfreeze_denoise_all = bool(lidar_unfreeze_denoise_all)
         self.lidar_unfreeze_output_blocks = int(lidar_unfreeze_output_blocks)
         self.lidar_unfreeze_out = bool(lidar_unfreeze_out)
         self.lidar_unfreeze_transformers = str(lidar_unfreeze_transformers or "none")
         self.lidar_unet_lr_scale = float(lidar_unet_lr_scale)
-        if pre_sat2grd_model_path is not None:
-            pre_sat2grd_model = torch.load(pre_sat2grd_model_path)
+        self.lidar_unet_new_lr_scale = float(lidar_unet_new_lr_scale)
+        self.lidar_context_lr_scale = float(lidar_context_lr_scale)
+        if pre_sat2grd_model_path:
+            pre_sat2grd_model = torch.load(pre_sat2grd_model_path, map_location="cpu")
             self.load_pre_sat2grd_model(pre_sat2grd_model['state_dict'])
             
         self.evaluate = Evaluate_indic()
@@ -193,6 +253,23 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             mask = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=dilation)
         return mask.clamp(0.0, 1.0)
 
+    def lidar_depth_target_mask(self, lidar_cond, latent_shape):
+        if lidar_cond is None or lidar_cond.shape[1] < 3:
+            return None, None
+        hit = lidar_cond[:, 1:2].float().clamp(0.0, 1.0)
+        depth = lidar_cond[:, 2:3].float().clamp(0.0, 1.0) * hit
+        target_h, target_w = latent_shape[-2:]
+        if hit.shape[-2] % target_h == 0 and hit.shape[-1] % target_w == 0:
+            kernel = (hit.shape[-2] // target_h, hit.shape[-1] // target_w)
+            hit_avg = F.avg_pool2d(hit, kernel_size=kernel, stride=kernel)
+            depth_avg = F.avg_pool2d(depth, kernel_size=kernel, stride=kernel)
+        else:
+            hit_avg = F.interpolate(hit, size=(target_h, target_w), mode="area")
+            depth_avg = F.interpolate(depth, size=(target_h, target_w), mode="area")
+        mask = (hit_avg > 0.0).to(depth_avg.dtype)
+        target = (depth_avg / hit_avg.clamp_min(1e-6)).clamp(0.0, 1.0)
+        return target * mask, mask
+
     def static_teacher_loss_mask(self, lidar_cond, latent_shape):
         if (
             lidar_cond is None
@@ -206,6 +283,22 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         if gate.shape[-2:] != latent_shape[-2:]:
             gate = F.interpolate(gate, size=latent_shape[-2:], mode="area")
         return (1.0 - gate).clamp(0.0, 1.0)
+
+    def foreground_image_mask(self, batch, lidar_cond, image_shape):
+        if self.foreground_mask_key not in batch:
+            return None
+        mask = batch[self.foreground_mask_key].float()
+        if mask.ndim == 3:
+            mask = mask[:, None]
+        target_h, target_w = image_shape[-2:]
+        if mask.shape[-2:] != (target_h, target_w):
+            mask = F.interpolate(mask, size=(target_h, target_w), mode="nearest")
+        mask = mask.clamp(0.0, 1.0)
+        if self.foreground_lidar_intersection:
+            lidar_mask = self.dynamic_point_image_mask(lidar_cond, image_shape)
+            if lidar_mask is not None:
+                mask = mask * lidar_mask.to(device=mask.device, dtype=mask.dtype)
+        return mask.clamp(0.0, 1.0)
 
     def append_dynamic_class_token(self, cond_label, batch=None):
         if self.dynamic_class_tokens is None or self.dynamic_class_token_weight <= 0.0:
@@ -231,6 +324,338 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         cond_label = self.condition_model_sat(inputs)
         cond_label = cond_label[:, 1:, :]
         return self.append_dynamic_class_token(cond_label, batch)
+
+    def apply_satellite_condition_dropout(self, cond_label):
+        metrics = {
+            "satellite_condition_dropout_prob": float(self.satellite_condition_dropout_prob),
+            "satellite_condition_dropout_applied": 0.0,
+            "satellite_condition_dropout_fraction": 0.0,
+        }
+        prob = max(0.0, min(1.0, float(self.satellite_condition_dropout_prob)))
+        if (not self.training) or prob <= 0.0 or cond_label is None:
+            self.last_satellite_condition_dropout_metrics = metrics
+            return cond_label
+        drop_mask = (torch.rand(cond_label.shape[0], 1, 1, device=cond_label.device) < prob).to(
+            dtype=cond_label.dtype
+        )
+        dropped = cond_label * (1.0 - drop_mask)
+        metrics.update(
+            {
+                "satellite_condition_dropout_applied": 1.0,
+                "satellite_condition_dropout_fraction": float(drop_mask.detach().float().mean().cpu()),
+            }
+        )
+        self.last_satellite_condition_dropout_metrics = metrics
+        return dropped
+
+    def make_lidar_context(self, lidar_cond, range_img=None, range_mask=None, camera_to_lidar=None, left_camera_k=None):
+        if self.lidar_context_model is None or lidar_cond is None:
+            return None
+        return self.lidar_context_model(
+            lidar_cond,
+            range_img=range_img,
+            range_mask=range_mask,
+            camera_k=left_camera_k,
+            camera_to_lidar=camera_to_lidar,
+        )
+
+    def make_lidar_evidence(self, lidar_cond):
+        if self.lidar_context_model is None or lidar_cond is None:
+            return None
+        if hasattr(self.lidar_context_model, "make_evidence_maps"):
+            return self.lidar_context_model.make_evidence_maps(lidar_cond)
+        return None
+
+    def lidar_counterfactual_probe_names(self):
+        probes = [item.strip() for item in self.lidar_counterfactual_probes.split(",") if item.strip()]
+        unsupported = [probe for probe in probes if probe != "zero"]
+        if unsupported:
+            raise ValueError(
+                "LiDAR counterfactual training now supports only the zero probe; "
+                f"remove unsupported probes: {', '.join(unsupported)}"
+            )
+        return probes
+
+    def apply_lidar_counterfactual_probe(self, tensor, probe):
+        if tensor is None:
+            return None
+        if probe == "zero":
+            return torch.zeros_like(tensor)
+        raise ValueError(f"Unsupported LiDAR counterfactual probe: {probe}")
+
+    def lidar_counterfactual_mask(self, foreground_image_loss_mask, point_image_loss_mask):
+        mask = None
+        if foreground_image_loss_mask is not None and float(foreground_image_loss_mask.detach().sum().cpu()) > 0.0:
+            mask = foreground_image_loss_mask
+        elif (
+            self.lidar_counterfactual_point_fallback
+            and point_image_loss_mask is not None
+            and float(point_image_loss_mask.detach().sum().cpu()) > 0.0
+        ):
+            mask = point_image_loss_mask
+        return mask
+
+    def masked_image_l1(self, pred_image, target_image, mask):
+        loss_raw = F.l1_loss(pred_image, target_image, reduction="none")
+        return self.DDPM._masked_loss_mean(loss_raw, mask)
+
+    def masked_depth_log_l1(self, pred_depth, target_depth, mask):
+        if pred_depth is None or target_depth is None or mask is None:
+            return None
+        pred = pred_depth.float().clamp(1e-6, 1.0)
+        target = target_depth.float()
+        if target.ndim == 3:
+            target = target[:, None]
+        if target.shape[-2:] != pred.shape[-2:]:
+            target = F.interpolate(target, size=pred.shape[-2:], mode="nearest")
+        target = target.to(device=pred.device, dtype=pred.dtype).clamp(1e-6, 1.0)
+        prepared_mask = self.DDPM._prepare_loss_mask(mask, pred)
+        eps = max(float(self.lidar_depth_log_eps), 1e-6)
+        loss_raw = (torch.log(pred.clamp_min(eps)) - torch.log(target.clamp_min(eps))).abs()
+        return self.DDPM._masked_loss_mean(loss_raw, prepared_mask)
+
+    def snapshot_lidar_monitor_state(self):
+        state = {"context": {}, "attention": []}
+        context_model = getattr(self, "lidar_context_model", None)
+        if context_model is not None:
+            for name in [
+                "last_valid_sample_ratio",
+                "last_hit_coverage",
+                "last_empty_coverage",
+                "last_pointmap_coverage",
+                "last_token_mean_norm",
+                "last_token_centered_norm",
+                "last_token_centered_to_mean_ratio",
+                "last_token_var_mean",
+                "last_token_proj_bias_norm",
+                "last_token_output_mean_norm",
+                "last_token_output_centered_norm",
+                "last_token_output_centered_to_mean_ratio",
+                "last_token_output_var_mean",
+            ]:
+                value = getattr(context_model, name, None)
+                if torch.is_tensor(value):
+                    state["context"][name] = value.detach().clone()
+        for module in self.DDPM.denoise_model.modules():
+            if not hasattr(module, "last_attn_entropy_norm"):
+                continue
+            module_state = {}
+            for name in [
+                "last_sim_std_mean",
+                "last_sim_range_mean",
+                "last_attn_entropy_norm",
+                "last_attn_max_mean",
+                "last_attn_std_mean",
+                "last_attn_token_count",
+                "last_attn_query_count",
+            ]:
+                if not hasattr(module, name):
+                    continue
+                value = getattr(module, name)
+                module_state[name] = value.detach().clone() if torch.is_tensor(value) else value
+            state["attention"].append((module, module_state))
+        return state
+
+    def restore_lidar_monitor_state(self, state):
+        context_model = getattr(self, "lidar_context_model", None)
+        if context_model is not None:
+            for name, value in state.get("context", {}).items():
+                target = getattr(context_model, name, None)
+                if torch.is_tensor(target):
+                    target.copy_(value.to(device=target.device, dtype=target.dtype))
+        for module, module_state in state.get("attention", []):
+            for name, value in module_state.items():
+                target = getattr(module, name, None)
+                if torch.is_tensor(target) and torch.is_tensor(value):
+                    target.copy_(value.to(device=target.device, dtype=target.dtype))
+                else:
+                    setattr(module, name, value)
+
+    def lidar_counterfactual_loss(
+        self,
+        normal_outputs,
+        pre_residual_laten,
+        t,
+        noise,
+        outputs,
+        cond_label,
+        lidar_cond,
+        range_img,
+        range_mask,
+        camera_to_lidar,
+        left_camera_k,
+        gt_shift_x,
+        gt_shift_y,
+        theta,
+        foreground_image_loss_mask,
+        point_image_loss_mask,
+        lidar_depth_target,
+        lidar_depth_mask,
+    ):
+        metrics = {
+            "lidar_counterfactual_applied": 0,
+            "lidar_counterfactual_mask_coverage": 0.0,
+            "lidar_counterfactual_normal_l1": 0.0,
+            "lidar_counterfactual_zero_l1": 0.0,
+            "lidar_counterfactual_normal_depth_log_l1": 0.0,
+            "lidar_counterfactual_zero_depth_log_l1": 0.0,
+            "lidar_counterfactual_zero_minus_normal_depth_log_l1": 0.0,
+            "lidar_counterfactual_exist_loss": 0.0,
+            "lidar_counterfactual_rank_loss": 0.0,
+            "lidar_counterfactual_separation_loss": 0.0,
+            "lidar_counterfactual_total_contrib": 0.0,
+            "lidar_zero_reconstruction_loss": 0.0,
+            "lidar_zero_reconstruction_loss_contrib": 0.0,
+            "lidar_zero_reconstruction_mask_coverage": 0.0,
+        }
+        probes = self.lidar_counterfactual_probe_names()
+        needs_rgb_counterfactual = self.lidar_counterfactual_weight > 0.0 and "zero" in probes
+        needs_zero_reconstruction = self.lidar_zero_reconstruction_loss_weight > 0.0 and "zero" in probes
+        if not needs_rgb_counterfactual and not needs_zero_reconstruction:
+            self.last_lidar_counterfactual_metrics = metrics
+            return pre_residual_laten.new_tensor(0.0)
+        if lidar_cond is None:
+            self.last_lidar_counterfactual_metrics = metrics
+            return pre_residual_laten.new_tensor(0.0)
+        mask = self.lidar_counterfactual_mask(foreground_image_loss_mask, point_image_loss_mask)
+        if mask is None:
+            self.last_lidar_counterfactual_metrics = metrics
+            return pre_residual_laten.new_tensor(0.0)
+
+        normal_pred = normal_outputs["pred_image"]
+        normal_l1 = (
+            self.masked_image_l1(normal_pred, outputs, mask)
+            if needs_rgb_counterfactual and normal_pred is not None
+            else pre_residual_laten.new_tensor(0.0)
+        )
+        normal_monitor_state = self.snapshot_lidar_monitor_state()
+
+        zero_lidar_cond = self.apply_lidar_counterfactual_probe(lidar_cond, "zero")
+        zero_range_img = self.apply_lidar_counterfactual_probe(range_img, "zero")
+        zero_range_mask = self.apply_lidar_counterfactual_probe(range_mask, "zero")
+        stop_negative = (
+            self.lidar_counterfactual_stop_negative
+            and not needs_zero_reconstruction
+        )
+        neg_ctx = torch.no_grad() if stop_negative else torch.enable_grad()
+        with neg_ctx:
+            zero_lidar_context = self.make_lidar_context(
+                zero_lidar_cond,
+                range_img=zero_range_img,
+                range_mask=zero_range_mask,
+                camera_to_lidar=camera_to_lidar,
+                left_camera_k=left_camera_k,
+            )
+            zero_lidar_evidence = self.make_lidar_evidence(zero_lidar_cond)
+            zero_outputs = self.DDPM.p_losses(
+                pre_residual_laten,
+                t,
+                cond_init_grd=None,
+                cond_sat=None,
+                cond_txt=cond_label,
+                lidar_context=zero_lidar_context,
+                lidar_evidence=zero_lidar_evidence,
+                noise=noise,
+                left_camera_k=left_camera_k,
+                gt_shift_x=gt_shift_x,
+                gt_shift_y=gt_shift_y,
+                theta=theta,
+                range_img=zero_range_img,
+                range_mask=zero_range_mask,
+                camera_to_lidar=camera_to_lidar,
+                x0_image_target=outputs,
+                image_decoder=self.pre_AE_model,
+                latent_scale_factor=self.scale_factor,
+                return_outputs=True,
+            )
+
+        zero_pred = zero_outputs["pred_image"]
+        zero_l1 = (
+            self.masked_image_l1(zero_pred, outputs, mask)
+            if needs_rgb_counterfactual and zero_pred is not None
+            else pre_residual_laten.new_tensor(0.0)
+        )
+        normal_depth_l1 = self.masked_depth_log_l1(
+            normal_outputs.get("lidar_depth_pred"),
+            lidar_depth_target,
+            lidar_depth_mask,
+        )
+        zero_depth_l1 = self.masked_depth_log_l1(
+            zero_outputs.get("lidar_depth_pred"),
+            lidar_depth_target,
+            lidar_depth_mask,
+        )
+        zero_l1_for_rank = zero_l1.detach() if self.lidar_counterfactual_stop_negative else zero_l1
+        if needs_rgb_counterfactual and self.lidar_counterfactual_exist_weight > 0.0:
+            exist_loss = F.relu(normal_l1 - zero_l1_for_rank + float(self.lidar_counterfactual_margin))
+        else:
+            exist_loss = pre_residual_laten.new_tensor(0.0)
+
+        if needs_rgb_counterfactual and self.lidar_counterfactual_separation_weight > 0.0:
+            sep_target = zero_pred.detach() if self.lidar_counterfactual_stop_negative else zero_pred
+            sep_l1 = self.masked_image_l1(normal_pred, sep_target, mask)
+            separation_loss = F.relu(float(self.lidar_counterfactual_margin) - sep_l1)
+        else:
+            separation_loss = pre_residual_laten.new_tensor(0.0)
+        zero_reconstruction_mask_coverage = 0.0
+        if needs_zero_reconstruction:
+            if self.lidar_zero_reconstruction_mask_mode == "background":
+                zero_loss_raw = zero_outputs.get("loss_raw")
+                if zero_loss_raw is None:
+                    zero_reconstruction = zero_outputs.get("loss", pre_residual_laten.new_tensor(0.0))
+                    zero_reconstruction_mask_coverage = 1.0
+                else:
+                    foreground_mask = self.DDPM._prepare_loss_mask(mask, zero_loss_raw)
+                    reconstruction_mask = (1.0 - foreground_mask).clamp(0.0, 1.0)
+                    zero_reconstruction = self.DDPM._masked_loss_mean(zero_loss_raw, reconstruction_mask)
+                    zero_reconstruction_mask_coverage = float(
+                        reconstruction_mask.detach().float().mean().cpu()
+                    )
+            else:
+                zero_reconstruction = zero_outputs.get("loss", pre_residual_laten.new_tensor(0.0))
+                zero_reconstruction_mask_coverage = 1.0
+        else:
+            zero_reconstruction = pre_residual_laten.new_tensor(0.0)
+        total = float(self.lidar_counterfactual_weight) * (
+            float(self.lidar_counterfactual_exist_weight) * exist_loss
+            + float(self.lidar_counterfactual_separation_weight) * separation_loss
+        )
+        total = total + float(self.lidar_zero_reconstruction_loss_weight) * zero_reconstruction
+        metrics.update(
+            {
+                "lidar_counterfactual_applied": 1,
+                "lidar_counterfactual_mask_coverage": float(mask.detach().float().mean().cpu()),
+                "lidar_counterfactual_normal_l1": float(normal_l1.detach().cpu()),
+                "lidar_counterfactual_zero_l1": float(zero_l1.detach().cpu()),
+                "lidar_counterfactual_normal_depth_log_l1": float(normal_depth_l1.detach().cpu())
+                if normal_depth_l1 is not None
+                else 0.0,
+                "lidar_counterfactual_zero_depth_log_l1": float(zero_depth_l1.detach().cpu())
+                if zero_depth_l1 is not None
+                else 0.0,
+                "lidar_counterfactual_zero_minus_normal_depth_log_l1": float(
+                    (zero_depth_l1 - normal_depth_l1).detach().cpu()
+                )
+                if normal_depth_l1 is not None and zero_depth_l1 is not None
+                else 0.0,
+                "lidar_counterfactual_exist_loss": float(exist_loss.detach().cpu()),
+                "lidar_counterfactual_rank_loss": float(exist_loss.detach().cpu()),
+                "lidar_counterfactual_separation_loss": float(separation_loss.detach().cpu()),
+                "lidar_counterfactual_total_contrib": float(total.detach().cpu()),
+                "lidar_zero_reconstruction_loss": float(zero_reconstruction.detach().cpu()),
+                "lidar_zero_reconstruction_loss_contrib": float(
+                    (
+                        float(self.lidar_zero_reconstruction_loss_weight) * zero_reconstruction
+                    ).detach().cpu()
+                ),
+                "lidar_zero_reconstruction_mask_coverage": zero_reconstruction_mask_coverage,
+            }
+        )
+        self.last_lidar_counterfactual_metrics = metrics
+        if "loss_metrics" in normal_outputs:
+            self.DDPM.last_loss_metrics = normal_outputs["loss_metrics"]
+        self.restore_lidar_monitor_state(normal_monitor_state)
+        return total
 
     def load_pre_sat2grd_model(self, pre_sat2grd_model):
         # self.load_pth_rematch(pre_sat2grd_model, self.Sat2Den, 'Sat2Den.', None)
@@ -270,7 +695,11 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             if 'first_stage_model' in k:
                 new_k = k.replace('first_stage_model.', '')
                 AE_state_dict[new_k] = v
-        self.pre_AE_model.load_state_dict(AE_state_dict)
+            elif 'pre_AE_model' in k:
+                new_k = k.replace('pre_AE_model.', '')
+                AE_state_dict[new_k] = v
+        if AE_state_dict:
+            self.pre_AE_model.load_state_dict(AE_state_dict, strict=False)
 
         # cond_state_dict = OrderedDict()
         # for k, v in pre_sat2grd_model.items():
@@ -286,7 +715,11 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             if 'diffusion_model' in k:
                 new_k = k.replace('model.diffusion_model.', '')
                 DDPM_state_dict[new_k] = v
-        self.DDPM.denoise_model.load_state_dict(DDPM_state_dict, strict=False)  
+            elif 'DDPM.denoise_model' in k:
+                new_k = k.replace('DDPM.denoise_model.', '')
+                DDPM_state_dict[new_k] = v
+        if DDPM_state_dict:
+            self.DDPM.denoise_model.load_state_dict(DDPM_state_dict, strict=False)
         
         
     def load_pth_rematch(self, state_dict, model, orin_key, aim_key):
@@ -296,9 +729,9 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 new_k = k.replace(orin_key, '')  
                 new_state_dict[new_k] = v
         if aim_key:
-            eval("model." + aim_key).load_state_dict(new_state_dict)
+            eval("model." + aim_key).load_state_dict(new_state_dict, strict=False)
         else:
-            model.load_state_dict(new_state_dict)
+            model.load_state_dict(new_state_dict, strict=False)
 
     def init_AE(self, AE_config, AE_ckpt_path):
         model = instantiate_from_config(AE_config)
@@ -307,14 +740,17 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         for param in model.parameters():
             param.requires_grad = False
 
-        checkpoint = torch.load(AE_ckpt_path)['state_dict']
+        checkpoint = torch.load(AE_ckpt_path, map_location="cpu")['state_dict']
         model_state_dict = OrderedDict()
         for key, value in checkpoint.items():
             if 'first_stage_model' in key:
                 new_k = key.replace('first_stage_model.', '') 
                 model_state_dict[new_k] = checkpoint[key]
+            elif 'pre_AE_model' in key:
+                new_k = key.replace('pre_AE_model.', '')
+                model_state_dict[new_k] = checkpoint[key]
         # self.load_pth_rematch(checkpoint['state_dict'], model, 'pre_AE_model.', None)
-        model.load_state_dict(model_state_dict)
+        model.load_state_dict(model_state_dict, strict=False)
         return model
         
 
@@ -324,7 +760,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         model.train = disabled_train
         for param in model.parameters():
             param.requires_grad = False
-        checkpoint = torch.load(AE_ckpt_path)
+        checkpoint = torch.load(AE_ckpt_path, map_location="cpu")
         self.load_pth_rematch(checkpoint['netG'], model, 'depth_model.', 'depth_model')
         self.load_pth_rematch(checkpoint['netG'], model, 'denoise_model.', 'denoise_model')
         self.load_pth_rematch(checkpoint['netG'], model, 'style_encode.', 'style_encode')
@@ -423,6 +859,13 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         lidar_cond = None
         if self.use_lidar_cond and self.lidar_condition_key in batch:
             lidar_cond = self.get_input(batch, self.lidar_condition_key)
+        range_img = self.get_input(batch, "range_img") if self.use_lidar_cond and "range_img" in batch else None
+        range_mask = self.get_input(batch, "range_mask") if self.use_lidar_cond and "range_mask" in batch else None
+        camera_to_lidar = (
+            self.get_input(batch, "camera_to_lidar").squeeze(-1)
+            if self.use_lidar_cond and "camera_to_lidar" in batch
+            else None
+        )
 
         left_camera_k = self.get_input(batch, "left_camera_k").squeeze(-1)
         gt_shift_x = batch['gt_shift_x']
@@ -434,7 +877,15 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         outputs = outputs*2 - 1
 
 
-        cond_label = self.make_condition(inputs, batch)
+        cond_label = self.apply_satellite_condition_dropout(self.make_condition(inputs, batch))
+        lidar_context = self.make_lidar_context(
+            lidar_cond,
+            range_img=range_img,
+            range_mask=range_mask,
+            camera_to_lidar=camera_to_lidar,
+            left_camera_k=left_camera_k,
+        )
+        lidar_evidence = self.make_lidar_evidence(lidar_cond)
         pre_residual_laten = self.pre_AE_model.encode(outputs).sample().detach()
 
         pre_residual_laten = pre_residual_laten * self.scale_factor
@@ -451,6 +902,23 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         crop_image_loss_mask = self.dynamic_crop_mask(batch[self.dynamic_mask_key].to(outputs.device), outputs.shape) if self.dynamic_crop_image_loss_weight > 0.0 and self.dynamic_mask_key in batch else None
         point_loss_mask = self.dynamic_point_mask(lidar_cond, pre_residual_laten.shape) if (self.dynamic_point_loss_weight > 0.0 or self.dynamic_point_x0_loss_weight > 0.0) else None
         point_image_loss_mask = self.dynamic_point_image_mask(lidar_cond, outputs.shape) if self.dynamic_point_image_loss_weight > 0.0 else None
+        lidar_depth_target, lidar_depth_mask = (
+            self.lidar_depth_target_mask(lidar_cond, pre_residual_laten.shape)
+            if self.lidar_depth_loss_weight > 0.0
+            else (None, None)
+        )
+        needs_foreground_mask = (
+            self.foreground_loss_weight > 0.0
+            or self.foreground_x0_loss_weight > 0.0
+            or self.foreground_image_loss_weight > 0.0
+            or self.foreground_lpips_loss_weight > 0.0
+        )
+        foreground_image_loss_mask = self.foreground_image_mask(batch, lidar_cond, outputs.shape) if needs_foreground_mask else None
+        foreground_loss_mask = (
+            self.latent_dynamic_mask(foreground_image_loss_mask, pre_residual_laten.shape)
+            if foreground_image_loss_mask is not None
+            else None
+        )
         static_teacher_loss_mask = self.static_teacher_loss_mask(lidar_cond, pre_residual_laten.shape)
         object_boxes = batch.get("dynamic_boxes")
         object_box_valid = batch.get("dynamic_box_valid")
@@ -458,9 +926,98 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             object_boxes = object_boxes.to(outputs.device)
         if object_box_valid is not None:
             object_box_valid = object_box_valid.to(outputs.device)
-        if self.dynamic_object_lpips_weight > 0.0:
+        if self.dynamic_object_lpips_weight > 0.0 or self.foreground_lpips_loss_weight > 0.0:
             self.evaluate.loss_fn_alex.eval()
-        loss = self.DDPM.t_losses(pre_residual_laten, cond_init_grd=lidar_cond, cond_sat=None, cond_txt = cond_label, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, loss_mask=loss_mask, loss_mask_weight=self.dynamic_loss_weight, x0_loss_weight=self.dynamic_x0_loss_weight, extra_loss_mask=point_loss_mask, extra_loss_mask_weight=self.dynamic_point_loss_weight, extra_x0_loss_weight=self.dynamic_point_x0_loss_weight, image_x0_loss_weight=self.dynamic_image_loss_weight, crop_image_x0_loss_weight=self.dynamic_crop_image_loss_weight, point_image_x0_loss_weight=self.dynamic_point_image_loss_weight, object_lpips_loss_weight=self.dynamic_object_lpips_weight, x0_image_target=outputs, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=self.evaluate.loss_fn_alex, object_lpips_padding=self.dynamic_object_lpips_padding, object_lpips_size=self.dynamic_object_lpips_size, object_lpips_max_boxes=self.dynamic_object_lpips_max_boxes, image_decoder=self.pre_AE_model, latent_scale_factor=self.scale_factor, static_teacher_loss_mask=static_teacher_loss_mask, static_teacher_consistency_weight=self.static_teacher_consistency_weight)
+        loss_kwargs = {
+            "cond_init_grd": None,
+            "cond_sat": None,
+            "cond_txt": cond_label,
+            "lidar_context": lidar_context,
+            "lidar_evidence": lidar_evidence,
+            "left_camera_k": left_camera_k,
+            "gt_shift_x": gt_shift_x,
+            "gt_shift_y": gt_shift_y,
+            "theta": theta,
+            "range_img": range_img,
+            "range_mask": range_mask,
+            "camera_to_lidar": camera_to_lidar,
+            "loss_mask": loss_mask,
+            "loss_mask_weight": self.dynamic_loss_weight,
+            "x0_loss_weight": self.dynamic_x0_loss_weight,
+            "extra_loss_mask": point_loss_mask,
+            "extra_loss_mask_weight": self.dynamic_point_loss_weight,
+            "extra_x0_loss_weight": self.dynamic_point_x0_loss_weight,
+            "foreground_loss_mask": foreground_loss_mask,
+            "foreground_loss_weight": self.foreground_loss_weight,
+            "foreground_x0_loss_weight": self.foreground_x0_loss_weight,
+            "foreground_image_loss_weight": self.foreground_image_loss_weight,
+            "foreground_lpips_loss_weight": self.foreground_lpips_loss_weight,
+            "foreground_image_loss_mask": foreground_image_loss_mask,
+            "foreground_lpips_padding": self.foreground_lpips_padding,
+            "foreground_lpips_size": self.foreground_lpips_size,
+            "image_x0_loss_weight": self.dynamic_image_loss_weight,
+            "crop_image_x0_loss_weight": self.dynamic_crop_image_loss_weight,
+            "point_image_x0_loss_weight": self.dynamic_point_image_loss_weight,
+            "object_lpips_loss_weight": self.dynamic_object_lpips_weight,
+            "x0_image_target": outputs,
+            "image_loss_mask": image_loss_mask,
+            "crop_image_loss_mask": crop_image_loss_mask,
+            "point_image_loss_mask": point_image_loss_mask,
+            "object_boxes": object_boxes,
+            "object_box_valid": object_box_valid,
+            "object_lpips_model": self.evaluate.loss_fn_alex,
+            "object_lpips_padding": self.dynamic_object_lpips_padding,
+            "object_lpips_size": self.dynamic_object_lpips_size,
+            "object_lpips_max_boxes": self.dynamic_object_lpips_max_boxes,
+            "image_decoder": self.pre_AE_model,
+            "latent_scale_factor": self.scale_factor,
+            "static_teacher_loss_mask": static_teacher_loss_mask,
+            "static_teacher_consistency_weight": self.static_teacher_consistency_weight,
+            "lidar_depth_target": lidar_depth_target,
+            "lidar_depth_mask": lidar_depth_mask,
+            "lidar_depth_loss_weight": self.lidar_depth_loss_weight,
+            "lidar_depth_log_eps": self.lidar_depth_log_eps,
+        }
+        self.last_lidar_counterfactual_metrics = {}
+        if (
+            (
+                self.lidar_counterfactual_weight > 0.0
+                or self.lidar_zero_reconstruction_loss_weight > 0.0
+            )
+            and self.use_lidar_cond
+        ):
+            t = torch.randint(0, self.DDPM.num_timesteps, (pre_residual_laten.shape[0],), device=pre_residual_laten.device).long()
+            noise = torch.randn_like(pre_residual_laten)
+            normal_outputs = self.DDPM.p_losses(
+                pre_residual_laten,
+                t,
+                noise=noise,
+                return_outputs=True,
+                **loss_kwargs,
+            )
+            loss = normal_outputs["loss"]
+            loss = loss + self.lidar_counterfactual_loss(
+                normal_outputs,
+                pre_residual_laten,
+                t,
+                noise,
+                outputs,
+                cond_label,
+                lidar_cond,
+                range_img,
+                range_mask,
+                camera_to_lidar,
+                left_camera_k,
+                gt_shift_x,
+                gt_shift_y,
+                theta,
+                foreground_image_loss_mask,
+                point_image_loss_mask,
+                lidar_depth_target,
+                lidar_depth_mask,
+            )
+        else:
+            loss = self.DDPM.t_losses(pre_residual_laten, **loss_kwargs)
         self.log("L1_loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         return loss
         
@@ -472,6 +1029,13 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         lidar_cond = None
         if self.use_lidar_cond and self.lidar_condition_key in batch:
             lidar_cond = self.get_input(batch, self.lidar_condition_key)
+        range_img = self.get_input(batch, "range_img") if self.use_lidar_cond and "range_img" in batch else None
+        range_mask = self.get_input(batch, "range_mask") if self.use_lidar_cond and "range_mask" in batch else None
+        camera_to_lidar = (
+            self.get_input(batch, "camera_to_lidar").squeeze(-1)
+            if self.use_lidar_cond and "camera_to_lidar" in batch
+            else None
+        )
 
         left_camera_k = self.get_input(batch, "left_camera_k").squeeze(-1)
         gt_shift_x = batch['gt_shift_x']
@@ -485,7 +1049,14 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
 
         cond_label = self.make_condition(inputs, batch)
         sat_con = cond_label.detach()
-
+        lidar_context = self.make_lidar_context(
+            lidar_cond,
+            range_img=range_img,
+            range_mask=range_mask,
+            camera_to_lidar=camera_to_lidar,
+            left_camera_k=left_camera_k,
+        )
+        lidar_evidence = self.make_lidar_evidence(lidar_cond)
         sampler = KITTI_DDIMSampler(self.DDPM, self.pre_AE_model, self.scale_factor)
         n_samples = outputs.size()[0] 
         shape = [1, 4, 16, 64] 
@@ -508,7 +1079,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                                         x_T=start_code,
                                         temperature = temperature,
                                         left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta,
-                                        cond_init_grd = lidar_cond)
+                                        range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar,
+                                        lidar_context=lidar_context,
+                                        lidar_evidence=lidar_evidence,
+                                        cond_init_grd = None)
         
         samples_ddim = samples_ddim * (1 / self.scale_factor)
         pre_residual = self.pre_AE_model.decode(samples_ddim)
@@ -574,25 +1148,69 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
     def configure_optimizers(self):
         lr = self.learning_rate
         if self.freeze_for_lidar_control:
-            for module in [self.pre_AE_model, self.condition_model_sat, self.DDPM.denoise_model]:
+            for module in [self.pre_AE_model, self.DDPM.denoise_model]:
                 module.eval()
                 for param in module.parameters():
                     param.requires_grad = False
-            train_params = list(self.DDPM.control_grd.parameters())
+            train_params = []
+            if getattr(self.DDPM, "control_grd", None) is not None:
+                self.DDPM.control_grd.eval()
+                for param in self.DDPM.control_grd.parameters():
+                    param.requires_grad = False
             if self.dynamic_class_tokens is not None:
                 train_params.append(self.dynamic_class_tokens)
             for param in train_params:
                 param.requires_grad = True
-            unet_params = []
+            lidar_context_params = []
+            if self.lidar_context_model is not None:
+                self.lidar_context_model.train()
+                for param in self.lidar_context_model.parameters():
+                    param.requires_grad = True
+                    lidar_context_params.append(param)
+            sat_params = []
+            if self.lidar_train_sat_condition:
+                self.condition_model_sat.train()
+                for param in self.condition_model_sat.parameters():
+                    param.requires_grad = True
+                    sat_params.append(param)
+            else:
+                self.condition_model_sat.eval()
+                for param in self.condition_model_sat.parameters():
+                    param.requires_grad = False
+            lidar_unet_params = []
+            old_unet_params = []
             unet_param_ids = set()
-            def add_unet_params(module):
+            def add_unet_params(module, target_params):
                 module.train()
                 for param in module.parameters():
                     if id(param) in unet_param_ids:
                         continue
                     param.requires_grad = True
-                    unet_params.append(param)
+                    target_params.append(param)
                     unet_param_ids.add(id(param))
+
+            def add_unet_param(param, target_params):
+                if id(param) in unet_param_ids:
+                    return
+                param.requires_grad = True
+                target_params.append(param)
+                unet_param_ids.add(id(param))
+
+            for name, param in self.DDPM.denoise_model.named_parameters():
+                if (
+                    ".attn_lidar." in name
+                    or ".norm_lidar." in name
+                    or ".evidence_router." in name
+                    or ".lidar_depth_head." in name
+                    or ".lidar_bottleneck_depth_head." in name
+                    or name.startswith("lidar_depth_head.")
+                    or name.startswith("lidar_bottleneck_depth_head.")
+                    or name.endswith(".lidar_gate")
+                ):
+                    add_unet_param(param, lidar_unet_params)
+
+            if self.lidar_unfreeze_denoise_all:
+                add_unet_params(self.DDPM.denoise_model, old_unet_params)
 
             transformer_scope = self.lidar_unfreeze_transformers.lower()
             if transformer_scope not in {"", "none"}:
@@ -606,26 +1224,32 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 for scope in scopes:
                     for module in scope.modules():
                         if module.__class__.__name__ == "SpatialTransformer":
-                            add_unet_params(module)
+                            add_unet_params(module, old_unet_params)
 
             if self.lidar_unfreeze_output_blocks > 0:
                 blocks = self.DDPM.denoise_model.output_blocks[-self.lidar_unfreeze_output_blocks:]
                 for block in blocks:
-                    add_unet_params(block)
+                    add_unet_params(block, old_unet_params)
             if self.lidar_unfreeze_out:
-                add_unet_params(self.DDPM.denoise_model.out)
-            if unet_params:
-                opt = torch.optim.AdamW(
-                    [
-                        {"params": train_params, "lr": lr},
-                        {"params": unet_params, "lr": lr * self.lidar_unet_lr_scale},
-                    ]
-                )
-            else:
-                opt = torch.optim.AdamW(train_params, lr=lr)
+                add_unet_params(self.DDPM.denoise_model.out, old_unet_params)
+            param_groups = []
+            if train_params:
+                param_groups.append({"params": train_params, "lr": lr})
+            if lidar_context_params:
+                param_groups.append({"params": lidar_context_params, "lr": lr * self.lidar_context_lr_scale})
+            if sat_params:
+                param_groups.append({"params": sat_params, "lr": lr * self.lidar_sat_lr_scale})
+            if lidar_unet_params:
+                param_groups.append({"params": lidar_unet_params, "lr": lr * self.lidar_unet_new_lr_scale})
+            if old_unet_params:
+                param_groups.append({"params": old_unet_params, "lr": lr * self.lidar_unet_lr_scale})
+            if not param_groups:
+                raise ValueError("No trainable parameters configured for LiDAR training")
+            opt = torch.optim.AdamW(param_groups)
         else:
             opt= torch.optim.AdamW(list(self.DDPM.denoise_model.parameters()) +
-                                   list(self.condition_model_sat.parameters()),
+                                   list(self.condition_model_sat.parameters()) +
+                                   (list(self.lidar_context_model.parameters()) if self.lidar_context_model is not None else []),
                                       lr=lr)
         return [opt]
 
@@ -641,6 +1265,13 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         lidar_cond = None
         if self.use_lidar_cond and self.lidar_condition_key in batch:
             lidar_cond = self.get_input(batch, self.lidar_condition_key)
+        range_img = self.get_input(batch, "range_img") if self.use_lidar_cond and "range_img" in batch else None
+        range_mask = self.get_input(batch, "range_mask") if self.use_lidar_cond and "range_mask" in batch else None
+        camera_to_lidar = (
+            self.get_input(batch, "camera_to_lidar").squeeze(-1)
+            if self.use_lidar_cond and "camera_to_lidar" in batch
+            else None
+        )
 
         left_camera_k = self.get_input(batch, "left_camera_k").squeeze(-1)
         gt_shift_x = batch['gt_shift_x']
@@ -653,7 +1284,14 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
 
         cond_label = self.make_condition(inputs, batch)
         sat_con = cond_label.detach()
-
+        lidar_context = self.make_lidar_context(
+            lidar_cond,
+            range_img=range_img,
+            range_mask=range_mask,
+            camera_to_lidar=camera_to_lidar,
+            left_camera_k=left_camera_k,
+        )
+        lidar_evidence = self.make_lidar_evidence(lidar_cond)
         sampler = KITTI_DDIMSampler(self.DDPM, self.pre_AE_model, self.scale_factor)
 
         n_samples = outputs.size()[0]
@@ -677,7 +1315,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                                         x_T=start_code,
                                         temperature = temperature,
                                         left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta,
-                                        cond_init_grd = lidar_cond)
+                                        range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar,
+                                        lidar_context=lidar_context,
+                                        lidar_evidence=lidar_evidence,
+                                        cond_init_grd = None)
         
         samples_ddim = samples_ddim * (1 / self.scale_factor)
         # img_list = self.DDPM.sample(noise, cond_init_grd=cond_init_grd, cond_sat=cond_sat)
@@ -699,7 +1340,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         if lidar_cond is not None:
             if lidar_cond.shape[1] >= 10:
                 log["lidar_cond"] = torch.cat(
-                    [lidar_cond[:, 0:1], lidar_cond[:, 8:9], lidar_cond[:, 9:10]],
+                    [lidar_cond[:, 8:9], lidar_cond[:, 1:2], lidar_cond[:, 2:3]],
                     dim=1,
                 ).clamp(0, 1)
             elif lidar_cond.shape[1] >= 8:
