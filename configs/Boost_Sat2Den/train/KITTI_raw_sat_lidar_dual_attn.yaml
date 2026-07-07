@@ -62,6 +62,12 @@ model:
             lidar_context_dim: 768
             lidar_gate_init: 0.001
             lidar_evidence_channels: 8
+            lidar_attention_mode: reference
+            lidar_fusion_mode: ray_evidence
+            ray_evidence_sat_bias: 4.0
+            ray_evidence_lidar_bias: -4.0
+            ray_evidence_null_bias: -6.0
+            lidar_reference_window: 3
         control_grd: null
     Condition_config_grd:
       target: ldm.modules.encoders.modules.CLIPVisionEmbedder
@@ -70,7 +76,7 @@ model:
     Lidar_context_config:
       target: models.KITTI_geo_ldm.lidar_condition_model.LidarRangeTokenEncoder
       params:
-        front_in_channels: 10
+        front_in_channels: 5
         range_in_channels: 3
         hidden_channels: 128
         range_feature_channels: 192
@@ -93,6 +99,7 @@ model:
       target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
     use_lidar_cond: true
     lidar_condition_key: lidar_cond
+    lidar_geom_mode: ray_depth_inv
     freeze_for_lidar_control: true
     dynamic_loss_weight: 0.0
     dynamic_x0_loss_weight: 0.0

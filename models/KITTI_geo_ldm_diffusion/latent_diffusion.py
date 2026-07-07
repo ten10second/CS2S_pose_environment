@@ -238,13 +238,20 @@ class DDPM(pl.LightningModule):
                 camera_k=left_camera_k,
                 image_size=tuple(cond_init_grd.shape[-2:]),
         )
+        ray_mask_mode = str(getattr(self, "ray_evidence_mask_mode", "foreground") or "foreground")
+        if ray_mask_mode == "none":
+            lidar_geometry_mask = None
+        elif ray_mask_mode == "lidar_hit" and lidar_evidence is not None and lidar_evidence.shape[1] > 1:
+            lidar_geometry_mask = lidar_evidence[:, 1:2]
+        else:
+            lidar_geometry_mask = foreground_loss_mask
         model_out = self.denoise_model(
             x_noisy,
             t,
             context=cond_txt,
             lidar_context=lidar_context,
             lidar_evidence=lidar_evidence,
-            lidar_geometry_mask=foreground_loss_mask,
+            lidar_geometry_mask=lidar_geometry_mask,
             control_grd=control_grd_para,
             left_camera_k=left_camera_k,
             gt_shift_x=gt_shift_x,
@@ -278,7 +285,6 @@ class DDPM(pl.LightningModule):
         if (
             static_teacher_loss_mask is not None
             and static_teacher_consistency_weight > 0.0
-            and cond_init_grd is not None
         ):
             with torch.no_grad():
                 teacher_out = self.denoise_model(
@@ -293,9 +299,12 @@ class DDPM(pl.LightningModule):
                     theta=theta,
                 )
             teacher_loss_raw = F.mse_loss(model_out, teacher_out, reduction="none")
-            loss = loss + float(static_teacher_consistency_weight) * self._masked_loss_mean(
-                teacher_loss_raw,
-                static_teacher_loss_mask,
+            static_teacher_loss = self._masked_loss_mean(teacher_loss_raw, static_teacher_loss_mask)
+            loss = loss + float(static_teacher_consistency_weight) * static_teacher_loss
+            record_loss("loss_static_teacher_eps", static_teacher_loss)
+            record_loss(
+                "loss_static_teacher_eps_contrib",
+                float(static_teacher_consistency_weight) * static_teacher_loss,
             )
         needs_pred_x0 = (
             (loss_mask is not None and x0_loss_weight > 0.0)

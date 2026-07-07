@@ -595,6 +595,148 @@ class LocalReferenceCrossAttention(TokenCrossAttention):
         return self.to_out(out)
 
 
+class RayAlignedEvidenceAttention(nn.Module):
+    """Fuse heterogeneous reference deltas around each target camera ray.
+
+    Satellite and LiDAR branches first produce per-query reference evidence.
+    This module then chooses among those evidence vectors with a tiny attention
+    over the evidence set of each image-space query.  It initializes almost as
+    the original CS2S satellite residual, so old satellite capability is not
+    destroyed when this module is introduced.
+    """
+
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dim_head=64,
+        dropout=0.0,
+        sat_bias=4.0,
+        lidar_bias=-4.0,
+        null_bias=-6.0,
+    ):
+        super().__init__()
+        inner_dim = int(heads) * int(dim_head)
+        self.heads = int(heads)
+        self.scale = float(dim_head) ** -0.5
+        self.to_q = zero_module(nn.Linear(dim, inner_dim, bias=False))
+        self.to_k = zero_module(nn.Linear(dim, inner_dim, bias=False))
+        self.ray_proj = zero_module(nn.Linear(dim, dim, bias=False))
+        self.dropout = nn.Dropout(dropout)
+        self.null_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.evidence_bias = nn.Parameter(
+            torch.tensor([float(sat_bias), float(lidar_bias), float(null_bias)], dtype=torch.float32)
+        )
+        self.register_buffer("last_evidence_sat_weight", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_lidar_weight", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_null_weight", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_entropy_norm", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_lidar_mask_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_lidar_weight_masked", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_lidar_weight_background", torch.tensor(0.0), persistent=False)
+
+    @staticmethod
+    def ray_encoding_2d(height, width, dim, device, dtype):
+        return TokenCrossAttention.coord_encoding_2d(height, width, dim, device=device, dtype=dtype)
+
+    def _record_stats(self, attn):
+        with torch.no_grad():
+            weights = attn.detach().float().mean(dim=(0, 1, 2))
+            entropy = -(attn.detach().float().clamp_min(1e-12) * attn.detach().float().clamp_min(1e-12).log()).sum(dim=-1)
+            entropy_norm = entropy / math.log(max(2, int(attn.shape[-1])))
+            self.last_evidence_sat_weight.copy_(weights[0].to(self.last_evidence_sat_weight.device))
+            self.last_evidence_lidar_weight.copy_(weights[1].to(self.last_evidence_lidar_weight.device))
+            self.last_evidence_null_weight.copy_(weights[2].to(self.last_evidence_null_weight.device))
+            self.last_evidence_entropy_norm.copy_(
+                entropy_norm.mean().detach().to(self.last_evidence_entropy_norm.device)
+            )
+
+    def _prepare_mask(self, mask, x, query_hw=None):
+        if mask is None:
+            return None
+        b, n, _ = x.shape
+        if mask.dim() == 4:
+            if query_hw is None:
+                return None
+            h, w = int(query_hw[0]), int(query_hw[1])
+            mask = F.interpolate(mask.float(), size=(h, w), mode="area")
+            mask = rearrange(mask, "b c h w -> b (h w) c")
+        elif mask.dim() == 3:
+            if mask.shape[1] != n and mask.shape[-1] == n:
+                mask = mask.transpose(1, 2)
+            if mask.shape[-1] != 1:
+                mask = mask.mean(dim=-1, keepdim=True)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(-1)
+        else:
+            return None
+        if mask.shape[0] != b or mask.shape[1] != n:
+            return None
+        return mask.to(device=x.device, dtype=x.dtype).clamp(0.0, 1.0)
+
+    def forward(self, x, sat_ref, lidar_ref, query_hw=None, lidar_geometry_mask=None):
+        if sat_ref is None:
+            sat_ref = torch.zeros_like(x)
+        if lidar_ref is None:
+            lidar_ref = torch.zeros_like(x)
+
+        b, n, c = x.shape
+        null = self.null_token.to(device=x.device, dtype=x.dtype).expand(b, n, c)
+        evidence = torch.stack([sat_ref, lidar_ref, null], dim=2)
+
+        q_input = x
+        if query_hw is not None:
+            h, w = int(query_hw[0]), int(query_hw[1])
+            if h * w == n:
+                ray = self.ray_encoding_2d(h, w, c, device=x.device, dtype=x.dtype)
+                q_input = q_input + self.ray_proj(ray).expand(b, n, c)
+
+        q = self.to_q(q_input)
+        k = self.to_k(evidence)
+        q = rearrange(q, "b n (h d) -> b h n d", h=self.heads)
+        k = rearrange(k, "b n e (h d) -> b h n e d", h=self.heads)
+
+        logits = (q.unsqueeze(3) * k).sum(dim=-1) * self.scale
+        bias = self.evidence_bias.to(device=logits.device, dtype=logits.dtype).view(1, 1, 1, 3)
+        attn = (logits + bias).softmax(dim=-1)
+        self._record_stats(attn)
+        attn = self.dropout(attn)
+
+        # Evidence vectors are already in the UNet feature dimension.  Using them
+        # directly keeps the initialization close to the original satellite
+        # reference residual instead of adding an extra random output projection.
+        attn_mean = attn.mean(dim=1)
+        if lidar_geometry_mask is None:
+            return (attn_mean.unsqueeze(-1) * evidence).sum(dim=2)
+
+        mask = self._prepare_mask(lidar_geometry_mask, x, query_hw=query_hw)
+        if mask is None:
+            return (attn_mean.unsqueeze(-1) * evidence).sum(dim=2)
+
+        sat_w = attn_mean[:, :, 0:1]
+        lidar_w = attn_mean[:, :, 1:2]
+        null_w = attn_mean[:, :, 2:3]
+        sat_null_denom = (sat_w + null_w).clamp_min(1e-6)
+        sat_null_ref = (sat_w * sat_ref + null_w * null) / sat_null_denom
+        lidar_correction = lidar_w * (lidar_ref - sat_null_ref)
+        with torch.no_grad():
+            mask_float = mask.detach().float()
+            bg_float = 1.0 - mask_float
+            lidar_weight = lidar_w.detach().float()
+            self.last_evidence_lidar_mask_mean.copy_(mask_float.mean().to(self.last_evidence_lidar_mask_mean.device))
+            self.last_evidence_lidar_weight_masked.copy_(
+                ((lidar_weight * mask_float).sum() / mask_float.sum().clamp_min(1.0)).to(
+                    self.last_evidence_lidar_weight_masked.device
+                )
+            )
+            self.last_evidence_lidar_weight_background.copy_(
+                ((lidar_weight * bg_float).sum() / bg_float.sum().clamp_min(1.0)).to(
+                    self.last_evidence_lidar_weight_background.device
+                )
+            )
+        return sat_null_ref + mask * lidar_correction
+
+
 class BasicTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -611,6 +753,10 @@ class BasicTransformerBlock(nn.Module):
         lidar_evidence_channels=0,
         lidar_attention_mode="token",
         lidar_reference_window=3,
+        lidar_fusion_mode="sequential",
+        ray_evidence_sat_bias=4.0,
+        ray_evidence_lidar_bias=-4.0,
+        ray_evidence_null_bias=-6.0,
     ):
         super().__init__()
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
@@ -625,9 +771,13 @@ class BasicTransformerBlock(nn.Module):
         self.lidar_evidence_channels = int(lidar_evidence_channels or 0)
         if self.use_lidar_cross_attention:
             self.norm_lidar = nn.LayerNorm(dim)
+            self.norm_evidence = nn.LayerNorm(dim)
             self.lidar_attention_mode = str(lidar_attention_mode or "token")
             if self.lidar_attention_mode not in {"token", "reference"}:
                 raise ValueError(f"unknown lidar_attention_mode: {self.lidar_attention_mode}")
+            self.lidar_fusion_mode = str(lidar_fusion_mode or "sequential")
+            if self.lidar_fusion_mode not in {"sequential", "ray_evidence"}:
+                raise ValueError(f"unknown lidar_fusion_mode: {self.lidar_fusion_mode}")
             if self.lidar_attention_mode == "reference":
                 self.attn_lidar = LocalReferenceCrossAttention(
                     query_dim=dim,
@@ -645,21 +795,32 @@ class BasicTransformerBlock(nn.Module):
                     dim_head=d_head,
                     dropout=dropout,
                 )
-            gate_init = min(max(float(lidar_gate_init), 1e-6), 1.0 - 1e-6)
-            self.lidar_gate = nn.Parameter(torch.tensor(math.log(gate_init / (1.0 - gate_init))))
-            if self.lidar_evidence_channels > 0:
-                self.evidence_router = nn.Sequential(
-                    nn.Linear(self.lidar_evidence_channels, dim),
-                    nn.SiLU(),
-                    zero_module(nn.Linear(dim, 1)),
+            if self.lidar_fusion_mode == "ray_evidence":
+                self.ray_evidence_attn = RayAlignedEvidenceAttention(
+                    dim=dim,
+                    heads=n_heads,
+                    dim_head=d_head,
+                    dropout=dropout,
+                    sat_bias=ray_evidence_sat_bias,
+                    lidar_bias=ray_evidence_lidar_bias,
+                    null_bias=ray_evidence_null_bias,
                 )
-            self.lidar_gate_cap = 1.0
+            else:
+                gate_init = min(max(float(lidar_gate_init), 1e-6), 1.0 - 1e-6)
+                self.lidar_gate = nn.Parameter(torch.tensor(math.log(gate_init / (1.0 - gate_init))))
+                if self.lidar_evidence_channels > 0:
+                    self.evidence_router = nn.Sequential(
+                        nn.Linear(self.lidar_evidence_channels, dim),
+                        nn.SiLU(),
+                        zero_module(nn.Linear(dim, 1)),
+                    )
+                self.lidar_gate_cap = 1.0
 
-    def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+    def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
             return checkpoint(
                 self._forward,
-                (x, context, lidar_context, lidar_evidence, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta),
+                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta),
                 self.parameters(),
                 self.checkpoint,
             )
@@ -699,8 +860,33 @@ class BasicTransformerBlock(nn.Module):
             self.evidence_router(evidence) + self.lidar_gate.to(dtype=x.dtype, device=x.device)
         )
 
-    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         x = self.attn1(self.norm1(x)) + x
+        if (
+            lidar_context is not None
+            and getattr(self, "lidar_fusion_mode", "sequential") == "ray_evidence"
+            and hasattr(self, "ray_evidence_attn")
+        ):
+            x_base = x
+            sat_delta = self.attn2(
+                self.norm2(x_base),
+                context=context,
+                left_camera_k=left_camera_k,
+                gt_shift_x=gt_shift_x,
+                gt_shift_y=gt_shift_y,
+                theta=theta,
+            )
+            lidar_delta = self.attn_lidar(self.norm_lidar(x_base), lidar_context, query_hw=latent_hw)
+            x = x_base + self.ray_evidence_attn(
+                self.norm_evidence(x_base),
+                sat_delta,
+                lidar_delta,
+                query_hw=latent_hw,
+                lidar_geometry_mask=lidar_geometry_mask,
+            )
+            x = self.ff(self.norm3(x)) + x
+            return x
+
         x = self.attn2(self.norm2(x), context=context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta) + x
         if lidar_context is not None:
             lidar_delta = self.attn_lidar(self.norm_lidar(x), lidar_context, query_hw=latent_hw)
@@ -732,6 +918,10 @@ class SpatialTransformer(nn.Module):
         lidar_evidence_channels=0,
         lidar_attention_mode="token",
         lidar_reference_window=3,
+        lidar_fusion_mode="sequential",
+        ray_evidence_sat_bias=4.0,
+        ray_evidence_lidar_bias=-4.0,
+        ray_evidence_null_bias=-6.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -758,6 +948,10 @@ class SpatialTransformer(nn.Module):
                 lidar_evidence_channels=lidar_evidence_channels,
                 lidar_attention_mode=lidar_attention_mode,
                 lidar_reference_window=lidar_reference_window,
+                lidar_fusion_mode=lidar_fusion_mode,
+                ray_evidence_sat_bias=ray_evidence_sat_bias,
+                ray_evidence_lidar_bias=ray_evidence_lidar_bias,
+                ray_evidence_null_bias=ray_evidence_null_bias,
             )
                 for d in range(depth)]
         )
@@ -768,7 +962,7 @@ class SpatialTransformer(nn.Module):
                                               stride=1,
                                               padding=0))
 
-    def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+    def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         # note: if no context is given, cross-attention defaults to self-attention
         b, c, h, w = x.shape
         x_in = x
@@ -776,7 +970,7 @@ class SpatialTransformer(nn.Module):
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
         for block in self.transformer_blocks:
-            x = block(x, context=context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, latent_hw=(h, w), left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            x = block(x, context=context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, latent_hw=(h, w), left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in

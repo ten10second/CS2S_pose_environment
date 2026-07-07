@@ -208,20 +208,22 @@ class LidarRangeTokenEncoder(nn.Module):
     def forward(
         self,
         lidar_cond: torch.Tensor,
+        raw_lidar_cond: Optional[torch.Tensor] = None,
         range_img: Optional[torch.Tensor] = None,
         range_mask: Optional[torch.Tensor] = None,
         camera_k: Optional[torch.Tensor] = None,
         camera_to_lidar: Optional[torch.Tensor] = None,
         image_size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
+        evidence_source = raw_lidar_cond if raw_lidar_cond is not None else lidar_cond
         front_input = lidar_cond.float()
         if self.use_evidence_maps:
-            evidence = self.make_evidence_maps(lidar_cond)
+            evidence = self.make_evidence_maps(evidence_source)
             front_input = torch.cat([front_input, evidence], dim=1)
             self.last_hit_coverage.copy_(evidence[:, 1:2].mean().detach().to(self.last_hit_coverage.device))
             self.last_empty_coverage.copy_(evidence[:, 5:6].mean().detach().to(self.last_empty_coverage.device))
         if self.use_pointmap_pe:
-            front_input = torch.cat([front_input, self.make_pointmap_pe(lidar_cond)], dim=1)
+            front_input = torch.cat([front_input, self.make_pointmap_pe(evidence_source)], dim=1)
         else:
             self.last_pointmap_coverage.zero_()
         front = self.front_stem(front_input)

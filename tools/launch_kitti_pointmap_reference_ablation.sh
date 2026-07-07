@@ -48,6 +48,8 @@ COMMON_ARGS=(
   --lidar-context-lr-scale 1.0
   --lidar-attn-gate-init 0.05
   --lidar-attention-mode reference
+  --lidar-fusion-mode ray_evidence
+  --lidar-geom-mode ray_depth_inv
   --lidar-reference-window 3
   --lidar-token-output-norm center_layernorm
   --lidar-depth-loss-weight 2.0
@@ -79,7 +81,9 @@ run_stage() {
     echo "manifest=${manifest}"
     echo "target_steps=${target_steps}"
     echo "lidar_attention_mode=reference"
-    echo "lidar_to_rgb_path=reference_attention"
+    echo "lidar_fusion_mode=ray_evidence"
+    echo "lidar_geom_mode=ray_depth_inv"
+    echo "lidar_to_rgb_path=ray_aligned_evidence_attention"
   } | tee "$run_dir/stage_info.txt"
   "$PYTHON_BIN" tools/train_kitti_lidar_dominant.py \
     "${COMMON_ARGS[@]}" \

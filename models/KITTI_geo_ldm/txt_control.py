@@ -78,6 +78,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 lidar_zero_reconstruction_mask_mode="all",
                 static_teacher_consistency_weight=0.0,
                 static_teacher_gate_channel=-1,
+                static_teacher_mask_mode="no_lidar",
+                ray_evidence_mask_mode="foreground",
                 dynamic_class_token_weight=0.0,
                 dynamic_class_hist_key="dynamic_class_hist",
                 dynamic_class_token_count=8,
@@ -91,6 +93,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 lidar_unfreeze_transformers="none",
                 lidar_unet_lr_scale=0.25,
                 lidar_unet_new_lr_scale=1.0,
+                lidar_geom_mode="raw",
                 Lidar_context_config=None,
                 use_lidar_control_residual=False,
                 lidar_context_lr_scale=1.0,
@@ -154,6 +157,19 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.last_satellite_condition_dropout_metrics = {}
         self.static_teacher_consistency_weight = float(static_teacher_consistency_weight)
         self.static_teacher_gate_channel = int(static_teacher_gate_channel)
+        self.static_teacher_mask_mode = str(static_teacher_mask_mode or "no_lidar")
+        if self.static_teacher_mask_mode not in {"no_lidar", "background"}:
+            raise ValueError(
+                "static_teacher_mask_mode must be 'no_lidar' or 'background', "
+                f"got {self.static_teacher_mask_mode!r}"
+            )
+        self.ray_evidence_mask_mode = str(ray_evidence_mask_mode or "foreground")
+        if self.ray_evidence_mask_mode not in {"none", "foreground", "lidar_hit"}:
+            raise ValueError(
+                "ray_evidence_mask_mode must be 'none', 'foreground', or 'lidar_hit', "
+                f"got {self.ray_evidence_mask_mode!r}"
+            )
+        self.DDPM.ray_evidence_mask_mode = self.ray_evidence_mask_mode
         self.dynamic_class_token_weight = dynamic_class_token_weight
         self.dynamic_class_hist_key = dynamic_class_hist_key
         if dynamic_class_token_weight > 0.0:
@@ -169,6 +185,9 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.lidar_unet_lr_scale = float(lidar_unet_lr_scale)
         self.lidar_unet_new_lr_scale = float(lidar_unet_new_lr_scale)
         self.lidar_context_lr_scale = float(lidar_context_lr_scale)
+        self.lidar_geom_mode = str(lidar_geom_mode or "raw")
+        if self.lidar_geom_mode not in {"raw", "ray_depth", "ray_depth_inv"}:
+            raise ValueError(f"unsupported lidar_geom_mode: {self.lidar_geom_mode}")
         if pre_sat2grd_model_path:
             pre_sat2grd_model = torch.load(pre_sat2grd_model_path, map_location="cpu")
             self.load_pre_sat2grd_model(pre_sat2grd_model['state_dict'])
@@ -270,10 +289,19 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         target = (depth_avg / hit_avg.clamp_min(1e-6)).clamp(0.0, 1.0)
         return target * mask, mask
 
-    def static_teacher_loss_mask(self, lidar_cond, latent_shape):
+    def static_teacher_loss_mask(self, lidar_cond, latent_shape, foreground_loss_mask=None):
+        if self.static_teacher_consistency_weight <= 0.0:
+            return None
+        if self.static_teacher_mask_mode == "background" and foreground_loss_mask is not None:
+            if foreground_loss_mask.shape[-2:] != latent_shape[-2:]:
+                foreground_loss_mask = F.interpolate(
+                    foreground_loss_mask.float(),
+                    size=latent_shape[-2:],
+                    mode="area",
+                )
+            return (1.0 - foreground_loss_mask.float()).clamp(0.0, 1.0)
         if (
             lidar_cond is None
-            or self.static_teacher_consistency_weight <= 0.0
             or self.static_teacher_gate_channel < 0
             or self.static_teacher_gate_channel >= lidar_cond.shape[1]
         ):
@@ -348,11 +376,37 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.last_satellite_condition_dropout_metrics = metrics
         return dropped
 
+    def build_lidar_geom_cond(self, lidar_cond):
+        if lidar_cond is None or self.lidar_geom_mode == "raw":
+            return lidar_cond
+        cond = lidar_cond.float()
+        b, _, h, w = cond.shape
+        zero = cond.new_zeros((b, 1, h, w))
+        hit = cond[:, 1:2].clamp(0.0, 1.0) if cond.shape[1] > 1 else zero
+        depth = cond[:, 2:3].clamp(0.0, 1.0) * hit if cond.shape[1] > 2 else zero
+        if cond.shape[1] >= 7:
+            xyz = cond[:, 4:7].float()
+            z = xyz[:, 2:3].abs().clamp_min(1e-4)
+            ray_x = (xyz[:, 0:1] / z).clamp(-2.0, 2.0) * 0.5
+            ray_y = (xyz[:, 1:2] / z).clamp(-2.0, 2.0) * 0.5
+        else:
+            ray_x = zero
+            ray_y = zero
+        ray_x = ray_x.clamp(-1.0, 1.0) * hit
+        ray_y = ray_y.clamp(-1.0, 1.0) * hit
+        log_depth = (torch.log1p(79.0 * depth.clamp_min(0.0)) / np.log(80.0)).clamp(0.0, 1.0) * hit
+        if self.lidar_geom_mode == "ray_depth":
+            return torch.cat([hit, ray_x, ray_y, log_depth], dim=1).to(dtype=lidar_cond.dtype)
+        inv_depth = (1.0 - depth).clamp(0.0, 1.0) * hit
+        return torch.cat([hit, ray_x, ray_y, log_depth, inv_depth], dim=1).to(dtype=lidar_cond.dtype)
+
     def make_lidar_context(self, lidar_cond, range_img=None, range_mask=None, camera_to_lidar=None, left_camera_k=None):
         if self.lidar_context_model is None or lidar_cond is None:
             return None
+        lidar_geom_cond = self.build_lidar_geom_cond(lidar_cond)
         return self.lidar_context_model(
-            lidar_cond,
+            lidar_geom_cond,
+            raw_lidar_cond=lidar_cond,
             range_img=range_img,
             range_mask=range_mask,
             camera_k=left_camera_k,
@@ -437,7 +491,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 if torch.is_tensor(value):
                     state["context"][name] = value.detach().clone()
         for module in self.DDPM.denoise_model.modules():
-            if not hasattr(module, "last_attn_entropy_norm"):
+            if not hasattr(module, "last_attn_entropy_norm") and not hasattr(module, "last_evidence_sat_weight"):
                 continue
             module_state = {}
             for name in [
@@ -448,6 +502,13 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 "last_attn_std_mean",
                 "last_attn_token_count",
                 "last_attn_query_count",
+                "last_evidence_sat_weight",
+                "last_evidence_lidar_weight",
+                "last_evidence_null_weight",
+                "last_evidence_entropy_norm",
+                "last_evidence_lidar_mask_mean",
+                "last_evidence_lidar_weight_masked",
+                "last_evidence_lidar_weight_background",
             ]:
                 if not hasattr(module, name):
                     continue
@@ -919,7 +980,11 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             if foreground_image_loss_mask is not None
             else None
         )
-        static_teacher_loss_mask = self.static_teacher_loss_mask(lidar_cond, pre_residual_laten.shape)
+        static_teacher_loss_mask = self.static_teacher_loss_mask(
+            lidar_cond,
+            pre_residual_laten.shape,
+            foreground_loss_mask=foreground_loss_mask,
+        )
         object_boxes = batch.get("dynamic_boxes")
         object_box_valid = batch.get("dynamic_box_valid")
         if object_boxes is not None:

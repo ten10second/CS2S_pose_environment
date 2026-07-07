@@ -431,6 +431,7 @@ class KITTI_DDIMSampler(object):
                range_img=None, range_mask=None, camera_to_lidar=None,
                lidar_context=None,
                lidar_evidence=None,
+               lidar_geometry_mask=None,
                cond_init_grd=None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
         **kwargs
@@ -475,6 +476,7 @@ class KITTI_DDIMSampler(object):
                                                     range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar,
                                                     lidar_context=lidar_context,
                                                     lidar_evidence=lidar_evidence,
+                                                    lidar_geometry_mask=lidar_geometry_mask,
                                                     cond_init_grd = cond_init_grd
                                                     )
         return samples, intermediates
@@ -489,6 +491,7 @@ class KITTI_DDIMSampler(object):
                       range_img=None, range_mask=None, camera_to_lidar=None,
                       lidar_context=None,
                       lidar_evidence=None,
+                      lidar_geometry_mask=None,
                       cond_init_grd=None):
         device = self.model.device
         b = shape[0]
@@ -529,6 +532,7 @@ class KITTI_DDIMSampler(object):
                                       range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar,
                                       lidar_context=lidar_context,
                                       lidar_evidence=lidar_evidence,
+                                      lidar_geometry_mask=lidar_geometry_mask,
                                       cond_init_grd = cond_init_grd)
             img, pred_x0 = outs
             if callback: callback(i)
@@ -548,6 +552,7 @@ class KITTI_DDIMSampler(object):
                       range_img=None, range_mask=None, camera_to_lidar=None,
                       lidar_context=None,
                       lidar_evidence=None,
+                      lidar_geometry_mask=None,
                       cond_init_grd=None):
         b, *_, device = *x.shape, x.device
 
@@ -566,7 +571,7 @@ class KITTI_DDIMSampler(object):
                 image_size=tuple(cond_init_grd.shape[-2:]),
             )
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.denoise_model(x, t, context = c, lidar_context=lidar_context, lidar_evidence=lidar_evidence, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            e_t = self.model.denoise_model(x, t, context = c, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
@@ -580,6 +585,7 @@ class KITTI_DDIMSampler(object):
             camera_to_lidar_in = torch.cat([camera_to_lidar] * 2) if camera_to_lidar is not None else None
             lidar_context_in = torch.cat([lidar_context] * 2) if lidar_context is not None else None
             lidar_evidence_in = torch.cat([lidar_evidence] * 2) if lidar_evidence is not None else None
+            lidar_geometry_mask_in = torch.cat([lidar_geometry_mask] * 2) if lidar_geometry_mask is not None else None
             control_grd_para = None
             if cond_init_grd is not None and control_model is not None:
                 cond_init_grd_in = torch.cat([cond_init_grd] * 2)
@@ -594,7 +600,7 @@ class KITTI_DDIMSampler(object):
                     camera_k=left_camera_k_in,
                     image_size=tuple(cond_init_grd.shape[-2:]),
                 )
-            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, context = c_in, lidar_context=lidar_context_in, lidar_evidence=lidar_evidence_in, control_grd = control_grd_para, left_camera_k = left_camera_k_in, gt_shift_x = gt_shift_x_in, gt_shift_y = gt_shift_y_in, theta = theta_in).chunk(2)
+            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, context = c_in, lidar_context=lidar_context_in, lidar_evidence=lidar_evidence_in, lidar_geometry_mask=lidar_geometry_mask_in, control_grd = control_grd_para, left_camera_k = left_camera_k_in, gt_shift_x = gt_shift_x_in, gt_shift_y = gt_shift_y_in, theta = theta_in).chunk(2)
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:
@@ -633,6 +639,7 @@ class KITTI_DDIMSampler(object):
                       range_img=None, range_mask=None, camera_to_lidar=None,
                       lidar_context=None,
                       lidar_evidence=None,
+                      lidar_geometry_mask=None,
                       cond_init_grd=None):
         if index<=1:
             txt_embed = None
@@ -693,5 +700,6 @@ class KITTI_DDIMSampler(object):
                                     range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar,
                                     lidar_context=lidar_context,
                                     lidar_evidence=lidar_evidence,
+                                    lidar_geometry_mask=lidar_geometry_mask,
                                     cond_init_grd = cond_init_grd)
             return x_prev, pred_x0

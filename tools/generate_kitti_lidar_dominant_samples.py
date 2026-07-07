@@ -34,6 +34,21 @@ def parse_args():
         choices=["", "none", "bbox_dynamic", "dynamic_points", "raw_lidar", "dynamic_full", "raw_lidar_pointmap"],
         help="LiDAR condition mode. Empty uses the mode saved in the config/checkpoint run config.",
     )
+    parser.add_argument(
+        "--lidar-geom-mode",
+        default="",
+        choices=["", "raw", "ray_depth", "ray_depth_inv"],
+        help="LiDAR geometry encoding mode. Empty uses the saved config or raw for older configs.",
+    )
+    parser.add_argument(
+        "--lidar-fusion-mode",
+        default="",
+        choices=["", "sequential", "ray_evidence"],
+        help="LiDAR/satellite fusion mode. Empty uses the saved config or sequential for older configs.",
+    )
+    parser.add_argument("--ray-evidence-sat-bias", type=float, default=None)
+    parser.add_argument("--ray-evidence-lidar-bias", type=float, default=None)
+    parser.add_argument("--ray-evidence-null-bias", type=float, default=None)
     parser.add_argument("--num-samples", type=int, default=6)
     parser.add_argument("--ddim-steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)
@@ -166,6 +181,21 @@ def make_condition_rgb(lidar_cond):
     return torch.cat([cond[1:2], cond[2:3], cond[0:1]], dim=0)
 
 
+def make_lidar_geometry_mask_for_sampling(model, lidar_evidence, batch=None):
+    mode = str(getattr(model.DDPM, "ray_evidence_mask_mode", "foreground") or "foreground")
+    if mode == "none":
+        return None
+    if mode == "foreground" and batch is not None and "foreground_mask" in batch:
+        mask = batch["foreground_mask"]
+        if torch.is_tensor(mask):
+            if lidar_evidence is not None:
+                mask = mask.to(device=lidar_evidence.device)
+            return mask.float()
+    if mode == "lidar_hit" and lidar_evidence is not None and lidar_evidence.shape[1] > 1:
+        return lidar_evidence[:, 1:2]
+    return None
+
+
 def resolve_condition_mode(cfg, args):
     if args.condition_mode:
         return args.condition_mode
@@ -175,15 +205,48 @@ def resolve_condition_mode(cfg, args):
         return "raw_lidar"
 
 
-def configure_lidar_condition_mode(cfg, condition_mode):
+def resolve_lidar_geom_mode(cfg, args):
+    if args.lidar_geom_mode:
+        return args.lidar_geom_mode
+    return str(getattr(cfg.model.params, "lidar_geom_mode", "raw") or "raw")
+
+
+def resolve_lidar_fusion_mode(cfg, args):
+    if args.lidar_fusion_mode:
+        return args.lidar_fusion_mode
+    unet_params = cfg.model.params.DDPM_config.params.unet_config.params
+    return str(getattr(unet_params, "lidar_fusion_mode", "sequential") or "sequential")
+
+
+def lidar_geom_channels(condition_mode, geom_mode):
+    if condition_mode == "none" or geom_mode == "raw":
+        return int(lidar_condition_channels(condition_mode))
+    if geom_mode == "ray_depth":
+        return 4
+    if geom_mode == "ray_depth_inv":
+        return 5
+    raise ValueError(f"Unsupported lidar geom mode: {geom_mode}")
+
+
+def configure_lidar_condition_mode(cfg, condition_mode, lidar_geom_mode, lidar_fusion_mode, args=None):
     cfg.data.params.test.params.condition_mode = condition_mode
     cfg.data.params.test.params.include_range_image = condition_mode != "none"
+    cfg.model.params.lidar_geom_mode = lidar_geom_mode
+    unet_params = cfg.model.params.DDPM_config.params.unet_config.params
+    unet_params.lidar_fusion_mode = lidar_fusion_mode
+    if args is not None:
+        if args.ray_evidence_sat_bias is not None:
+            unet_params.ray_evidence_sat_bias = float(args.ray_evidence_sat_bias)
+        if args.ray_evidence_lidar_bias is not None:
+            unet_params.ray_evidence_lidar_bias = float(args.ray_evidence_lidar_bias)
+        if args.ray_evidence_null_bias is not None:
+            unet_params.ray_evidence_null_bias = float(args.ray_evidence_null_bias)
     if condition_mode == "none":
         return cfg
     if "Lidar_context_config" not in cfg.model.params or cfg.model.params.Lidar_context_config is None:
         return cfg
     params = cfg.model.params.Lidar_context_config.params
-    params.front_in_channels = int(lidar_condition_channels(condition_mode))
+    params.front_in_channels = int(lidar_geom_channels(condition_mode, lidar_geom_mode))
     params.use_pointmap_pe = bool(lidar_condition_uses_pointmap(condition_mode))
     return cfg
 
@@ -202,6 +265,10 @@ def lidar_attention_stats(model):
     route_y_std = []
     route_query_x_corr = []
     route_query_y_corr = []
+    evidence_sat = []
+    evidence_lidar = []
+    evidence_null = []
+    evidence_entropy = []
     denoise_model = getattr(getattr(model, "DDPM", None), "denoise_model", None)
     if denoise_model is None:
         return {
@@ -252,6 +319,17 @@ def lidar_attention_stats(model):
                 if torch.is_tensor(value):
                     value = float(value.detach().float().cpu())
                 values.append(float(value))
+        if hasattr(module, "last_evidence_sat_weight"):
+            for values, attr in [
+                (evidence_sat, "last_evidence_sat_weight"),
+                (evidence_lidar, "last_evidence_lidar_weight"),
+                (evidence_null, "last_evidence_null_weight"),
+                (evidence_entropy, "last_evidence_entropy_norm"),
+            ]:
+                value = getattr(module, attr, 0.0)
+                if torch.is_tensor(value):
+                    value = float(value.detach().float().cpu())
+                values.append(float(value))
     if not entropy:
         return {
             "lidar_attn_modules": 0,
@@ -262,6 +340,11 @@ def lidar_attention_stats(model):
             "lidar_attn_std_mean": 0.0,
             "lidar_attn_token_count_mean": 0.0,
             "lidar_attn_query_count_mean": 0.0,
+            "ray_evidence_modules": int(len(evidence_sat)),
+            "ray_evidence_sat_weight_mean": sum(evidence_sat) / float(len(evidence_sat)) if evidence_sat else 0.0,
+            "ray_evidence_lidar_weight_mean": sum(evidence_lidar) / float(len(evidence_lidar)) if evidence_lidar else 0.0,
+            "ray_evidence_null_weight_mean": sum(evidence_null) / float(len(evidence_null)) if evidence_null else 0.0,
+            "ray_evidence_entropy_norm_mean": sum(evidence_entropy) / float(len(evidence_entropy)) if evidence_entropy else 0.0,
         }
     count = float(len(entropy))
     return {
@@ -279,6 +362,11 @@ def lidar_attention_stats(model):
         "lidar_route_token_y_std": sum(route_y_std) / float(len(route_y_std)) if route_y_std else 0.0,
         "lidar_route_query_x_corr": sum(route_query_x_corr) / float(len(route_query_x_corr)) if route_query_x_corr else 0.0,
         "lidar_route_query_y_corr": sum(route_query_y_corr) / float(len(route_query_y_corr)) if route_query_y_corr else 0.0,
+        "ray_evidence_modules": int(len(evidence_sat)),
+        "ray_evidence_sat_weight_mean": sum(evidence_sat) / float(len(evidence_sat)) if evidence_sat else 0.0,
+        "ray_evidence_lidar_weight_mean": sum(evidence_lidar) / float(len(evidence_lidar)) if evidence_lidar else 0.0,
+        "ray_evidence_null_weight_mean": sum(evidence_null) / float(len(evidence_null)) if evidence_null else 0.0,
+        "ray_evidence_entropy_norm_mean": sum(evidence_entropy) / float(len(evidence_entropy)) if evidence_entropy else 0.0,
     }
 
 
@@ -474,6 +562,7 @@ def generate_prediction(
             left_camera_k=left_camera_k,
         )
         lidar_evidence = model.make_lidar_evidence(lidar_cond) if hasattr(model, "make_lidar_evidence") else None
+    lidar_geometry_mask = make_lidar_geometry_mask_for_sampling(model, lidar_evidence, batch=batch)
     key_structure_stats = lidar_key_structure_stats(model, lidar_context, max_tokens=key_stats_max_tokens)
     torch.manual_seed(seed)
     x_t = torch.randn((cond_label.shape[0], 4, 16, 64), device=inputs.device)
@@ -500,6 +589,7 @@ def generate_prediction(
         camera_to_lidar=camera_to_lidar,
         lidar_context=lidar_context,
         lidar_evidence=lidar_evidence,
+        lidar_geometry_mask=lidar_geometry_mask,
         cond_init_grd=None,
     )
     pred = model.pre_AE_model.decode(samples_ddim * (1 / model.scale_factor))
@@ -512,7 +602,9 @@ def main():
     args = parse_args()
     cfg = OmegaConf.load(args.config)
     condition_mode = resolve_condition_mode(cfg, args)
-    configure_lidar_condition_mode(cfg, condition_mode)
+    lidar_geom_mode = resolve_lidar_geom_mode(cfg, args)
+    lidar_fusion_mode = resolve_lidar_fusion_mode(cfg, args)
+    configure_lidar_condition_mode(cfg, condition_mode, lidar_geom_mode, lidar_fusion_mode, args=args)
     cfg.data.params.test.params.manifest = args.manifest
 
     dataset = SatLidarRawDataset(

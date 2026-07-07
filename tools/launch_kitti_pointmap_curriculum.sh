@@ -50,6 +50,8 @@ COMMON_ARGS=(
   --lidar-context-lr-scale 1.0
   --lidar-attn-gate-init 0.05
   --lidar-attention-mode reference
+  --lidar-fusion-mode ray_evidence
+  --lidar-geom-mode ray_depth_inv
   --lidar-reference-window 3
   --lidar-token-output-norm center_layernorm
   --lidar-depth-loss-weight 2.0

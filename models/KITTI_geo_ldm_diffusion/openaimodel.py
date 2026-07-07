@@ -77,12 +77,12 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None, lidar_context=None, lidar_evidence=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None):
+    def forward(self, x, emb, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+                x = layer(x, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
             else:
                 x = layer(x)
         return x
@@ -470,6 +470,10 @@ class UNetModel(nn.Module):
         lidar_evidence_channels=0,
         lidar_attention_mode="token",
         lidar_reference_window=3,
+        lidar_fusion_mode="sequential",
+        ray_evidence_sat_bias=4.0,
+        ray_evidence_lidar_bias=-4.0,
+        ray_evidence_null_bias=-6.0,
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
     ):
@@ -516,6 +520,12 @@ class UNetModel(nn.Module):
         if self.lidar_attention_mode not in {"token", "reference"}:
             raise ValueError(f"unknown lidar_attention_mode: {self.lidar_attention_mode}")
         self.lidar_reference_window = max(1, int(lidar_reference_window))
+        self.lidar_fusion_mode = str(lidar_fusion_mode or "sequential")
+        if self.lidar_fusion_mode not in {"sequential", "ray_evidence"}:
+            raise ValueError(f"unknown lidar_fusion_mode: {self.lidar_fusion_mode}")
+        self.ray_evidence_sat_bias = float(ray_evidence_sat_bias)
+        self.ray_evidence_lidar_bias = float(ray_evidence_lidar_bias)
+        self.ray_evidence_null_bias = float(ray_evidence_null_bias)
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -581,6 +591,10 @@ class UNetModel(nn.Module):
                             lidar_evidence_channels=self.lidar_evidence_channels,
                             lidar_attention_mode=self.lidar_attention_mode,
                             lidar_reference_window=self.lidar_reference_window,
+                            lidar_fusion_mode=self.lidar_fusion_mode,
+                            ray_evidence_sat_bias=self.ray_evidence_sat_bias,
+                            ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
+                            ray_evidence_null_bias=self.ray_evidence_null_bias,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -647,6 +661,10 @@ class UNetModel(nn.Module):
                             lidar_evidence_channels=self.lidar_evidence_channels,
                             lidar_attention_mode=self.lidar_attention_mode,
                             lidar_reference_window=self.lidar_reference_window,
+                            lidar_fusion_mode=self.lidar_fusion_mode,
+                            ray_evidence_sat_bias=self.ray_evidence_sat_bias,
+                            ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
+                            ray_evidence_null_bias=self.ray_evidence_null_bias,
                         ),
             ResBlock(
                 ch,
@@ -712,6 +730,10 @@ class UNetModel(nn.Module):
                             lidar_evidence_channels=self.lidar_evidence_channels,
                             lidar_attention_mode=self.lidar_attention_mode,
                             lidar_reference_window=self.lidar_reference_window,
+                            lidar_fusion_mode=self.lidar_fusion_mode,
+                            ray_evidence_sat_bias=self.ray_evidence_sat_bias,
+                            ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
+                            ray_evidence_null_bias=self.ray_evidence_null_bias,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -792,9 +814,9 @@ class UNetModel(nn.Module):
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
             hs.append(h)
-        h = self.middle_block(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+        h = self.middle_block(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         self.last_lidar_bottleneck_depth_pred = th.sigmoid(
             self.lidar_bottleneck_depth_head(h.float())
         ).type_as(h)
@@ -815,7 +837,7 @@ class UNetModel(nn.Module):
             if control_grd is not None and len(control_grd) > 0:
                 skip = add_control(skip)
             h = th.cat([h, skip], dim=1)
-            h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         h = h.type(x.dtype)
         self.last_lidar_depth_pred = th.sigmoid(self.lidar_depth_head(h.float())).type_as(h)
         if self.predict_codebook_ids:

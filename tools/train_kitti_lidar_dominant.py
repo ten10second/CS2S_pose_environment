@@ -63,6 +63,14 @@ def parse_args():
         help="Run inline visual sampling every N steps. 0 disables sampling.",
     )
     parser.add_argument("--sample-manifest", default="", help="Fixed manifest used for inline sample panels.")
+    parser.add_argument(
+        "--sample-foreground-mask-root",
+        default="",
+        help=(
+            "Foreground mask cache used by inline sample panels. Defaults to --foreground-mask-root. "
+            "Only used when --ray-evidence-mask-mode=foreground."
+        ),
+    )
     parser.add_argument("--sample-num-samples", type=int, default=2)
     parser.add_argument("--sample-ddim-steps", type=int, default=2)
     parser.add_argument(
@@ -112,10 +120,56 @@ def parse_args():
     parser.add_argument(
         "--lidar-attention-mode",
         choices=["token", "reference"],
-        default="token",
+        default="reference",
         help=(
             "token uses global pooled LiDAR token cross-attention; reference uses "
             "Pointmap-style local attention aligned to the camera-view token grid."
+        ),
+    )
+    parser.add_argument(
+        "--lidar-fusion-mode",
+        choices=["sequential", "ray_evidence"],
+        default="ray_evidence",
+        help=(
+            "sequential keeps CS2S satellite residual followed by LiDAR residual; "
+            "ray_evidence fuses satellite, LiDAR, and null evidence per target camera ray."
+        ),
+    )
+    parser.add_argument(
+        "--lidar-geom-mode",
+        choices=["raw", "ray_depth", "ray_depth_inv"],
+        default="ray_depth_inv",
+        help=(
+            "raw feeds the original projected LiDAR tensor to the front encoder; "
+            "ray_depth/ray_depth_inv feed ray direction plus range cues while keeping "
+            "raw LiDAR for evidence maps and depth supervision."
+        ),
+    )
+    parser.add_argument(
+        "--ray-evidence-sat-bias",
+        type=float,
+        default=4.0,
+        help="Initial evidence-attention logit bias for the satellite evidence slot.",
+    )
+    parser.add_argument(
+        "--ray-evidence-lidar-bias",
+        type=float,
+        default=-4.0,
+        help="Initial evidence-attention logit bias for the LiDAR evidence slot.",
+    )
+    parser.add_argument(
+        "--ray-evidence-null-bias",
+        type=float,
+        default=-6.0,
+        help="Initial evidence-attention logit bias for the null/prior evidence slot.",
+    )
+    parser.add_argument(
+        "--ray-evidence-mask-mode",
+        choices=["none", "foreground", "lidar_hit"],
+        default="foreground",
+        help=(
+            "Where RAEA applies LiDAR correction. none reproduces the original unmasked RAEA; "
+            "foreground uses the foreground loss mask; lidar_hit uses LiDAR hit evidence and is available at sampling."
         ),
     )
     parser.add_argument(
@@ -188,6 +242,15 @@ def parse_args():
         help="Epsilon used by normalized log-depth supervision.",
     )
     parser.add_argument("--static-teacher-consistency-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--static-teacher-mask-mode",
+        choices=["no_lidar", "background"],
+        default="no_lidar",
+        help=(
+            "no_lidar anchors only pixels without projected LiDAR hits; background anchors "
+            "everything outside the foreground mask, including road/building LiDAR hits."
+        ),
+    )
     parser.add_argument("--foreground-mask-root", default="")
     parser.add_argument("--foreground-mask-suffix", default="_foreground.png")
     parser.add_argument("--foreground-loss-weight", type=float, default=0.0)
@@ -382,6 +445,18 @@ def resource_metrics():
     return metrics
 
 
+def lidar_geom_channels(condition_mode, geom_mode):
+    if condition_mode == "none":
+        return int(lidar_condition_channels(condition_mode))
+    if geom_mode == "raw":
+        return int(lidar_condition_channels(condition_mode))
+    if geom_mode == "ray_depth":
+        return 4
+    if geom_mode == "ray_depth_inv":
+        return 5
+    raise ValueError(f"Unsupported lidar geom mode: {geom_mode}")
+
+
 def configure_cfg(cfg, args):
     cfg.model.base_learning_rate = args.lr
     cfg.model.params.pre_sat2grd_model_path = None
@@ -398,6 +473,7 @@ def configure_cfg(cfg, args):
     cfg.model.params.lidar_unfreeze_transformers = "none" if args.train_denoise == "none" else args.lidar_unfreeze_transformers
     cfg.model.params.lidar_unet_lr_scale = float(args.lidar_unet_lr_scale)
     cfg.model.params.lidar_unet_new_lr_scale = float(args.lidar_unet_new_lr_scale)
+    cfg.model.params.lidar_geom_mode = args.lidar_geom_mode
 
     cfg.model.params.dynamic_loss_weight = float(args.dynamic_loss_weight)
     cfg.model.params.dynamic_x0_loss_weight = float(args.dynamic_x0_loss_weight)
@@ -411,6 +487,8 @@ def configure_cfg(cfg, args):
     cfg.model.params.lidar_depth_log_eps = float(args.lidar_depth_log_eps)
     cfg.model.params.static_teacher_consistency_weight = float(args.static_teacher_consistency_weight)
     cfg.model.params.static_teacher_gate_channel = int(lidar_condition_gate_channel(args.condition_mode))
+    cfg.model.params.static_teacher_mask_mode = args.static_teacher_mask_mode
+    cfg.model.params.ray_evidence_mask_mode = args.ray_evidence_mask_mode
     cfg.model.params.foreground_loss_weight = float(args.foreground_loss_weight)
     cfg.model.params.foreground_x0_loss_weight = float(args.foreground_x0_loss_weight)
     cfg.model.params.foreground_image_loss_weight = float(args.foreground_image_loss_weight)
@@ -439,11 +517,15 @@ def configure_cfg(cfg, args):
     unet.lidar_evidence_channels = 8 if use_dual_attention else 0
     unet.lidar_attention_mode = args.lidar_attention_mode
     unet.lidar_reference_window = int(args.lidar_reference_window)
+    unet.lidar_fusion_mode = args.lidar_fusion_mode
+    unet.ray_evidence_sat_bias = float(args.ray_evidence_sat_bias)
+    unet.ray_evidence_lidar_bias = float(args.ray_evidence_lidar_bias)
+    unet.ray_evidence_null_bias = float(args.ray_evidence_null_bias)
     if use_dual_attention:
         cfg.model.params.Lidar_context_config = {
             "target": "models.KITTI_geo_ldm.lidar_condition_model.LidarRangeTokenEncoder",
             "params": {
-                "front_in_channels": int(lidar_condition_channels(args.condition_mode)),
+                "front_in_channels": int(lidar_geom_channels(args.condition_mode, args.lidar_geom_mode)),
                 "range_in_channels": 3,
                 "hidden_channels": int(args.lidar_token_hidden_channels),
                 "range_feature_channels": int(args.range_feature_channels),
@@ -624,6 +706,9 @@ def build_inline_sample_dataset(args):
         max_depth=80.0,
         align_satellite_to_camera=True,
         include_range_image=True,
+        foreground_mask_root=args.sample_foreground_mask_root or args.foreground_mask_root,
+        foreground_mask_suffix=args.foreground_mask_suffix,
+        include_tracklets=bool(args.include_tracklets),
     )
 
 
@@ -709,6 +794,10 @@ def run_inline_samples(model, sample_dataset, args, out_dir, step):
 
 def count_trainable(module):
     return sum(param.numel() for param in module.parameters() if param.requires_grad)
+
+
+def uses_lidar_residual_gate(args):
+    return args.lidar_fusion_mode == "sequential"
 
 
 def lidar_gate_mean(model):
@@ -809,6 +898,13 @@ def lidar_attention_stats(model):
     sim_range = []
     token_count = []
     query_count = []
+    evidence_sat = []
+    evidence_lidar = []
+    evidence_null = []
+    evidence_entropy = []
+    evidence_lidar_mask = []
+    evidence_lidar_masked = []
+    evidence_lidar_background = []
     for module in model.DDPM.denoise_model.modules():
         if hasattr(module, "last_attn_entropy_norm"):
             entropy.append(torch.tensor(module_stat_float(module, "last_attn_entropy_norm"), dtype=torch.float32))
@@ -818,6 +914,15 @@ def lidar_attention_stats(model):
             sim_range.append(torch.tensor(module_stat_float(module, "last_sim_range_mean"), dtype=torch.float32))
             token_count.append(torch.tensor(module_stat_float(module, "last_attn_token_count"), dtype=torch.float32))
             query_count.append(torch.tensor(module_stat_float(module, "last_attn_query_count"), dtype=torch.float32))
+        if hasattr(module, "last_evidence_sat_weight"):
+            evidence_sat.append(torch.tensor(module_stat_float(module, "last_evidence_sat_weight"), dtype=torch.float32))
+            evidence_lidar.append(torch.tensor(module_stat_float(module, "last_evidence_lidar_weight"), dtype=torch.float32))
+            evidence_null.append(torch.tensor(module_stat_float(module, "last_evidence_null_weight"), dtype=torch.float32))
+            evidence_entropy.append(torch.tensor(module_stat_float(module, "last_evidence_entropy_norm"), dtype=torch.float32))
+            if hasattr(module, "last_evidence_lidar_mask_mean"):
+                evidence_lidar_mask.append(torch.tensor(module_stat_float(module, "last_evidence_lidar_mask_mean"), dtype=torch.float32))
+                evidence_lidar_masked.append(torch.tensor(module_stat_float(module, "last_evidence_lidar_weight_masked"), dtype=torch.float32))
+                evidence_lidar_background.append(torch.tensor(module_stat_float(module, "last_evidence_lidar_weight_background"), dtype=torch.float32))
     if not entropy:
         return {
             "lidar_attn_modules": 0,
@@ -828,8 +933,16 @@ def lidar_attention_stats(model):
             "lidar_attn_std_mean": 0.0,
             "lidar_attn_token_count_mean": 0.0,
             "lidar_attn_query_count_mean": 0.0,
+            "ray_evidence_modules": len(evidence_sat),
+            "ray_evidence_sat_weight_mean": float(torch.stack(evidence_sat).mean()) if evidence_sat else 0.0,
+            "ray_evidence_lidar_weight_mean": float(torch.stack(evidence_lidar).mean()) if evidence_lidar else 0.0,
+            "ray_evidence_null_weight_mean": float(torch.stack(evidence_null).mean()) if evidence_null else 0.0,
+            "ray_evidence_entropy_norm_mean": float(torch.stack(evidence_entropy).mean()) if evidence_entropy else 0.0,
+            "ray_evidence_lidar_mask_mean": float(torch.stack(evidence_lidar_mask).mean()) if evidence_lidar_mask else 0.0,
+            "ray_evidence_lidar_weight_masked_mean": float(torch.stack(evidence_lidar_masked).mean()) if evidence_lidar_masked else 0.0,
+            "ray_evidence_lidar_weight_background_mean": float(torch.stack(evidence_lidar_background).mean()) if evidence_lidar_background else 0.0,
         }
-    return {
+    stats = {
         "lidar_attn_modules": len(entropy),
         "lidar_sim_std_mean": float(torch.stack(sim_std).mean()),
         "lidar_sim_range_mean": float(torch.stack(sim_range).mean()),
@@ -839,6 +952,19 @@ def lidar_attention_stats(model):
         "lidar_attn_token_count_mean": float(torch.stack(token_count).mean()),
         "lidar_attn_query_count_mean": float(torch.stack(query_count).mean()),
     }
+    stats.update(
+        {
+            "ray_evidence_modules": len(evidence_sat),
+            "ray_evidence_sat_weight_mean": float(torch.stack(evidence_sat).mean()) if evidence_sat else 0.0,
+            "ray_evidence_lidar_weight_mean": float(torch.stack(evidence_lidar).mean()) if evidence_lidar else 0.0,
+            "ray_evidence_null_weight_mean": float(torch.stack(evidence_null).mean()) if evidence_null else 0.0,
+            "ray_evidence_entropy_norm_mean": float(torch.stack(evidence_entropy).mean()) if evidence_entropy else 0.0,
+            "ray_evidence_lidar_mask_mean": float(torch.stack(evidence_lidar_mask).mean()) if evidence_lidar_mask else 0.0,
+            "ray_evidence_lidar_weight_masked_mean": float(torch.stack(evidence_lidar_masked).mean()) if evidence_lidar_masked else 0.0,
+            "ray_evidence_lidar_weight_background_mean": float(torch.stack(evidence_lidar_background).mean()) if evidence_lidar_background else 0.0,
+        }
+    )
+    return stats
 
 
 def lidar_context_token_stats(model):
@@ -903,6 +1029,8 @@ def force_lidar_gate(model, gate_value):
         if name.endswith("lidar_gate"):
             param.data.copy_(logit.to(device=param.device, dtype=param.dtype))
             count += 1
+    if count == 0:
+        return {"enabled": False, "count": 0, "reason": "no_lidar_residual_gate"}
     return {"enabled": True, "count": count, "gate": float(gate_value)}
 
 
@@ -984,7 +1112,12 @@ def main():
     if args.resume_ckpt:
         start_step = load_training_checkpoint(model, optimizer, args.resume_ckpt)
         print(json.dumps({"resumed": args.resume_ckpt, "start_step": start_step}, sort_keys=True))
-    forced_gate = force_lidar_gate(model, args.force_lidar_gate)
+    use_lidar_residual_gate = uses_lidar_residual_gate(args)
+    forced_gate = (
+        force_lidar_gate(model, args.force_lidar_gate)
+        if use_lidar_residual_gate
+        else {"enabled": False, "count": 0, "reason": "ray_evidence_fusion_does_not_use_lidar_gate"}
+    )
     if forced_gate["enabled"]:
         print(
             json.dumps(
@@ -992,7 +1125,11 @@ def main():
                 sort_keys=True,
             )
         )
-    initial_gate_cap = set_lidar_gate_cap(model, scheduled_lidar_gate_cap(args, start_step))
+    initial_gate_cap = (
+        set_lidar_gate_cap(model, scheduled_lidar_gate_cap(args, start_step))
+        if use_lidar_residual_gate
+        else {"enabled": False, "count": 0, "reason": "ray_evidence_fusion_does_not_use_lidar_gate"}
+    )
     model.train()
 
     metadata = {
@@ -1008,6 +1145,7 @@ def main():
         "sample_num_samples": int(args.sample_num_samples),
         "sample_ddim_steps": int(args.sample_ddim_steps),
         "sample_probes": args.sample_probes,
+        "sample_foreground_mask_root": args.sample_foreground_mask_root or args.foreground_mask_root,
         "deprecated_sample_shift_fraction_noop": float(args.sample_shift_fraction),
         "uses_result_kitti_ckpt": bool(args.cs2s_init_ckpt),
         "cs2s_loaded": cs2s_loaded,
@@ -1017,6 +1155,13 @@ def main():
         "train_size": len(train_dataset),
         "steps_per_epoch_batch1": len(train_dataset),
         "lidar_injection": args.lidar_injection,
+        "lidar_attention_mode": args.lidar_attention_mode,
+        "lidar_fusion_mode": args.lidar_fusion_mode,
+        "lidar_geom_mode": args.lidar_geom_mode,
+        "ray_evidence_sat_bias": float(args.ray_evidence_sat_bias),
+        "ray_evidence_lidar_bias": float(args.ray_evidence_lidar_bias),
+        "ray_evidence_null_bias": float(args.ray_evidence_null_bias),
+        "ray_evidence_mask_mode": args.ray_evidence_mask_mode,
         "use_lidar_control_residual": False,
         "use_lidar_cross_attention": bool(cfg.model.params.DDPM_config.params.unet_config.params.use_lidar_cross_attention),
         "lidar_evidence_channels": int(cfg.model.params.DDPM_config.params.unet_config.params.lidar_evidence_channels),
@@ -1044,15 +1189,12 @@ def main():
         "lidar_token_structure_target_ratio": float(args.lidar_token_structure_target_ratio),
         "lidar_attention_mode": args.lidar_attention_mode,
         "lidar_reference_window": int(args.lidar_reference_window),
-        "force_lidar_gate": float(args.force_lidar_gate),
-        "forced_lidar_gate": forced_gate,
-        "lidar_gate_cap_start": float(args.lidar_gate_cap_start),
-        "lidar_gate_cap_end": float(args.lidar_gate_cap_end),
-        "lidar_gate_warmup_steps": int(args.lidar_gate_warmup_steps),
-        "initial_lidar_gate_cap": initial_gate_cap,
+        "uses_lidar_residual_gate": bool(use_lidar_residual_gate),
         "foreground_mask_root": args.foreground_mask_root,
         "foreground_mask_suffix": args.foreground_mask_suffix,
         "include_tracklets": bool(args.include_tracklets),
+        "static_teacher_consistency_weight": float(args.static_teacher_consistency_weight),
+        "static_teacher_mask_mode": args.static_teacher_mask_mode,
         "foreground_loss_weight": float(args.foreground_loss_weight),
         "foreground_x0_loss_weight": float(args.foreground_x0_loss_weight),
         "foreground_image_loss_weight": float(args.foreground_image_loss_weight),
@@ -1074,6 +1216,17 @@ def main():
         "trainable_sat_condition_params": count_trainable(model.condition_model_sat),
         "trainable_denoise_params": count_trainable(model.DDPM.denoise_model),
     }
+    if use_lidar_residual_gate:
+        metadata.update(
+            {
+                "force_lidar_gate": float(args.force_lidar_gate),
+                "forced_lidar_gate": forced_gate,
+                "lidar_gate_cap_start": float(args.lidar_gate_cap_start),
+                "lidar_gate_cap_end": float(args.lidar_gate_cap_end),
+                "lidar_gate_warmup_steps": int(args.lidar_gate_warmup_steps),
+                "initial_lidar_gate_cap": initial_gate_cap,
+            }
+        )
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
     print(json.dumps({"start": True, **metadata, **resource_metrics()}, sort_keys=True))
 
@@ -1105,8 +1258,9 @@ def main():
             "satellite_condition_dropout_fraction": 0.0,
         }
         for step in range(start_step + 1, args.steps + 1):
-            lidar_gate_cap = scheduled_lidar_gate_cap(args, step)
-            set_lidar_gate_cap(model, lidar_gate_cap)
+            if use_lidar_residual_gate:
+                lidar_gate_cap = scheduled_lidar_gate_cap(args, step)
+                set_lidar_gate_cap(model, lidar_gate_cap)
             batch_cpu, iterator = next_batch(loader, iterator)
             batch = move_batch_to_cuda(batch_cpu)
             optimizer.zero_grad(set_to_none=True)
@@ -1119,7 +1273,7 @@ def main():
                 loss = loss + token_structure_loss_contrib
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            gate_grad_stats = lidar_gate_grad_stats(model)
+            gate_grad_stats = lidar_gate_grad_stats(model) if use_lidar_residual_gate else {}
             scaler.step(optimizer)
             scaler.update()
 
@@ -1203,6 +1357,12 @@ def main():
                     "step": step,
                     "loss": scalar(loss),
                     "condition_mode": args.condition_mode,
+                    "lidar_fusion_mode": args.lidar_fusion_mode,
+                    "lidar_geom_mode": args.lidar_geom_mode,
+                    "ray_evidence_sat_bias": float(args.ray_evidence_sat_bias),
+                    "ray_evidence_lidar_bias": float(args.ray_evidence_lidar_bias),
+                    "ray_evidence_null_bias": float(args.ray_evidence_null_bias),
+                    "ray_evidence_mask_mode": args.ray_evidence_mask_mode,
                     "num_projected_lidar_points": int(batch.get("num_projected_lidar_points", torch.zeros(1, device="cuda")).sum().detach().cpu()),
                     "num_dynamic_boxes": int(batch.get("num_dynamic_boxes", torch.zeros(1, device="cuda")).sum().detach().cpu()),
                     "lidar_support_loss_weight": args.lidar_support_loss_weight,
@@ -1282,6 +1442,8 @@ def main():
                     "foreground_x0_loss_weight": args.foreground_x0_loss_weight,
                     "foreground_image_loss_weight": args.foreground_image_loss_weight,
                     "foreground_lpips_loss_weight": args.foreground_lpips_loss_weight,
+                    "static_teacher_consistency_weight": float(args.static_teacher_consistency_weight),
+                    "static_teacher_mask_mode": args.static_teacher_mask_mode,
                     "lidar_zero_reconstruction_loss_weight": float(args.lidar_zero_reconstruction_loss_weight),
                     "lidar_zero_reconstruction_mask_mode": args.lidar_zero_reconstruction_mask_mode,
                     "lidar_counterfactual_weight": args.lidar_counterfactual_weight,
@@ -1301,8 +1463,6 @@ def main():
                     "lidar_evidence_hit_coverage": scalar(getattr(getattr(model, "lidar_context_model", None), "last_hit_coverage", torch.tensor(0.0))),
                     "lidar_evidence_empty_coverage": scalar(getattr(getattr(model, "lidar_context_model", None), "last_empty_coverage", torch.tensor(0.0))),
                     **lidar_context_token_stats(model),
-                    "lidar_gate_mean": lidar_gate_mean(model),
-                    **lidar_gate_stats(model),
                     **gate_grad_stats,
                     **lidar_attention_stats(model),
                     **satellite_dropout_metrics,
@@ -1310,6 +1470,13 @@ def main():
                     **getattr(model, "last_lidar_counterfactual_metrics", {}),
                     **resource_metrics(),
                 }
+                if use_lidar_residual_gate:
+                    record.update(
+                        {
+                            "lidar_gate_mean": lidar_gate_mean(model),
+                            **lidar_gate_stats(model),
+                        }
+                    )
                 metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
                 metrics_file.flush()
                 print(json.dumps(record, sort_keys=True))
