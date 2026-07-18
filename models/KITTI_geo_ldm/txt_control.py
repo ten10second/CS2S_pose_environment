@@ -74,6 +74,11 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 lidar_counterfactual_exist_weight=1.0,
                 lidar_depth_loss_weight=0.0,
                 lidar_depth_log_eps=1e-3,
+                lidar_semantic_alignment_weight=0.0,
+                lidar_semantic_alignment_key="image_semantic_feat",
+                lidar_semantic_alignment_mask_mode="all",
+                lidar_semantic_contrast_weight=0.0,
+                lidar_semantic_contrast_margin=0.1,
                 lidar_zero_reconstruction_loss_weight=0.0,
                 lidar_zero_reconstruction_mask_mode="all",
                 static_teacher_consistency_weight=0.0,
@@ -146,6 +151,18 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.last_lidar_counterfactual_metrics = {}
         self.lidar_depth_loss_weight = float(lidar_depth_loss_weight)
         self.lidar_depth_log_eps = float(lidar_depth_log_eps)
+        self.lidar_semantic_alignment_weight = float(lidar_semantic_alignment_weight)
+        self.lidar_semantic_alignment_key = str(lidar_semantic_alignment_key or "image_semantic_feat")
+        self.lidar_semantic_alignment_mask_mode = str(lidar_semantic_alignment_mask_mode or "all")
+        if self.lidar_semantic_alignment_mask_mode not in {"all", "lidar_hit", "foreground", "foreground_lidar"}:
+            raise ValueError(
+                "lidar_semantic_alignment_mask_mode must be one of "
+                "'all', 'lidar_hit', 'foreground', 'foreground_lidar', "
+                f"got {self.lidar_semantic_alignment_mask_mode!r}"
+            )
+        self.lidar_semantic_contrast_weight = float(lidar_semantic_contrast_weight)
+        self.lidar_semantic_contrast_margin = float(lidar_semantic_contrast_margin)
+        self.last_lidar_semantic_alignment_metrics = {}
         self.lidar_zero_reconstruction_loss_weight = float(lidar_zero_reconstruction_loss_weight)
         self.lidar_zero_reconstruction_mask_mode = str(lidar_zero_reconstruction_mask_mode or "all")
         if self.lidar_zero_reconstruction_mask_mode not in {"all", "background"}:
@@ -400,7 +417,18 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         inv_depth = (1.0 - depth).clamp(0.0, 1.0) * hit
         return torch.cat([hit, ray_x, ray_y, log_depth, inv_depth], dim=1).to(dtype=lidar_cond.dtype)
 
-    def make_lidar_context(self, lidar_cond, range_img=None, range_mask=None, camera_to_lidar=None, left_camera_k=None):
+    def make_lidar_context(
+        self,
+        lidar_cond,
+        range_img=None,
+        range_mask=None,
+        camera_to_lidar=None,
+        left_camera_k=None,
+        lidar_points=None,
+        lidar_points_mask=None,
+        lidar_point_features=None,
+        lidar_point_features_mask=None,
+    ):
         if self.lidar_context_model is None or lidar_cond is None:
             return None
         lidar_geom_cond = self.build_lidar_geom_cond(lidar_cond)
@@ -411,7 +439,131 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             range_mask=range_mask,
             camera_k=left_camera_k,
             camera_to_lidar=camera_to_lidar,
+            lidar_points=lidar_points,
+            lidar_points_mask=lidar_points_mask,
+            lidar_point_features=lidar_point_features,
+            lidar_point_features_mask=lidar_point_features_mask,
         )
+
+    def lidar_semantic_alignment_loss(
+        self,
+        semantic_pred_tokens,
+        batch,
+        lidar_cond,
+        foreground_image_loss_mask,
+    ):
+        metrics = {
+            "lidar_semantic_alignment_applied": 0,
+            "lidar_semantic_alignment_loss": 0.0,
+            "lidar_semantic_alignment_contrib": 0.0,
+            "lidar_semantic_alignment_mask_coverage": 0.0,
+            "lidar_semantic_alignment_target_available": 0.0,
+            "lidar_semantic_contrast_loss": 0.0,
+            "lidar_semantic_contrast_contrib": 0.0,
+        }
+        if self.lidar_semantic_alignment_weight <= 0.0:
+            self.last_lidar_semantic_alignment_metrics = metrics
+            return None
+        if semantic_pred_tokens is None or self.lidar_semantic_alignment_key not in batch:
+            self.last_lidar_semantic_alignment_metrics = metrics
+            return None
+
+        pred = semantic_pred_tokens
+        target = batch[self.lidar_semantic_alignment_key].to(device=pred.device, dtype=pred.dtype)
+        if target.ndim == 4:
+            if target.shape[1] == pred.shape[-1]:
+                target_map = target
+            elif target.shape[-1] == pred.shape[-1]:
+                target_map = target.permute(0, 3, 1, 2).contiguous()
+            else:
+                self.last_lidar_semantic_alignment_metrics = metrics
+                return None
+            grid_h, grid_w = self.lidar_context_model.token_grid
+            if target_map.shape[-2:] != (grid_h, grid_w):
+                target_map = F.interpolate(target_map, size=(grid_h, grid_w), mode="bilinear", align_corners=False)
+            target_tokens = target_map.flatten(2).transpose(1, 2)
+        elif target.ndim == 3:
+            target_tokens = target
+            if target_tokens.shape[1] != pred.shape[1] and target_tokens.shape[2] == pred.shape[1]:
+                target_tokens = target_tokens.transpose(1, 2)
+            if target_tokens.shape[1] != pred.shape[1] or target_tokens.shape[2] != pred.shape[2]:
+                self.last_lidar_semantic_alignment_metrics = metrics
+                return None
+        else:
+            self.last_lidar_semantic_alignment_metrics = metrics
+            return None
+
+        mask = pred.new_ones((pred.shape[0], pred.shape[1], 1))
+        if "image_semantic_available" in batch:
+            available = batch["image_semantic_available"].to(device=pred.device, dtype=pred.dtype).view(pred.shape[0], -1)
+            mask = mask * available[:, :1].unsqueeze(1)
+            metrics["lidar_semantic_alignment_target_available"] = float(available[:, 0].detach().mean().cpu())
+        if "image_semantic_mask" in batch:
+            sem_mask = batch["image_semantic_mask"].to(device=pred.device, dtype=pred.dtype)
+            if sem_mask.ndim == 3:
+                sem_mask = sem_mask.unsqueeze(1)
+            grid_h, grid_w = self.lidar_context_model.token_grid
+            sem_mask = F.interpolate(sem_mask.float(), size=(grid_h, grid_w), mode="nearest").flatten(2).transpose(1, 2)
+            mask = mask * sem_mask.clamp(0.0, 1.0)
+
+        hit_tokens = None
+        if lidar_cond is not None:
+            hit = lidar_cond[:, 1:2].float().to(device=pred.device, dtype=pred.dtype)
+            grid_h, grid_w = self.lidar_context_model.token_grid
+            hit_tokens = F.adaptive_max_pool2d(hit, (grid_h, grid_w)).flatten(2).transpose(1, 2).clamp(0.0, 1.0)
+        fg_tokens = None
+        if foreground_image_loss_mask is not None:
+            grid_h, grid_w = self.lidar_context_model.token_grid
+            fg_tokens = F.interpolate(
+                foreground_image_loss_mask.to(device=pred.device, dtype=pred.dtype),
+                size=(grid_h, grid_w),
+                mode="nearest",
+            ).flatten(2).transpose(1, 2).clamp(0.0, 1.0)
+
+        if self.lidar_semantic_alignment_mask_mode == "lidar_hit" and hit_tokens is not None:
+            mask = mask * hit_tokens
+        elif self.lidar_semantic_alignment_mask_mode == "foreground" and fg_tokens is not None:
+            mask = mask * fg_tokens
+        elif self.lidar_semantic_alignment_mask_mode == "foreground_lidar":
+            if fg_tokens is not None:
+                mask = mask * fg_tokens
+            if hit_tokens is not None:
+                mask = mask * hit_tokens
+
+        mask_sum = mask.sum().clamp_min(1.0)
+        pred_norm = F.normalize(pred, dim=-1)
+        target_norm = F.normalize(target_tokens.detach(), dim=-1)
+        align_raw = 1.0 - (pred_norm * target_norm).sum(dim=-1, keepdim=True)
+        align_loss = (align_raw * mask).sum() / mask_sum
+        contrast_loss = pred.new_zeros(())
+        if self.lidar_semantic_contrast_weight > 0.0 and fg_tokens is not None:
+            fg_mask = (mask * fg_tokens).clamp(0.0, 1.0)
+            bg_mask = (mask * (1.0 - fg_tokens)).clamp(0.0, 1.0)
+            if float(fg_mask.detach().sum().cpu()) > 1.0 and float(bg_mask.detach().sum().cpu()) > 1.0:
+                fg_target = F.normalize((target_norm * fg_mask).sum(dim=1) / fg_mask.sum(dim=1).clamp_min(1.0), dim=-1)
+                bg_target = F.normalize((target_norm * bg_mask).sum(dim=1) / bg_mask.sum(dim=1).clamp_min(1.0), dim=-1)
+                fg_sim = (pred_norm * fg_target.unsqueeze(1)).sum(dim=-1, keepdim=True)
+                fg_bg_sim = (pred_norm * bg_target.unsqueeze(1)).sum(dim=-1, keepdim=True)
+                contrast_raw = F.relu(float(self.lidar_semantic_contrast_margin) + fg_bg_sim - fg_sim)
+                contrast_loss = (contrast_raw * fg_mask).sum() / fg_mask.sum().clamp_min(1.0)
+        total = float(self.lidar_semantic_alignment_weight) * align_loss
+        total = total + float(self.lidar_semantic_contrast_weight) * contrast_loss
+        metrics.update(
+            {
+                "lidar_semantic_alignment_applied": 1,
+                "lidar_semantic_alignment_loss": float(align_loss.detach().cpu()),
+                "lidar_semantic_alignment_contrib": float(
+                    (float(self.lidar_semantic_alignment_weight) * align_loss).detach().cpu()
+                ),
+                "lidar_semantic_alignment_mask_coverage": float(mask.detach().float().mean().cpu()),
+                "lidar_semantic_contrast_loss": float(contrast_loss.detach().cpu()),
+                "lidar_semantic_contrast_contrib": float(
+                    (float(self.lidar_semantic_contrast_weight) * contrast_loss).detach().cpu()
+                ),
+            }
+        )
+        self.last_lidar_semantic_alignment_metrics = metrics
+        return total
 
     def make_lidar_evidence(self, lidar_cond):
         if self.lidar_context_model is None or lidar_cond is None:
@@ -486,6 +638,9 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 "last_token_output_centered_norm",
                 "last_token_output_centered_to_mean_ratio",
                 "last_token_output_var_mean",
+                "last_point_valid_ratio",
+                "last_point_count_mean",
+                "last_ray_token_coverage",
             ]:
                 value = getattr(context_model, name, None)
                 if torch.is_tensor(value):
@@ -545,6 +700,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         range_mask,
         camera_to_lidar,
         left_camera_k,
+        lidar_points,
+        lidar_points_mask,
+        lidar_point_features,
+        lidar_point_features_mask,
         gt_shift_x,
         gt_shift_y,
         theta,
@@ -594,6 +753,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         zero_lidar_cond = self.apply_lidar_counterfactual_probe(lidar_cond, "zero")
         zero_range_img = self.apply_lidar_counterfactual_probe(range_img, "zero")
         zero_range_mask = self.apply_lidar_counterfactual_probe(range_mask, "zero")
+        zero_lidar_points = self.apply_lidar_counterfactual_probe(lidar_points, "zero")
+        zero_lidar_points_mask = self.apply_lidar_counterfactual_probe(lidar_points_mask, "zero")
+        zero_lidar_point_features = self.apply_lidar_counterfactual_probe(lidar_point_features, "zero")
+        zero_lidar_point_features_mask = self.apply_lidar_counterfactual_probe(lidar_point_features_mask, "zero")
         stop_negative = (
             self.lidar_counterfactual_stop_negative
             and not needs_zero_reconstruction
@@ -606,6 +769,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 range_mask=zero_range_mask,
                 camera_to_lidar=camera_to_lidar,
                 left_camera_k=left_camera_k,
+                lidar_points=zero_lidar_points,
+                lidar_points_mask=zero_lidar_points_mask,
+                lidar_point_features=zero_lidar_point_features,
+                lidar_point_features_mask=zero_lidar_point_features_mask,
             )
             zero_lidar_evidence = self.make_lidar_evidence(zero_lidar_cond)
             zero_outputs = self.DDPM.p_losses(
@@ -922,6 +1089,26 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             lidar_cond = self.get_input(batch, self.lidar_condition_key)
         range_img = self.get_input(batch, "range_img") if self.use_lidar_cond and "range_img" in batch else None
         range_mask = self.get_input(batch, "range_mask") if self.use_lidar_cond and "range_mask" in batch else None
+        lidar_points = (
+            batch["lidar_points"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_points" in batch
+            else None
+        )
+        lidar_points_mask = (
+            batch["lidar_points_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_points_mask" in batch
+            else None
+        )
+        lidar_point_features = (
+            batch["lidar_point_features"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_point_features" in batch
+            else None
+        )
+        lidar_point_features_mask = (
+            batch["lidar_point_features_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_point_features_mask" in batch
+            else None
+        )
         camera_to_lidar = (
             self.get_input(batch, "camera_to_lidar").squeeze(-1)
             if self.use_lidar_cond and "camera_to_lidar" in batch
@@ -945,6 +1132,15 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             range_mask=range_mask,
             camera_to_lidar=camera_to_lidar,
             left_camera_k=left_camera_k,
+            lidar_points=lidar_points,
+            lidar_points_mask=lidar_points_mask,
+            lidar_point_features=lidar_point_features,
+            lidar_point_features_mask=lidar_point_features_mask,
+        )
+        semantic_pred_tokens = (
+            getattr(self.lidar_context_model, "last_semantic_pred_tokens", None)
+            if self.lidar_context_model is not None
+            else None
         )
         lidar_evidence = self.make_lidar_evidence(lidar_cond)
         pre_residual_laten = self.pre_AE_model.encode(outputs).sample().detach()
@@ -979,6 +1175,12 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             self.latent_dynamic_mask(foreground_image_loss_mask, pre_residual_laten.shape)
             if foreground_image_loss_mask is not None
             else None
+        )
+        semantic_alignment_loss = self.lidar_semantic_alignment_loss(
+            semantic_pred_tokens,
+            batch,
+            lidar_cond,
+            foreground_image_loss_mask,
         )
         static_teacher_loss_mask = self.static_teacher_loss_mask(
             lidar_cond,
@@ -1073,6 +1275,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 range_mask,
                 camera_to_lidar,
                 left_camera_k,
+                lidar_points,
+                lidar_points_mask,
+                lidar_point_features,
+                lidar_point_features_mask,
                 gt_shift_x,
                 gt_shift_y,
                 theta,
@@ -1083,6 +1289,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             )
         else:
             loss = self.DDPM.t_losses(pre_residual_laten, **loss_kwargs)
+        if semantic_alignment_loss is not None:
+            loss = loss + semantic_alignment_loss
         self.log("L1_loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         return loss
         
@@ -1096,6 +1304,26 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             lidar_cond = self.get_input(batch, self.lidar_condition_key)
         range_img = self.get_input(batch, "range_img") if self.use_lidar_cond and "range_img" in batch else None
         range_mask = self.get_input(batch, "range_mask") if self.use_lidar_cond and "range_mask" in batch else None
+        lidar_points = (
+            batch["lidar_points"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_points" in batch
+            else None
+        )
+        lidar_points_mask = (
+            batch["lidar_points_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_points_mask" in batch
+            else None
+        )
+        lidar_point_features = (
+            batch["lidar_point_features"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_point_features" in batch
+            else None
+        )
+        lidar_point_features_mask = (
+            batch["lidar_point_features_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_point_features_mask" in batch
+            else None
+        )
         camera_to_lidar = (
             self.get_input(batch, "camera_to_lidar").squeeze(-1)
             if self.use_lidar_cond and "camera_to_lidar" in batch
@@ -1120,6 +1348,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             range_mask=range_mask,
             camera_to_lidar=camera_to_lidar,
             left_camera_k=left_camera_k,
+            lidar_points=lidar_points,
+            lidar_points_mask=lidar_points_mask,
+            lidar_point_features=lidar_point_features,
+            lidar_point_features_mask=lidar_point_features_mask,
         )
         lidar_evidence = self.make_lidar_evidence(lidar_cond)
         sampler = KITTI_DDIMSampler(self.DDPM, self.pre_AE_model, self.scale_factor)
@@ -1265,6 +1497,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 if (
                     ".attn_lidar." in name
                     or ".norm_lidar." in name
+                    or ".ray_evidence_attn." in name
                     or ".evidence_router." in name
                     or ".lidar_depth_head." in name
                     or ".lidar_bottleneck_depth_head." in name
@@ -1332,6 +1565,26 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             lidar_cond = self.get_input(batch, self.lidar_condition_key)
         range_img = self.get_input(batch, "range_img") if self.use_lidar_cond and "range_img" in batch else None
         range_mask = self.get_input(batch, "range_mask") if self.use_lidar_cond and "range_mask" in batch else None
+        lidar_points = (
+            batch["lidar_points"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_points" in batch
+            else None
+        )
+        lidar_points_mask = (
+            batch["lidar_points_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_points_mask" in batch
+            else None
+        )
+        lidar_point_features = (
+            batch["lidar_point_features"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_point_features" in batch
+            else None
+        )
+        lidar_point_features_mask = (
+            batch["lidar_point_features_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_point_features_mask" in batch
+            else None
+        )
         camera_to_lidar = (
             self.get_input(batch, "camera_to_lidar").squeeze(-1)
             if self.use_lidar_cond and "camera_to_lidar" in batch
@@ -1355,6 +1608,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             range_mask=range_mask,
             camera_to_lidar=camera_to_lidar,
             left_camera_k=left_camera_k,
+            lidar_points=lidar_points,
+            lidar_points_mask=lidar_points_mask,
+            lidar_point_features=lidar_point_features,
+            lidar_point_features_mask=lidar_point_features_mask,
         )
         lidar_evidence = self.make_lidar_evidence(lidar_cond)
         sampler = KITTI_DDIMSampler(self.DDPM, self.pre_AE_model, self.scale_factor)

@@ -619,7 +619,10 @@ class RayAlignedEvidenceAttention(nn.Module):
         inner_dim = int(heads) * int(dim_head)
         self.heads = int(heads)
         self.scale = float(dim_head) ** -0.5
-        self.to_q = zero_module(nn.Linear(dim, inner_dim, bias=False))
+        # Keep the initial evidence logits bias-only without deadlocking the
+        # bilinear q-k router: a non-zero query lets the zero-initialized key
+        # projection receive gradients on the first optimization step.
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
         self.to_k = zero_module(nn.Linear(dim, inner_dim, bias=False))
         self.ray_proj = zero_module(nn.Linear(dim, dim, bias=False))
         self.dropout = nn.Dropout(dropout)
@@ -629,11 +632,20 @@ class RayAlignedEvidenceAttention(nn.Module):
         )
         self.register_buffer("last_evidence_sat_weight", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_evidence_lidar_weight", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_lidar_weight_std", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_lidar_weight_min", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_evidence_lidar_weight_max", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_evidence_null_weight", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_evidence_entropy_norm", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_evidence_lidar_mask_mean", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_evidence_lidar_weight_masked", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_evidence_lidar_weight_background", torch.tensor(0.0), persistent=False)
+
+    def reset_router_parameters(self):
+        """Recover query-adaptive routing while preserving bias-only output."""
+        self.to_q.reset_parameters()
+        nn.init.zeros_(self.to_k.weight)
+        nn.init.zeros_(self.ray_proj.weight)
 
     @staticmethod
     def ray_encoding_2d(height, width, dim, device, dtype):
@@ -642,10 +654,20 @@ class RayAlignedEvidenceAttention(nn.Module):
     def _record_stats(self, attn):
         with torch.no_grad():
             weights = attn.detach().float().mean(dim=(0, 1, 2))
+            lidar_weight = attn.detach().float().mean(dim=1)[..., 1]
             entropy = -(attn.detach().float().clamp_min(1e-12) * attn.detach().float().clamp_min(1e-12).log()).sum(dim=-1)
             entropy_norm = entropy / math.log(max(2, int(attn.shape[-1])))
             self.last_evidence_sat_weight.copy_(weights[0].to(self.last_evidence_sat_weight.device))
             self.last_evidence_lidar_weight.copy_(weights[1].to(self.last_evidence_lidar_weight.device))
+            self.last_evidence_lidar_weight_std.copy_(
+                lidar_weight.std(unbiased=False).to(self.last_evidence_lidar_weight_std.device)
+            )
+            self.last_evidence_lidar_weight_min.copy_(
+                lidar_weight.min().to(self.last_evidence_lidar_weight_min.device)
+            )
+            self.last_evidence_lidar_weight_max.copy_(
+                lidar_weight.max().to(self.last_evidence_lidar_weight_max.device)
+            )
             self.last_evidence_null_weight.copy_(weights[2].to(self.last_evidence_null_weight.device))
             self.last_evidence_entropy_norm.copy_(
                 entropy_norm.mean().detach().to(self.last_evidence_entropy_norm.device)

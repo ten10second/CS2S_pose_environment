@@ -214,7 +214,12 @@ class LidarRangeTokenEncoder(nn.Module):
         camera_k: Optional[torch.Tensor] = None,
         camera_to_lidar: Optional[torch.Tensor] = None,
         image_size: Optional[Tuple[int, int]] = None,
+        lidar_points: Optional[torch.Tensor] = None,
+        lidar_points_mask: Optional[torch.Tensor] = None,
+        lidar_point_features: Optional[torch.Tensor] = None,
+        lidar_point_features_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        del lidar_points, lidar_points_mask, lidar_point_features, lidar_point_features_mask
         evidence_source = raw_lidar_cond if raw_lidar_cond is not None else lidar_cond
         front_input = lidar_cond.float()
         if self.use_evidence_maps:
@@ -308,6 +313,385 @@ class LidarRangeTokenEncoder(nn.Module):
                 )
             else:
                 self.last_token_proj_bias_norm.zero_()
+        fixed_pos = self.coord_encoding_2d(
+            self.token_grid[0],
+            self.token_grid[1],
+            output_tokens.shape[-1],
+            device=output_tokens.device,
+            dtype=output_tokens.dtype,
+        )
+        return (
+            output_tokens
+            + self.pos_embed.to(device=output_tokens.device, dtype=output_tokens.dtype)
+            + float(self.fixed_coord_pos_scale) * fixed_pos
+        )
+
+
+class Lidar3DPointRayTokenEncoder(nn.Module):
+    """Encode raw camera-visible 3D LiDAR points, then route them to image rays.
+
+    This is the first low-dependency version of the 3D-to-ray evidence path:
+    raw points are encoded before any image-plane aggregation, and only then
+    pooled into the same camera token grid consumed by RAEA/reference attention.
+    """
+
+    def __init__(
+        self,
+        point_in_channels: int = 10,
+        front_in_channels: int = 5,
+        hidden_channels: int = 128,
+        token_dim: int = 768,
+        token_grid: Tuple[int, int] = (8, 32),
+        image_size: Tuple[int, int] = (128, 512),
+        use_evidence_maps: bool = True,
+        evidence_dilation: int = 4,
+        evidence_free_space_dilation: int = 14,
+        token_output_norm: str = "none",
+        token_structure_target_ratio: float = 0.0,
+        fixed_coord_pos_scale: float = 0.25,
+        use_pointmap_pe: bool = False,
+        point_pretrained_ckpt: str = "",
+        point_feature_dim: int = 0,
+        semantic_feature_dim: int = 0,
+    ):
+        super().__init__()
+        self.point_in_channels = int(point_in_channels)
+        self.point_feature_dim = int(point_feature_dim)
+        self.semantic_feature_dim = int(semantic_feature_dim)
+        self.front_in_channels = int(front_in_channels)
+        self.token_grid = tuple(token_grid)
+        self.image_size = tuple(image_size)
+        self.use_evidence_maps = bool(use_evidence_maps)
+        self.evidence_dilation = int(evidence_dilation)
+        self.evidence_free_space_dilation = int(evidence_free_space_dilation)
+        self.token_output_norm_mode = str(token_output_norm or "none")
+        self.token_structure_target_ratio = float(token_structure_target_ratio)
+        self.fixed_coord_pos_scale = float(fixed_coord_pos_scale)
+        self.use_pointmap_pe = bool(use_pointmap_pe)
+        if self.token_output_norm_mode not in {"none", "layernorm", "center_layernorm"}:
+            raise ValueError(f"Unsupported token_output_norm: {self.token_output_norm_mode}")
+
+        self.point_encoder = nn.Sequential(
+            nn.Linear(self.point_in_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+        )
+        self.point_feature_encoder = (
+            nn.Sequential(
+                nn.LayerNorm(self.point_feature_dim),
+                nn.Linear(self.point_feature_dim, hidden_channels),
+                nn.SiLU(),
+                nn.Linear(hidden_channels, hidden_channels),
+            )
+            if self.point_feature_dim > 0
+            else None
+        )
+        self.evidence_channels = 8 if self.use_evidence_maps else 0
+        token_input_channels = hidden_channels + self.evidence_channels
+        self.token_proj = nn.Sequential(
+            nn.Conv2d(token_input_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, token_dim, kernel_size=1),
+        )
+        self.token_output_norm = (
+            nn.LayerNorm(token_dim) if self.token_output_norm_mode in {"layernorm", "center_layernorm"} else None
+        )
+        self.semantic_head = (
+            nn.Sequential(
+                nn.LayerNorm(token_dim),
+                nn.Linear(token_dim, self.semantic_feature_dim),
+            )
+            if self.semantic_feature_dim > 0
+            else None
+        )
+        token_count = int(self.token_grid[0]) * int(self.token_grid[1])
+        self.pos_embed = nn.Parameter(torch.zeros(1, token_count, token_dim))
+        self.register_buffer("last_valid_sample_ratio", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_hit_coverage", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_empty_coverage", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_pointmap_coverage", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_point_valid_ratio", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_point_feature_valid_ratio", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_point_count_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_ray_token_coverage", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_mean_norm", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_centered_norm", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_centered_to_mean_ratio", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_var_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_proj_bias_norm", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_output_mean_norm", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_output_centered_norm", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_output_centered_to_mean_ratio", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_token_output_var_mean", torch.tensor(0.0), persistent=False)
+        self.last_token_structure_loss = None
+        self.last_semantic_pred_tokens = None
+        if point_pretrained_ckpt:
+            self.load_point_pretrained(point_pretrained_ckpt)
+
+    @staticmethod
+    def coord_encoding_2d(height: int, width: int, dim: int, device, dtype) -> torch.Tensor:
+        return LidarRangeTokenEncoder.coord_encoding_2d(height, width, dim, device, dtype)
+
+    def load_point_pretrained(self, ckpt_path: str) -> None:
+        payload = torch.load(str(ckpt_path), map_location="cpu")
+        state = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+        if isinstance(state, dict) and any(key.startswith("point_encoder.") for key in state):
+            self.load_state_dict(state, strict=False)
+            return
+        if isinstance(state, dict):
+            point_state = {
+                key.replace("module.", "", 1): value
+                for key, value in state.items()
+                if key.replace("module.", "", 1).startswith("point_encoder.")
+            }
+            if point_state:
+                self.load_state_dict(point_state, strict=False)
+
+    def make_evidence_maps(self, lidar_cond: torch.Tensor) -> torch.Tensor:
+        return build_lidar_evidence_maps(
+            lidar_cond,
+            dilation=self.evidence_dilation,
+            free_space_dilation=self.evidence_free_space_dilation,
+        )
+
+    def _point_tokens(
+        self,
+        lidar_points: Optional[torch.Tensor],
+        lidar_points_mask: Optional[torch.Tensor],
+        lidar_point_features: Optional[torch.Tensor],
+        lidar_point_features_mask: Optional[torch.Tensor],
+        device,
+        dtype,
+        batch_size: int,
+    ) -> torch.Tensor:
+        grid_h, grid_w = int(self.token_grid[0]), int(self.token_grid[1])
+        token_count = grid_h * grid_w
+        hidden_channels = self.point_encoder[-1].out_features
+        ray_tokens = torch.zeros((batch_size, token_count, hidden_channels), device=device, dtype=dtype)
+        if lidar_points is None:
+            self.last_valid_sample_ratio.zero_()
+            self.last_point_valid_ratio.zero_()
+            self.last_point_feature_valid_ratio.zero_()
+            self.last_point_count_mean.zero_()
+            self.last_ray_token_coverage.zero_()
+            self.last_pointmap_coverage.zero_()
+            return ray_tokens
+
+        points = lidar_points.to(device=device, dtype=dtype)
+        if points.ndim != 3:
+            raise ValueError(f"lidar_points must be [B, P, C], got {tuple(points.shape)}")
+        if points.shape[0] != batch_size:
+            raise ValueError(
+                f"lidar_points batch size must match lidar_cond: {points.shape[0]} != {batch_size}"
+            )
+        if points.shape[-1] < self.point_in_channels:
+            pad = points.new_zeros((*points.shape[:-1], self.point_in_channels - points.shape[-1]))
+            points = torch.cat([points, pad], dim=-1)
+        points = points[..., : self.point_in_channels]
+        if lidar_points_mask is None:
+            point_mask = torch.ones(points.shape[:2], device=device, dtype=dtype)
+        else:
+            point_mask = lidar_points_mask.to(device=device, dtype=dtype)
+            if point_mask.ndim == 3:
+                point_mask = point_mask.squeeze(-1)
+            if tuple(point_mask.shape) != tuple(points.shape[:2]):
+                raise ValueError(
+                    "lidar_points_mask must match lidar_points [B, P]: "
+                    f"{tuple(point_mask.shape)} != {tuple(points.shape[:2])}"
+                )
+            point_mask = point_mask.clamp(0.0, 1.0)
+
+        encoded = self.point_encoder(points.reshape(-1, self.point_in_channels)).reshape(
+            points.shape[0], points.shape[1], hidden_channels
+        )
+        feature_valid_ratio = encoded.new_zeros(())
+        if self.point_feature_encoder is not None and lidar_point_features is not None:
+            point_features = lidar_point_features.to(device=device, dtype=dtype)
+            if point_features.ndim != 3:
+                raise ValueError(f"lidar_point_features must be [B, P, C], got {tuple(point_features.shape)}")
+            if point_features.shape[0] != points.shape[0]:
+                raise ValueError(
+                    "lidar_point_features batch size must match lidar_points: "
+                    f"{point_features.shape[0]} != {points.shape[0]}"
+                )
+            if point_features.shape[1] != points.shape[1]:
+                if point_features.shape[1] < points.shape[1]:
+                    pad = point_features.new_zeros(
+                        point_features.shape[0],
+                        points.shape[1] - point_features.shape[1],
+                        point_features.shape[2],
+                    )
+                    point_features = torch.cat([point_features, pad], dim=1)
+                else:
+                    point_features = point_features[:, : points.shape[1]]
+            if point_features.shape[-1] < self.point_feature_dim:
+                pad = point_features.new_zeros(
+                    (*point_features.shape[:-1], self.point_feature_dim - point_features.shape[-1])
+                )
+                point_features = torch.cat([point_features, pad], dim=-1)
+            point_features = point_features[..., : self.point_feature_dim]
+            if lidar_point_features_mask is None:
+                feature_mask = point_mask
+            else:
+                feature_mask = lidar_point_features_mask.to(device=device, dtype=dtype)
+                if feature_mask.ndim == 3:
+                    feature_mask = feature_mask.squeeze(-1)
+                if tuple(feature_mask.shape) != tuple(points.shape[:2]):
+                    raise ValueError(
+                        "lidar_point_features_mask must match lidar_points [B, P]: "
+                        f"{tuple(feature_mask.shape)} != {tuple(points.shape[:2])}"
+                    )
+                feature_mask = feature_mask.clamp(0.0, 1.0) * point_mask
+            encoded_features = self.point_feature_encoder(
+                point_features.reshape(-1, self.point_feature_dim)
+            ).reshape(points.shape[0], points.shape[1], hidden_channels) * feature_mask.unsqueeze(-1)
+            if encoded_features.shape != encoded.shape:
+                raise RuntimeError(
+                    "Point and pretrained-feature encodings must have identical shapes: "
+                    f"{tuple(encoded.shape)} != {tuple(encoded_features.shape)}"
+                )
+            # Avoid broadcast-capable AddBackward metadata on this long-running AMP path.
+            encoded = torch.stack((encoded, encoded_features), dim=0).sum(dim=0)
+            feature_valid_ratio = feature_mask.mean()
+        encoded = encoded * point_mask.unsqueeze(-1)
+        uv = points[..., 4:6].clamp(-1.0, 1.0)
+        col = ((uv[..., 0] + 1.0) * 0.5 * float(max(grid_w - 1, 1))).round().long().clamp(0, grid_w - 1)
+        row = ((uv[..., 1] + 1.0) * 0.5 * float(max(grid_h - 1, 1))).round().long().clamp(0, grid_h - 1)
+        token_index = (row * grid_w + col).clamp(0, token_count - 1)
+        index_expanded = token_index.unsqueeze(-1).expand(-1, -1, hidden_channels)
+        ray_tokens.scatter_add_(1, index_expanded, encoded)
+        counts = torch.zeros((points.shape[0], token_count, 1), device=device, dtype=dtype)
+        counts.scatter_add_(1, token_index.unsqueeze(-1), point_mask.unsqueeze(-1))
+        ray_tokens = ray_tokens / counts.clamp_min(1.0)
+        with torch.no_grad():
+            valid_ratio = point_mask.mean()
+            point_count = point_mask.sum(dim=1).mean()
+            ray_coverage = (counts > 0.0).to(dtype).mean()
+            self.last_valid_sample_ratio.copy_(valid_ratio.detach().to(self.last_valid_sample_ratio.device))
+            self.last_point_valid_ratio.copy_(valid_ratio.detach().to(self.last_point_valid_ratio.device))
+            self.last_point_feature_valid_ratio.copy_(
+                feature_valid_ratio.detach().to(self.last_point_feature_valid_ratio.device)
+            )
+            self.last_point_count_mean.copy_(point_count.detach().to(self.last_point_count_mean.device))
+            self.last_ray_token_coverage.copy_(ray_coverage.detach().to(self.last_ray_token_coverage.device))
+            self.last_pointmap_coverage.copy_(ray_coverage.detach().to(self.last_pointmap_coverage.device))
+        return ray_tokens
+
+    def _record_token_stats(self, tokens: torch.Tensor, output_tokens: torch.Tensor) -> None:
+        token_mean = tokens.mean(dim=1, keepdim=True)
+        token_centered = tokens - token_mean
+        mean_norm_per_sample = token_mean.norm(dim=-1).squeeze(1)
+        centered_norm_per_sample = token_centered.norm(dim=-1).mean(dim=1)
+        token_ratio = centered_norm_per_sample / mean_norm_per_sample.clamp_min(1e-8)
+        if self.token_structure_target_ratio > 0.0:
+            target = torch.as_tensor(
+                self.token_structure_target_ratio,
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+            self.last_token_structure_loss = F.relu(target - token_ratio).mean()
+        else:
+            self.last_token_structure_loss = tokens.new_zeros(())
+
+        with torch.no_grad():
+            mean_norm = mean_norm_per_sample.mean()
+            centered_norm = centered_norm_per_sample.mean()
+            self.last_token_mean_norm.copy_(mean_norm.detach().to(self.last_token_mean_norm.device))
+            self.last_token_centered_norm.copy_(
+                centered_norm.detach().to(self.last_token_centered_norm.device)
+            )
+            self.last_token_centered_to_mean_ratio.copy_(
+                token_ratio.mean().detach().to(self.last_token_centered_to_mean_ratio.device)
+            )
+            self.last_token_var_mean.copy_(
+                tokens.float().var(dim=1, unbiased=False).mean().detach().to(self.last_token_var_mean.device)
+            )
+            output_mean = output_tokens.mean(dim=1, keepdim=True)
+            output_centered = output_tokens - output_mean
+            output_mean_norm = output_mean.norm(dim=-1).mean()
+            output_centered_norm = output_centered.norm(dim=-1).mean()
+            self.last_token_output_mean_norm.copy_(
+                output_mean_norm.detach().to(self.last_token_output_mean_norm.device)
+            )
+            self.last_token_output_centered_norm.copy_(
+                output_centered_norm.detach().to(self.last_token_output_centered_norm.device)
+            )
+            self.last_token_output_centered_to_mean_ratio.copy_(
+                (output_centered_norm / output_mean_norm.clamp_min(1e-8))
+                .detach()
+                .to(self.last_token_output_centered_to_mean_ratio.device)
+            )
+            self.last_token_output_var_mean.copy_(
+                output_tokens.float()
+                .var(dim=1, unbiased=False)
+                .mean()
+                .detach()
+                .to(self.last_token_output_var_mean.device)
+            )
+            final_proj = self.token_proj[-1]
+            if getattr(final_proj, "bias", None) is not None:
+                self.last_token_proj_bias_norm.copy_(
+                    final_proj.bias.detach().float().norm().to(self.last_token_proj_bias_norm.device)
+                )
+            else:
+                self.last_token_proj_bias_norm.zero_()
+
+    def forward(
+        self,
+        lidar_cond: torch.Tensor,
+        raw_lidar_cond: Optional[torch.Tensor] = None,
+        range_img: Optional[torch.Tensor] = None,
+        range_mask: Optional[torch.Tensor] = None,
+        camera_k: Optional[torch.Tensor] = None,
+        camera_to_lidar: Optional[torch.Tensor] = None,
+        image_size: Optional[Tuple[int, int]] = None,
+        lidar_points: Optional[torch.Tensor] = None,
+        lidar_points_mask: Optional[torch.Tensor] = None,
+        lidar_point_features: Optional[torch.Tensor] = None,
+        lidar_point_features_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del range_img, range_mask, camera_k, camera_to_lidar, image_size
+        evidence_source = raw_lidar_cond if raw_lidar_cond is not None else lidar_cond
+        batch_size = int(lidar_cond.shape[0])
+        point_tokens = self._point_tokens(
+            lidar_points,
+            lidar_points_mask,
+            lidar_point_features,
+            lidar_point_features_mask,
+            device=lidar_cond.device,
+            dtype=lidar_cond.dtype,
+            batch_size=batch_size,
+        )
+        grid_h, grid_w = int(self.token_grid[0]), int(self.token_grid[1])
+        point_map = point_tokens.transpose(1, 2).reshape(batch_size, -1, grid_h, grid_w)
+        maps = [point_map]
+        if self.use_evidence_maps:
+            evidence = self.make_evidence_maps(evidence_source)
+            pooled_evidence = F.adaptive_avg_pool2d(evidence, self.token_grid).to(dtype=point_map.dtype)
+            maps.append(pooled_evidence)
+            self.last_hit_coverage.copy_(evidence[:, 1:2].mean().detach().to(self.last_hit_coverage.device))
+            self.last_empty_coverage.copy_(evidence[:, 5:6].mean().detach().to(self.last_empty_coverage.device))
+        else:
+            self.last_hit_coverage.zero_()
+            self.last_empty_coverage.zero_()
+
+        tokens = self.token_proj(torch.cat(maps, dim=1)).flatten(2).transpose(1, 2)
+        output_tokens = tokens
+        if self.token_output_norm_mode == "center_layernorm":
+            output_tokens = output_tokens - output_tokens.mean(dim=1, keepdim=True)
+        if self.token_output_norm is not None:
+            output_tokens = self.token_output_norm(output_tokens)
+        self._record_token_stats(tokens, output_tokens)
+        if self.semantic_head is not None:
+            self.last_semantic_pred_tokens = self.semantic_head(output_tokens)
+        else:
+            self.last_semantic_pred_tokens = None
         fixed_pos = self.coord_encoding_2d(
             self.token_grid[0],
             self.token_grid[1],

@@ -25,7 +25,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate fixed KITTI LiDAR-dominant samples from a checkpoint.")
     parser.add_argument("--config", default="results/kitti_xlidar_overfit/lidar_dominant_sdinit_b4_9000step_partial/run_config.yaml")
     parser.add_argument("--ckpt", default="results/kitti_xlidar_overfit/lidar_dominant_sdinit_b4_9000step_partial/checkpoints/last.pt")
-    parser.add_argument("--baseline-cs2s-ckpt", default="result/KITTI.ckpt")
+    parser.add_argument(
+        "--baseline-cs2s-ckpt",
+        default="result/KITTI.ckpt",
+        help=(
+            "CS2S checkpoint loaded into the current experiment architecture for a no-LiDAR reference. "
+            "This is not a pure original-CS2S baseline when the current config adds LiDAR/RAEA modules."
+        ),
+    )
     parser.add_argument("--manifest", default="dataset/kitti_raw_sat_lidar/foreground_test2_hardcases.jsonl")
     parser.add_argument("--out-dir", default="results/kitti_xlidar_overfit/lidar_dominant_sdinit_b4_9000step_partial/sample_vis_last")
     parser.add_argument(
@@ -49,6 +56,15 @@ def parse_args():
     parser.add_argument("--ray-evidence-sat-bias", type=float, default=None)
     parser.add_argument("--ray-evidence-lidar-bias", type=float, default=None)
     parser.add_argument("--ray-evidence-null-bias", type=float, default=None)
+    parser.add_argument("--lidar-point-feature-cache-root", default="")
+    parser.add_argument("--lidar-point-feature-cache-suffix", default="")
+    parser.add_argument("--lidar-point-feature-dim", type=int, default=-1)
+    parser.add_argument("--image-semantic-cache-root", default="")
+    parser.add_argument("--image-semantic-cache-suffix", default="")
+    parser.add_argument("--image-semantic-feature-key", default="")
+    parser.add_argument("--image-semantic-feature-dim", type=int, default=-1)
+    parser.add_argument("--image-semantic-height", type=int, default=-1)
+    parser.add_argument("--image-semantic-width", type=int, default=-1)
     parser.add_argument("--num-samples", type=int, default=6)
     parser.add_argument("--ddim-steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)
@@ -248,6 +264,11 @@ def configure_lidar_condition_mode(cfg, condition_mode, lidar_geom_mode, lidar_f
     params = cfg.model.params.Lidar_context_config.params
     params.front_in_channels = int(lidar_geom_channels(condition_mode, lidar_geom_mode))
     params.use_pointmap_pe = bool(lidar_condition_uses_pointmap(condition_mode))
+    target = str(cfg.model.params.Lidar_context_config.target)
+    uses_raw_points = target.endswith("Lidar3DPointRayTokenEncoder")
+    cfg.data.params.test.params.include_raw_lidar_points = bool(condition_mode != "none" and uses_raw_points)
+    if uses_raw_points and "raw_lidar_point_count" not in cfg.data.params.test.params:
+        cfg.data.params.test.params.raw_lidar_point_count = 8192
     return cfg
 
 
@@ -267,6 +288,9 @@ def lidar_attention_stats(model):
     route_query_y_corr = []
     evidence_sat = []
     evidence_lidar = []
+    evidence_lidar_std = []
+    evidence_lidar_min = []
+    evidence_lidar_max = []
     evidence_null = []
     evidence_entropy = []
     denoise_model = getattr(getattr(model, "DDPM", None), "denoise_model", None)
@@ -330,6 +354,15 @@ def lidar_attention_stats(model):
                 if torch.is_tensor(value):
                     value = float(value.detach().float().cpu())
                 values.append(float(value))
+            for values, attr in [
+                (evidence_lidar_std, "last_evidence_lidar_weight_std"),
+                (evidence_lidar_min, "last_evidence_lidar_weight_min"),
+                (evidence_lidar_max, "last_evidence_lidar_weight_max"),
+            ]:
+                value = getattr(module, attr, 0.0)
+                if torch.is_tensor(value):
+                    value = float(value.detach().float().cpu())
+                values.append(float(value))
     if not entropy:
         return {
             "lidar_attn_modules": 0,
@@ -343,6 +376,9 @@ def lidar_attention_stats(model):
             "ray_evidence_modules": int(len(evidence_sat)),
             "ray_evidence_sat_weight_mean": sum(evidence_sat) / float(len(evidence_sat)) if evidence_sat else 0.0,
             "ray_evidence_lidar_weight_mean": sum(evidence_lidar) / float(len(evidence_lidar)) if evidence_lidar else 0.0,
+            "ray_evidence_lidar_weight_std_mean": sum(evidence_lidar_std) / float(len(evidence_lidar_std)) if evidence_lidar_std else 0.0,
+            "ray_evidence_lidar_weight_min_mean": sum(evidence_lidar_min) / float(len(evidence_lidar_min)) if evidence_lidar_min else 0.0,
+            "ray_evidence_lidar_weight_max_mean": sum(evidence_lidar_max) / float(len(evidence_lidar_max)) if evidence_lidar_max else 0.0,
             "ray_evidence_null_weight_mean": sum(evidence_null) / float(len(evidence_null)) if evidence_null else 0.0,
             "ray_evidence_entropy_norm_mean": sum(evidence_entropy) / float(len(evidence_entropy)) if evidence_entropy else 0.0,
         }
@@ -365,6 +401,9 @@ def lidar_attention_stats(model):
         "ray_evidence_modules": int(len(evidence_sat)),
         "ray_evidence_sat_weight_mean": sum(evidence_sat) / float(len(evidence_sat)) if evidence_sat else 0.0,
         "ray_evidence_lidar_weight_mean": sum(evidence_lidar) / float(len(evidence_lidar)) if evidence_lidar else 0.0,
+        "ray_evidence_lidar_weight_std_mean": sum(evidence_lidar_std) / float(len(evidence_lidar_std)) if evidence_lidar_std else 0.0,
+        "ray_evidence_lidar_weight_min_mean": sum(evidence_lidar_min) / float(len(evidence_lidar_min)) if evidence_lidar_min else 0.0,
+        "ray_evidence_lidar_weight_max_mean": sum(evidence_lidar_max) / float(len(evidence_lidar_max)) if evidence_lidar_max else 0.0,
         "ray_evidence_null_weight_mean": sum(evidence_null) / float(len(evidence_null)) if evidence_null else 0.0,
         "ray_evidence_entropy_norm_mean": sum(evidence_entropy) / float(len(evidence_entropy)) if evidence_entropy else 0.0,
     }
@@ -538,6 +577,12 @@ def generate_prediction(
     lidar_cond = model.get_input(batch, model.lidar_condition_key).cuda()
     range_img = model.get_input(batch, "range_img").cuda() if "range_img" in batch else None
     range_mask = model.get_input(batch, "range_mask").cuda() if "range_mask" in batch else None
+    lidar_points = batch["lidar_points"].cuda().float() if "lidar_points" in batch else None
+    lidar_points_mask = batch["lidar_points_mask"].cuda().float() if "lidar_points_mask" in batch else None
+    lidar_point_features = batch["lidar_point_features"].cuda().float() if "lidar_point_features" in batch else None
+    lidar_point_features_mask = (
+        batch["lidar_point_features_mask"].cuda().float() if "lidar_point_features_mask" in batch else None
+    )
     camera_to_lidar = model.get_input(batch, "camera_to_lidar").squeeze(-1).cuda()
     left_camera_k = model.get_input(batch, "left_camera_k").squeeze(-1).cuda()
     gt_shift_x = batch["gt_shift_x"].cuda()
@@ -547,6 +592,10 @@ def generate_prediction(
     lidar_cond = apply_probe_tensor(lidar_cond, probe)
     range_img = apply_probe_tensor(range_img, probe)
     range_mask = apply_probe_tensor(range_mask, probe)
+    lidar_points = apply_probe_tensor(lidar_points, probe)
+    lidar_points_mask = apply_probe_tensor(lidar_points_mask, probe)
+    lidar_point_features = apply_probe_tensor(lidar_point_features, probe)
+    lidar_point_features_mask = apply_probe_tensor(lidar_point_features_mask, probe)
 
     inputs = inputs * 2 - 1
     outputs = outputs * 2 - 1
@@ -560,6 +609,10 @@ def generate_prediction(
             range_mask=range_mask,
             camera_to_lidar=camera_to_lidar,
             left_camera_k=left_camera_k,
+            lidar_points=lidar_points,
+            lidar_points_mask=lidar_points_mask,
+            lidar_point_features=lidar_point_features,
+            lidar_point_features_mask=lidar_point_features_mask,
         )
         lidar_evidence = model.make_lidar_evidence(lidar_cond) if hasattr(model, "make_lidar_evidence") else None
     lidar_geometry_mask = make_lidar_geometry_mask_for_sampling(model, lidar_evidence, batch=batch)
@@ -606,6 +659,10 @@ def main():
     lidar_fusion_mode = resolve_lidar_fusion_mode(cfg, args)
     configure_lidar_condition_mode(cfg, condition_mode, lidar_geom_mode, lidar_fusion_mode, args=args)
     cfg.data.params.test.params.manifest = args.manifest
+    test_params = cfg.data.params.test.params
+
+    def cfg_value(name, default):
+        return getattr(test_params, name, default)
 
     dataset = SatLidarRawDataset(
         manifest=args.manifest,
@@ -616,6 +673,33 @@ def main():
         max_depth=80.0,
         align_satellite_to_camera=True,
         include_range_image=True,
+        include_raw_lidar_points=bool(getattr(test_params, "include_raw_lidar_points", False)),
+        raw_lidar_point_count=int(cfg_value("raw_lidar_point_count", 8192)),
+        lidar_point_feature_cache_root=args.lidar_point_feature_cache_root
+        or str(cfg_value("lidar_point_feature_cache_root", "")),
+        lidar_point_feature_cache_suffix=args.lidar_point_feature_cache_suffix
+        or str(cfg_value("lidar_point_feature_cache_suffix", ".npz")),
+        lidar_point_feature_dim=int(
+            args.lidar_point_feature_dim
+            if args.lidar_point_feature_dim >= 0
+            else cfg_value("lidar_point_feature_dim", 0)
+        ),
+        image_semantic_cache_root=args.image_semantic_cache_root or str(cfg_value("image_semantic_cache_root", "")),
+        image_semantic_cache_suffix=args.image_semantic_cache_suffix
+        or str(cfg_value("image_semantic_cache_suffix", ".npz")),
+        image_semantic_feature_key=args.image_semantic_feature_key
+        or str(cfg_value("image_semantic_feature_key", "image_semantic_feat")),
+        image_semantic_feature_dim=int(
+            args.image_semantic_feature_dim
+            if args.image_semantic_feature_dim >= 0
+            else cfg_value("image_semantic_feature_dim", 0)
+        ),
+        image_semantic_height=int(
+            args.image_semantic_height if args.image_semantic_height >= 0 else cfg_value("image_semantic_height", 8)
+        ),
+        image_semantic_width=int(
+            args.image_semantic_width if args.image_semantic_width >= 0 else cfg_value("image_semantic_width", 32)
+        ),
     )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -666,10 +750,10 @@ def main():
                 use_lidar=False,
                 key_stats_max_tokens=args.key_stats_max_tokens,
             )
-            pred_path = out_dir / "images" / "KITTI_ckpt" / f"{safe_id}.png"
+            pred_path = out_dir / "images" / "cs2s_init_current_arch_no_lidar" / f"{safe_id}.png"
             save_tensor_image(pred[0], pred_path)
-            image_paths_by_id[sample_id]["KITTI.ckpt"] = pred_path
-            attention_stats_by_id[sample_id]["KITTI.ckpt"] = {
+            image_paths_by_id[sample_id]["CS2S-init current-arch no-LiDAR"] = pred_path
+            attention_stats_by_id[sample_id]["CS2S-init current-arch no-LiDAR"] = {
                 "attention": attention_stats,
                 "key_structure": key_structure_stats,
             }

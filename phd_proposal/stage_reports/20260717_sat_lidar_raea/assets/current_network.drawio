@@ -1,0 +1,137 @@
+<mxfile host="app.diagrams.net" modified="2026-07-17T00:00:00.000Z" agent="Codex" version="24.7.17">
+  <diagram id="raea-network" name="Current Network">
+    <mxGraphModel dx="1800" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Current Satellite-LiDAR Street-View Diffusion Network" style="text;html=1;align=left;verticalAlign=middle;fontSize=28;fontStyle=1;fontColor=#17212B;spacing=0;" vertex="1" parent="1">
+          <mxGeometry x="50" y="24" width="1080" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="RAEA: heterogeneous evidence is organized per target camera ray, not as sequential modality residuals" style="text;html=1;align=left;verticalAlign=middle;fontSize=14;fontColor=#52606D;spacing=0;" vertex="1" parent="1">
+          <mxGeometry x="52" y="62" width="1120" height="26" as="geometry" />
+        </mxCell>
+
+        <mxCell id="input_band" value="INPUTS &amp; OFFLINE TEACHERS" style="swimlane;html=1;startSize=30;horizontal=1;rounded=0;fillColor=#F7F9FB;strokeColor=#B7C0CA;fontColor=#4A5561;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="45" y="110" width="310" height="535" as="geometry" />
+        </mxCell>
+        <mxCell id="sat_input" value="Satellite image&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;pose + KITTI calibration&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E5F4ED;strokeColor=#2D7F5E;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="170" width="235" height="72" as="geometry" />
+        </mxCell>
+        <mxCell id="lidar_input" value="Raw Velodyne points&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;camera-visible XYZ + UV/ray/range cues&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FDEBDD;strokeColor=#C6682F;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="300" width="235" height="82" as="geometry" />
+        </mxCell>
+        <mxCell id="utonia_input" value="Offline Utonia feature&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;4096 points × 576-D, fp16 memmap&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF3D8;strokeColor=#C58B1B;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="405" width="235" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="gt_input" value="Ground-truth street RGB&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;VAE latent + offline DINO feature&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E9E7F8;strokeColor=#6253A5;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="525" width="235" height="82" as="geometry" />
+        </mxCell>
+
+        <mxCell id="encoding_band" value="REFERENCE ENCODING" style="swimlane;html=1;startSize=30;horizontal=1;rounded=0;fillColor=#F7F9FB;strokeColor=#B7C0CA;fontColor=#4A5561;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="390" y="110" width="520" height="535" as="geometry" />
+        </mxCell>
+        <mxCell id="sat_encoder" value="CS2S satellite encoder&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;multi-scale satellite context&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E5F4ED;strokeColor=#2D7F5E;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="430" y="165" width="205" height="82" as="geometry" />
+        </mxCell>
+        <mxCell id="sat_pose" value="Pose-aligned satellite attention&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;query → calibrated satellite footprint&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#D7EEE4;strokeColor=#2D7F5E;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="675" y="165" width="200" height="82" as="geometry" />
+        </mxCell>
+        <mxCell id="point_fusion" value="3D point feature fusion&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;raw point MLP + Utonia projection&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FDEBDD;strokeColor=#C6682F;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="430" y="300" width="205" height="92" as="geometry" />
+        </mxCell>
+        <mxCell id="ray_pool" value="Camera-ray routing&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;scatter/average to 8×32 ray grid&lt;br&gt;+ hit/depth/free-space evidence maps&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F9E2D3;strokeColor=#C6682F;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="675" y="292" width="200" height="108" as="geometry" />
+        </mxCell>
+        <mxCell id="lidar_token" value="Ray-depth LiDAR tokens&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;center + LayerNorm + coordinate PE&lt;br&gt;768-D camera-view geometry/semantics&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F7D3C1;strokeColor=#B9562E;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="545" y="435" width="215" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="dino_head" value="Semantic projection head&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;768-D ray token → 384-D DINO space&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#EEEAF9;strokeColor=#6253A5;strokeWidth=2;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="430" y="565" width="205" height="62" as="geometry" />
+        </mxCell>
+        <mxCell id="vae_noise" value="VAE encode + diffusion noise&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;x₀ → xₜ, timestep t&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E9E7F8;strokeColor=#6253A5;strokeWidth=2;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="670" y="565" width="205" height="62" as="geometry" />
+        </mxCell>
+
+        <mxCell id="denoise_band" value="FULL SD1.4 / CS2S DENOISER (TRAINED)" style="swimlane;html=1;startSize=30;horizontal=1;rounded=0;fillColor=#F7F9FB;strokeColor=#B7C0CA;fontColor=#4A5561;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="945" y="110" width="800" height="535" as="geometry" />
+        </mxCell>
+        <mxCell id="xt" value="Street latent xₜ(u,v)&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;timestep-conditioned upstream feature&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E8EDF2;strokeColor=#4A6072;strokeWidth=2;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="975" y="300" width="155" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="self_attn" value="Self-attention&lt;br&gt;x_base" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E8EDF2;strokeColor=#4A6072;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="300" width="150" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="sat_ref" value="Pose-aligned Sat Cross-Attn&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;x_base queries satellite context → Δsat&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#D7EEE4;strokeColor=#2D7F5E;strokeWidth=2;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="165" width="210" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="lidar_ref" value="Local LiDAR Cross-Attn&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;x_base queries local 3×3 ray tokens → Δlidar&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F7D3C1;strokeColor=#B9562E;strokeWidth=2;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="445" width="210" height="72" as="geometry" />
+        </mxCell>
+        <mxCell id="null_ref" value="Learned null / prior evidence" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ECEFF2;strokeColor=#7B8794;strokeWidth=2;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1400" y="455" width="145" height="58" as="geometry" />
+        </mxCell>
+        <mxCell id="raea" value="RAEA&lt;br&gt;&lt;font style=&quot;font-size:13px&quot;&gt;Ray-Aligned Evidence Attention&lt;/font&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;E(u,v) = {sat, LiDAR, null}&lt;br&gt;query-adaptive selection per camera ray&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF0C7;strokeColor=#A57414;strokeWidth=3;fontSize=18;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1395" y="265" width="185" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="ffn" value="Residual update + FFN&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;repeated across UNet transformer blocks&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E8EDF2;strokeColor=#4A6072;strokeWidth=2;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1600" y="300" width="125" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="rgb_out" value="Predicted noise ε̂&lt;br&gt;→ DDIM 50-step street RGB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DBE9F6;strokeColor=#2D6293;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1575" y="535" width="150" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="removed" value="Removed from current path:&lt;br&gt;decoder 3/6 geometry feedback · LiDAR ControlNet residual · scalar lidar_gate" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF5F5;strokeColor=#C74B50;dashed=1;strokeWidth=2;fontSize=12;fontColor=#8C3135;" vertex="1" parent="1">
+          <mxGeometry x="975" y="555" width="500" height="54" as="geometry" />
+        </mxCell>
+
+        <mxCell id="loss_band" value="ACTIVE TRAINING OBJECTIVES" style="swimlane;html=1;startSize=34;horizontal=1;rounded=0;fillColor=#F8F7FC;strokeColor=#9E94C7;fontColor=#554B86;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="45" y="690" width="1700" height="245" as="geometry" />
+        </mxCell>
+        <mxCell id="loss_eps" value="Diffusion denoising&lt;br&gt;&lt;b&gt;Lε&lt;/b&gt;: full-image epsilon MSE" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E8EDF2;strokeColor=#4A6072;strokeWidth=2;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="85" y="755" width="255" height="82" as="geometry" />
+        </mxCell>
+        <mxCell id="loss_hit" value="LiDAR-supported reconstruction&lt;br&gt;&lt;b&gt;Lhit&lt;/b&gt;: ε + latent x₀ + decoded RGB L1&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;only at projected LiDAR support&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FDEBDD;strokeColor=#C6682F;strokeWidth=2;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="385" y="745" width="300" height="102" as="geometry" />
+        </mxCell>
+        <mxCell id="loss_depth" value="Metric geometry&lt;br&gt;&lt;b&gt;Ldepth&lt;/b&gt;: sparse log-depth&lt;br&gt;UNet feature + bottleneck head" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E6E0F7;strokeColor=#6253A5;strokeWidth=2;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="730" y="745" width="255" height="102" as="geometry" />
+        </mxCell>
+        <mxCell id="loss_dino" value="Cross-modal semantics&lt;br&gt;&lt;b&gt;LDINO&lt;/b&gt;: cosine alignment&lt;br&gt;LiDAR ray token ↔ GT DINO feature" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DDEFF4;strokeColor=#168AAD;strokeWidth=2;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1030" y="745" width="285" height="102" as="geometry" />
+        </mxCell>
+        <mxCell id="loss_structure" value="Token health regularizer&lt;br&gt;&lt;b&gt;Lstruct&lt;/b&gt;: preserve centered/mean ratio&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;prevents common-direction collapse&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F1E9F7;strokeColor=#8C5BA6;strokeWidth=2;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="745" width="300" height="102" as="geometry" />
+        </mxCell>
+        <mxCell id="inactive_note" value="Current Stage 1: SAM2 foreground RGB = 0 · counterfactual zero loss = 0 · static teacher consistency = 0" style="text;html=1;align=center;verticalAlign=middle;fontSize=12;fontColor=#6B7280;" vertex="1" parent="1">
+          <mxGeometry x="340" y="872" width="1100" height="28" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_sat1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2D7F5E;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="sat_input" target="sat_encoder"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_sat2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2D7F5E;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="sat_encoder" target="sat_pose"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_sat3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2D7F5E;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="sat_pose" target="sat_ref"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_lidar1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C6682F;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lidar_input" target="point_fusion"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_utonia" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C58B1B;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="utonia_input" target="point_fusion"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_lidar2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C6682F;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="point_fusion" target="ray_pool"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_lidar3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C6682F;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="ray_pool" target="lidar_token"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_lidar4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B9562E;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lidar_token" target="lidar_ref"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_sem_head" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#6253A5;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lidar_token" target="dino_head"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_gt" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#6253A5;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="gt_input" target="vae_noise"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_xt" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4A6072;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="vae_noise" target="xt"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_self" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4A6072;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="xt" target="self_attn"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_q_sat" value="query" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4A6072;strokeWidth=1.5;dashed=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="self_attn" target="sat_ref"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_q_lidar" value="query" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4A6072;strokeWidth=1.5;dashed=1;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="self_attn" target="lidar_ref"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_q_raea" value="query + ray PE" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4A6072;strokeWidth=2;endArrow=block;endFill=1;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="self_attn" target="raea"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_sat_raea" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2D7F5E;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="sat_ref" target="raea"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_lidar_raea" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B9562E;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lidar_ref" target="raea"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_null_raea" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7B8794;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="null_ref" target="raea"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_raea_ffn" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#A57414;strokeWidth=2.5;endArrow=block;endFill=1;" edge="1" parent="1" source="raea" target="ffn"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_ffn_out" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2D6293;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="ffn" target="rgb_out"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_loss_eps" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4A6072;strokeWidth=1.5;dashed=1;endArrow=open;endFill=0;" edge="1" parent="1" source="rgb_out" target="loss_eps"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_loss_hit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C6682F;strokeWidth=1.5;dashed=1;endArrow=open;endFill=0;" edge="1" parent="1" source="rgb_out" target="loss_hit"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_loss_depth" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#6253A5;strokeWidth=1.5;dashed=1;endArrow=open;endFill=0;" edge="1" parent="1" source="lidar_ref" target="loss_depth"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_loss_dino" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#168AAD;strokeWidth=1.5;dashed=1;endArrow=open;endFill=0;" edge="1" parent="1" source="dino_head" target="loss_dino"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_loss_struct" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8C5BA6;strokeWidth=1.5;dashed=1;endArrow=open;endFill=0;" edge="1" parent="1" source="lidar_token" target="loss_structure"><mxGeometry relative="1" as="geometry" /></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

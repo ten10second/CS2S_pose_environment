@@ -409,6 +409,105 @@ def build_kitti_range_image(
     return _points_to_range_image(load_velodyne_points(velodyne_path), spec)
 
 
+def build_raw_lidar_point_samples(
+    velodyne_path: str,
+    calib: Dict[str, np.ndarray],
+    output_size: Tuple[int, int] = (128, 512),
+    max_depth: float = 80.0,
+    max_points: int = 8192,
+) -> Dict[str, np.ndarray]:
+    """Return fixed-size camera-visible raw 3D LiDAR samples.
+
+    The point features keep metric camera-frame geometry before the model
+    routes points back to target camera rays:
+
+    [X_cam, Y_cam, Z_cam, intensity, u_norm, v_norm, depth_norm,
+     log_depth_norm, inv_depth_norm, range_norm].
+    """
+    max_points = max(1, int(max_points))
+    out_h, out_w = output_size
+    features = np.zeros((max_points, 10), dtype=np.float32)
+    mask = np.zeros((max_points,), dtype=np.float32)
+
+    points = load_velodyne_points(velodyne_path)
+    if points.size == 0:
+        return {
+            "lidar_points": features,
+            "lidar_points_mask": mask,
+            "num_raw_lidar_points": np.asarray(0, dtype=np.int64),
+            "num_raw_lidar_projected_points": np.asarray(0, dtype=np.int64),
+        }
+
+    points_xyz = points[:, :3].astype(np.float32)
+    uv, depth, valid = project_velo_to_image(points_xyz, calib, output_size)
+    camera_xyz = velo_to_camera2(points_xyz, calib)
+    ranges = np.linalg.norm(points_xyz, axis=1).astype(np.float32)
+    valid = (
+        valid
+        & np.isfinite(depth)
+        & np.isfinite(camera_xyz).all(axis=1)
+        & (depth > 0.0)
+        & (depth <= float(max_depth))
+        & np.isfinite(ranges)
+        & (ranges > 0.0)
+    )
+    valid_indices = np.nonzero(valid)[0]
+    projected_count = int(valid_indices.size)
+    if projected_count == 0:
+        return {
+            "lidar_points": features,
+            "lidar_points_mask": mask,
+            "num_raw_lidar_points": np.asarray(int(points.shape[0]), dtype=np.int64),
+            "num_raw_lidar_projected_points": np.asarray(0, dtype=np.int64),
+        }
+
+    if projected_count > max_points:
+        # Preserve broad ray coverage deterministically instead of taking an
+        # arbitrary prefix from the Velodyne scan order.
+        flat_uv = uv[valid_indices, 1] * float(out_w) + uv[valid_indices, 0]
+        order = np.argsort(flat_uv, kind="mergesort")
+        take = np.linspace(0, projected_count - 1, max_points).round().astype(np.int64)
+        selected = valid_indices[order[take]]
+    else:
+        selected = valid_indices
+
+    n = int(selected.size)
+    selected_xyz = camera_xyz[selected]
+    selected_uv = uv[selected]
+    selected_depth = np.clip(depth[selected], 0.0, float(max_depth))
+    selected_range = np.clip(ranges[selected], 0.0, float(max_depth))
+    intensity = np.clip(points[selected, 3].astype(np.float32), 0.0, 1.0)
+
+    depth_norm = (selected_depth / float(max_depth)).astype(np.float32)
+    log_depth = (
+        np.log1p(selected_depth.astype(np.float32))
+        / np.log1p(np.asarray(float(max_depth), dtype=np.float32))
+    ).astype(np.float32)
+    inv_depth = (1.0 - depth_norm).astype(np.float32)
+    range_norm = (selected_range / float(max_depth)).astype(np.float32)
+    u_norm = (selected_uv[:, 0] / max(float(out_w - 1), 1.0) * 2.0 - 1.0).astype(np.float32)
+    v_norm = (selected_uv[:, 1] / max(float(out_h - 1), 1.0) * 2.0 - 1.0).astype(np.float32)
+
+    features[:n, 0] = np.clip(selected_xyz[:, 0] / float(max_depth), -1.0, 1.0)
+    features[:n, 1] = np.clip(selected_xyz[:, 1] / float(max_depth), -1.0, 1.0)
+    features[:n, 2] = np.clip(selected_xyz[:, 2] / float(max_depth), 0.0, 1.0)
+    features[:n, 3] = intensity
+    features[:n, 4] = np.clip(u_norm, -1.0, 1.0)
+    features[:n, 5] = np.clip(v_norm, -1.0, 1.0)
+    features[:n, 6] = np.clip(depth_norm, 0.0, 1.0)
+    features[:n, 7] = np.clip(log_depth, 0.0, 1.0)
+    features[:n, 8] = np.clip(inv_depth, 0.0, 1.0)
+    features[:n, 9] = np.clip(range_norm, 0.0, 1.0)
+    mask[:n] = 1.0
+
+    return {
+        "lidar_points": features,
+        "lidar_points_mask": mask,
+        "num_raw_lidar_points": np.asarray(int(points.shape[0]), dtype=np.int64),
+        "num_raw_lidar_projected_points": np.asarray(projected_count, dtype=np.int64),
+    }
+
+
 def velo_to_rect(points_xyz: np.ndarray, calib: Dict[str, np.ndarray]) -> np.ndarray:
     if points_xyz.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
