@@ -21,9 +21,6 @@ from dataloader.kitti_raw_lidar_utils import (  # noqa: E402
     generate_lidar_condition,
     load_raw_calibration,
     load_velodyne_points,
-    parse_tracklet_xml,
-    points_in_boxes,
-    project_dynamic_boxes,
     project_velo_to_image,
     read_jsonl,
 )
@@ -120,9 +117,7 @@ def record_from_drive(args):
         "satellite_path": str(drive_dir / "satellite" / f"{frame_id}.png"),
         "velodyne_path": str(drive_dir / "velodyne_points" / "data" / f"{frame_id}.bin"),
         "oxts_path": str(drive_dir / "oxts" / "data" / f"{frame_id}.txt"),
-        "tracklet_xml_path": str(drive_dir / "tracklet_labels.xml") if (drive_dir / "tracklet_labels.xml").exists() else "",
         "calib_dir": str(calib_dir),
-        "num_dynamic_boxes": 0,
     }
 
 
@@ -200,7 +195,7 @@ def draw_aligned_satellite(record, calib):
     return aligned
 
 
-def draw_lidar_overlay(record, boxes, calib, output_size, max_draw_points):
+def draw_lidar_overlay(record, calib, output_size, max_draw_points):
     base = Image.open(record["image_02_path"]).convert("RGB").resize((output_size[1], output_size[0]), Image.BILINEAR)
     draw = ImageDraw.Draw(base)
     points = load_velodyne_points(record["velodyne_path"])
@@ -216,35 +211,17 @@ def draw_lidar_overlay(record, boxes, calib, output_size, max_draw_points):
         color = (int(255 * (1.0 - d)), int(80 + 175 * d), 255)
         draw.point((x, y), fill=color)
 
-    inside, _ = points_in_boxes(points_xyz, boxes)
-    dyn_uv, dyn_depth, dyn_valid = project_velo_to_image(points_xyz[inside], calib, output_size)
-    for idx in np.nonzero(dyn_valid)[0]:
-        x = int(round(float(dyn_uv[idx, 0])))
-        y = int(round(float(dyn_uv[idx, 1])))
-        draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=(40, 255, 80))
-
-    dynamic_boxes, dynamic_box_valid = project_dynamic_boxes(boxes, calib, output_size)
-    for box, flag in zip(dynamic_boxes, dynamic_box_valid):
-        if float(flag) <= 0.5:
-            continue
-        x0, y0, x1, y1, class_id = [float(value) for value in box]
-        draw.rectangle((x0, y0, x1, y1), outline=(255, 40, 40), width=2)
-        draw.text((x0 + 2, y0 + 2), str(int(class_id)), fill=(255, 40, 40))
     draw.text((8, 8), "RGB + LiDAR projection", fill=(255, 255, 255))
-    draw.text((8, 26), "blue/red=all LiDAR depth, green=dynamic points, red=tracklet box", fill=(255, 255, 255))
+    draw.text((8, 26), "color encodes projected LiDAR depth", fill=(255, 255, 255))
     return base.resize((512, 128), Image.BILINEAR)
 
 
 def condition_rgb(lidar_cond):
     cond = lidar_cond["lidar_cond"]
-    if cond.shape[0] >= 8:
-        rgb = np.stack([cond[0], cond[4], cond[7]], axis=-1)
-    else:
-        rgb = np.zeros((*cond.shape[-2:], 3), dtype=np.float32)
-        rgb[..., : min(3, cond.shape[0])] = cond[:3].transpose(1, 2, 0)
+    rgb = np.stack([cond[2], cond[1], cond[6]], axis=-1)
     image = Image.fromarray(np.uint8(np.clip(rgb, 0, 1) * 255)).resize((512, 128), Image.NEAREST)
     draw = ImageDraw.Draw(image)
-    draw.text((8, 8), "dynamic geometry RGB: confidence / near-depth / seed", fill=(255, 255, 255))
+    draw.text((8, 8), "current pointmap: depth / hit / camera-Z", fill=(255, 255, 255))
     return image
 
 
@@ -304,20 +281,18 @@ def satellite_neighbor_shift(record):
 
 def check_record(record, args, out_dir):
     calib = load_raw_calibration(record["calib_dir"])
-    boxes_by_frame = parse_tracklet_xml(record.get("tracklet_xml_path", ""))
-    boxes = boxes_by_frame.get(int(record["frame_index"]), [])
     oxts = read_oxts(record["oxts_path"])
     lidar = generate_lidar_condition(
         record["velodyne_path"],
-        boxes,
+        [],
         calib,
         output_size=(args.image_height, args.image_width),
-        mode="dynamic_points",
+        mode="raw_lidar_pointmap",
     )
 
     raw_sat = draw_raw_satellite(record, oxts, calib)
     aligned_sat = draw_aligned_satellite(record, calib)
-    lidar_overlay = draw_lidar_overlay(record, boxes, calib, (args.image_height, args.image_width), args.max_draw_points)
+    lidar_overlay = draw_lidar_overlay(record, calib, (args.image_height, args.image_width), args.max_draw_points)
     cond_img = condition_rgb(lidar)
     panel = make_panel(raw_sat, aligned_sat, lidar_overlay, cond_img)
 
@@ -330,8 +305,6 @@ def check_record(record, args, out_dir):
     points_xyz = points[:, :3] if points.size else np.zeros((0, 3), dtype=np.float32)
     _, _, valid = project_velo_to_image(points_xyz, calib, (args.image_height, args.image_width))
     lidar_cond = lidar["lidar_cond"]
-    point_channel = 7 if lidar_cond.shape[0] >= 8 else 1
-    confidence_channel = 0 if lidar_cond.shape[0] > 0 else point_channel
     summary = {
         "sample_id": record["sample_id"],
         "panel_path": str(panel_path),
@@ -343,7 +316,6 @@ def check_record(record, args, out_dir):
         "image_02_path": record["image_02_path"],
         "velodyne_path": record["velodyne_path"],
         "oxts_path": record["oxts_path"],
-        "tracklet_xml_path": record.get("tracklet_xml_path", ""),
         "meter_per_pixel_process_sat": float(kitti_utils.get_meter_per_pixel()),
         "calib_resolved_dir": str(calib.get("calib_dir", record["calib_dir"])),
         "transform_direction_imu_to_velo": "calib_imu_to_velo.txt: IMU -> Velodyne",
@@ -355,10 +327,8 @@ def check_record(record, args, out_dir):
         ),
         "camera_02_in_imu_forward_right_m": list(camera_forward_right(calib)),
         "projected_lidar_points": int(valid.sum()),
-        "num_dynamic_boxes": len(boxes),
-        "num_projected_dynamic_points": int(lidar["num_projected_dynamic_points"]),
-        "dynamic_seed_pixels": int(lidar_cond[point_channel].sum()) if point_channel < lidar_cond.shape[0] else 0,
-        "dynamic_confidence_pixels": int((lidar_cond[confidence_channel] > 0.0).sum()),
+        "pointmap_hit_pixels": int((lidar_cond[1] > 0.0).sum()),
+        "pointmap_xyz_pixels": int((np.abs(lidar_cond[4:7]).sum(axis=0) > 0.0).sum()),
         "timestamp": timestamp_report(record),
         "satellite_neighbor_shift": satellite_neighbor_shift(record),
     }

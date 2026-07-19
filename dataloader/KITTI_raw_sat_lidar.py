@@ -105,9 +105,14 @@ class SatLidarRawDataset(Dataset):
         image_semantic_height: int = 8,
         image_semantic_width: int = 32,
         include_tracklets: bool = True,
+        kitti_root: str = "",
     ):
         self.manifest = manifest
         self.records = read_jsonl(manifest)
+        self.kitti_root = Path(kitti_root) if kitti_root else None
+        self._rebased_calib_dirs = {}
+        if self.kitti_root is not None:
+            self.records = [self._rebase_record_paths(record) for record in self.records]
         self.condition_mode = condition_mode
         self.image_size: Tuple[int, int] = (image_height, image_width)
         self.sat_size = sat_size
@@ -164,6 +169,49 @@ class SatLidarRawDataset(Dataset):
 
         self._calib_cache: Dict[str, dict] = {}
         self._tracklet_cache: Dict[str, dict] = {}
+
+    def _rebase_record_paths(self, record):
+        record = dict(record)
+        date = str(record["date"])
+        drive = str(record["drive"])
+        frame_id = str(record["frame_id"])
+        date_root = self.kitti_root / date
+        drive_root = date_root / drive
+        calib_root = self._resolve_rebased_calib_dir(date_root, date)
+        record.update(
+            {
+                "calib_dir": str(calib_root),
+                "calib_cam_to_cam_path": str(calib_root / "calib_cam_to_cam.txt"),
+                "calib_velo_to_cam_path": str(calib_root / "calib_velo_to_cam.txt"),
+                "image_02_path": str(drive_root / "image_02" / "data" / f"{frame_id}.png"),
+                "oxts_path": str(drive_root / "oxts" / "data" / f"{frame_id}.txt"),
+                "satellite_path": str(drive_root / "satellite" / f"{frame_id}.png"),
+                "velodyne_path": str(
+                    drive_root / "velodyne_points" / "data" / f"{frame_id}.bin"
+                ),
+            }
+        )
+        if record.get("tracklet_xml_path"):
+            record["tracklet_xml_path"] = str(drive_root / "tracklet_labels.xml")
+        return record
+
+    def _resolve_rebased_calib_dir(self, date_root: Path, date: str) -> Path:
+        cached = self._rebased_calib_dirs.get(date)
+        if cached is not None:
+            return cached
+        calib_root = date_root / f"{date}_calib"
+        candidates = (calib_root, calib_root / date)
+        for candidate in candidates:
+            if (candidate / "calib_cam_to_cam.txt").is_file() and (
+                candidate / "calib_velo_to_cam.txt"
+            ).is_file():
+                self._rebased_calib_dirs[date] = candidate
+                return candidate
+        for cam_path in calib_root.rglob("calib_cam_to_cam.txt"):
+            if (cam_path.parent / "calib_velo_to_cam.txt").is_file():
+                self._rebased_calib_dirs[date] = cam_path.parent
+                return cam_path.parent
+        raise FileNotFoundError(f"Missing KITTI calibration files under: {calib_root}")
 
     def _foreground_mask_path(self, sample_id: str) -> Path:
         safe_id = sample_id.replace("/", "__")

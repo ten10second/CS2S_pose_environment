@@ -466,11 +466,7 @@ class UNetModel(nn.Module):
         context_dim=None,                 # custom transformer support
         use_lidar_cross_attention=False,
         lidar_context_dim=None,
-        lidar_gate_init=1e-3,
-        lidar_evidence_channels=0,
-        lidar_attention_mode="token",
         lidar_reference_window=3,
-        lidar_fusion_mode="sequential",
         ray_evidence_sat_bias=4.0,
         ray_evidence_lidar_bias=-4.0,
         ray_evidence_null_bias=-6.0,
@@ -514,15 +510,7 @@ class UNetModel(nn.Module):
         self.predict_codebook_ids = n_embed is not None
         self.use_lidar_cross_attention = bool(use_lidar_cross_attention)
         self.lidar_context_dim = lidar_context_dim
-        self.lidar_gate_init = float(lidar_gate_init)
-        self.lidar_evidence_channels = int(lidar_evidence_channels or 0)
-        self.lidar_attention_mode = str(lidar_attention_mode or "token")
-        if self.lidar_attention_mode not in {"token", "reference"}:
-            raise ValueError(f"unknown lidar_attention_mode: {self.lidar_attention_mode}")
         self.lidar_reference_window = max(1, int(lidar_reference_window))
-        self.lidar_fusion_mode = str(lidar_fusion_mode or "sequential")
-        if self.lidar_fusion_mode not in {"sequential", "ray_evidence"}:
-            raise ValueError(f"unknown lidar_fusion_mode: {self.lidar_fusion_mode}")
         self.ray_evidence_sat_bias = float(ray_evidence_sat_bias)
         self.ray_evidence_lidar_bias = float(ray_evidence_lidar_bias)
         self.ray_evidence_null_bias = float(ray_evidence_null_bias)
@@ -587,11 +575,7 @@ class UNetModel(nn.Module):
                             checkpoint=use_checkpoint,
                             use_lidar_cross_attention=self.use_lidar_cross_attention,
                             lidar_context_dim=self.lidar_context_dim,
-                            lidar_gate_init=self.lidar_gate_init,
-                            lidar_evidence_channels=self.lidar_evidence_channels,
-                            lidar_attention_mode=self.lidar_attention_mode,
                             lidar_reference_window=self.lidar_reference_window,
-                            lidar_fusion_mode=self.lidar_fusion_mode,
                             ray_evidence_sat_bias=self.ray_evidence_sat_bias,
                             ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
                             ray_evidence_null_bias=self.ray_evidence_null_bias,
@@ -657,11 +641,7 @@ class UNetModel(nn.Module):
                             checkpoint=use_checkpoint,
                             use_lidar_cross_attention=self.use_lidar_cross_attention,
                             lidar_context_dim=self.lidar_context_dim,
-                            lidar_gate_init=self.lidar_gate_init,
-                            lidar_evidence_channels=self.lidar_evidence_channels,
-                            lidar_attention_mode=self.lidar_attention_mode,
                             lidar_reference_window=self.lidar_reference_window,
-                            lidar_fusion_mode=self.lidar_fusion_mode,
                             ray_evidence_sat_bias=self.ray_evidence_sat_bias,
                             ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
                             ray_evidence_null_bias=self.ray_evidence_null_bias,
@@ -726,11 +706,7 @@ class UNetModel(nn.Module):
                             checkpoint=use_checkpoint,
                             use_lidar_cross_attention=self.use_lidar_cross_attention,
                             lidar_context_dim=self.lidar_context_dim,
-                            lidar_gate_init=self.lidar_gate_init,
-                            lidar_evidence_channels=self.lidar_evidence_channels,
-                            lidar_attention_mode=self.lidar_attention_mode,
                             lidar_reference_window=self.lidar_reference_window,
-                            lidar_fusion_mode=self.lidar_fusion_mode,
                             ray_evidence_sat_bias=self.ray_evidence_sat_bias,
                             ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
                             ray_evidence_null_bias=self.ray_evidence_null_bias,

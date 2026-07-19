@@ -223,7 +223,16 @@ def main():
         except Exception as exc:
             failed += 1
             print(json.dumps({"failed": failed, "idx": idx, "sample_id": sample_id, "error": str(exc)}))
-    print(json.dumps({"complete": True, "written": written, "skipped": skipped, "failed": failed, "out_root": str(out_root)}))
+    summary = {
+        "complete": failed == 0,
+        "written": written,
+        "skipped": skipped,
+        "failed": failed,
+        "out_root": str(out_root),
+    }
+    print(json.dumps(summary))
+    if failed:
+        raise SystemExit(f"Utonia cache generation failed for {failed} samples; rerun with --skip-existing after fixing errors.")
 
 
 if __name__ == "__main__":

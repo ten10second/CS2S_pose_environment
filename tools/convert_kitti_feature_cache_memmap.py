@@ -8,10 +8,10 @@ from pathlib import Path
 import numpy as np
 
 
-POINT_FEATURE_KEYS = ("lidar_point_features", "utonia_feat", "point_features", "features", "feat")
-POINT_MASK_KEYS = ("lidar_point_features_mask", "point_feature_mask", "point_mask", "mask")
-IMAGE_FEATURE_KEYS = ("image_semantic_feat", "dino_feat", "clip_feat", "features", "feat")
-IMAGE_MASK_KEYS = ("image_semantic_mask", "semantic_mask", "valid_mask", "mask")
+POINT_FEATURE_KEY = "utonia_feat"
+POINT_MASK_KEY = "lidar_point_features_mask"
+IMAGE_FEATURE_KEY = "dino_feat"
+IMAGE_MASK_KEY = "image_semantic_mask"
 
 
 def parse_args():
@@ -30,72 +30,36 @@ def parse_args():
     return parser.parse_args()
 
 
-def first_array(payload, keys):
-    for key in keys:
-        if key in payload:
-            return payload[key]
-    return None
+def required_array(payload, key):
+    if key not in payload:
+        raise KeyError(f"Required cache array is missing: {key}")
+    return np.asarray(payload[key])
 
 
 def normalize_point(payload, feature_shape, mask_shape):
-    features = np.zeros(feature_shape, dtype=np.float16)
-    mask = np.zeros(mask_shape, dtype=np.uint8)
-    cached = first_array(payload, POINT_FEATURE_KEYS)
-    if cached is None:
-        return features, mask
-    cached = np.asarray(cached)
-    if cached.ndim == 1:
-        cached = cached[:, None]
-    elif cached.ndim > 2:
-        cached = cached.reshape(cached.shape[0], -1)
-    point_count = min(feature_shape[0], cached.shape[0])
-    channel_count = min(feature_shape[1], cached.shape[1])
-    features[:point_count, :channel_count] = cached[:point_count, :channel_count].astype(np.float16)
-    cached_mask = first_array(payload, POINT_MASK_KEYS)
-    if cached_mask is None:
-        mask[:point_count] = 1
-    else:
-        cached_mask = np.asarray(cached_mask).reshape(-1)
-        mask_count = min(point_count, cached_mask.shape[0])
-        mask[:mask_count] = cached_mask[:mask_count] > 0.5
-    return features, mask
+    features = required_array(payload, POINT_FEATURE_KEY)
+    mask = required_array(payload, POINT_MASK_KEY)
+    if tuple(features.shape) != tuple(feature_shape):
+        raise ValueError(f"Utonia feature shape {features.shape} != expected {feature_shape}")
+    if tuple(mask.shape) != tuple(mask_shape):
+        raise ValueError(f"Utonia mask shape {mask.shape} != expected {mask_shape}")
+    return features.astype(np.float16), (mask > 0.5).astype(np.uint8)
 
 
 def normalize_image(payload, feature_shape, mask_shape):
     channels, height, width = feature_shape
-    features = np.zeros(feature_shape, dtype=np.float16)
-    mask = np.zeros(mask_shape, dtype=np.uint8)
-    cached = first_array(payload, IMAGE_FEATURE_KEYS)
-    if cached is None:
-        return features, mask
-    cached = np.asarray(cached)
-    if cached.ndim == 2:
-        if cached.shape[0] == height * width:
-            cached = cached.reshape(height, width, cached.shape[1]).transpose(2, 0, 1)
-        elif cached.shape[1] == height * width:
-            cached = cached.reshape(cached.shape[0], height, width)
-        else:
-            cached = cached.reshape(cached.shape[0], -1, 1)
-    elif cached.ndim == 3 and (cached.shape[-1] == channels or cached.shape[:2] == (height, width)):
-        cached = cached.transpose(2, 0, 1)
-    elif cached.ndim > 3:
-        cached = cached.reshape(cached.shape[0], cached.shape[-2], cached.shape[-1])
-    channel_count = min(channels, cached.shape[0])
-    height_count = min(height, cached.shape[1])
-    width_count = min(width, cached.shape[2])
-    features[:channel_count, :height_count, :width_count] = cached[
-        :channel_count, :height_count, :width_count
-    ].astype(np.float16)
-    cached_mask = first_array(payload, IMAGE_MASK_KEYS)
-    if cached_mask is None:
-        mask[:, :height_count, :width_count] = 1
-    else:
-        cached_mask = np.asarray(cached_mask)
-        if cached_mask.ndim == 3:
-            cached_mask = cached_mask[0] if cached_mask.shape[0] == 1 else cached_mask[..., 0]
-        mask_height = min(height, cached_mask.shape[0])
-        mask_width = min(width, cached_mask.shape[1])
-        mask[:, :mask_height, :mask_width] = cached_mask[:mask_height, :mask_width] > 0.5
+    features_hwc = required_array(payload, IMAGE_FEATURE_KEY)
+    mask_hw = required_array(payload, IMAGE_MASK_KEY)
+    expected_hwc = (height, width, channels)
+    expected_hw = (height, width)
+    if tuple(features_hwc.shape) != expected_hwc:
+        raise ValueError(f"DINO feature shape {features_hwc.shape} != expected {expected_hwc}")
+    if tuple(mask_hw.shape) != expected_hw:
+        raise ValueError(f"DINO mask shape {mask_hw.shape} != expected {expected_hw}")
+    features = features_hwc.transpose(2, 0, 1).astype(np.float16)
+    mask = (mask_hw[None] > 0.5).astype(np.uint8)
+    if tuple(mask.shape) != tuple(mask_shape):
+        raise ValueError(f"DINO converted mask shape {mask.shape} != expected {mask_shape}")
     return features, mask
 
 

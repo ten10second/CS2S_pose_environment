@@ -49,20 +49,5 @@ class RayEvidenceAttentionTest(unittest.TestCase):
         self.assertIsNotNone(module.ray_proj.weight.grad)
         self.assertGreater(module.ray_proj.weight.grad.abs().sum().item(), 0.0)
 
-    def test_router_reset_preserves_bias_only_start_and_revives_query(self):
-        torch.manual_seed(11)
-        module = RayAlignedEvidenceAttention(dim=8, heads=2, dim_head=4)
-        with torch.no_grad():
-            module.to_q.weight.zero_()
-            module.to_k.weight.normal_()
-            module.ray_proj.weight.normal_()
-
-        module.reset_router_parameters()
-
-        self.assertGreater(module.to_q.weight.norm().item(), 0.0)
-        self.assertEqual(module.to_k.weight.norm().item(), 0.0)
-        self.assertEqual(module.ray_proj.weight.norm().item(), 0.0)
-
-
 if __name__ == "__main__":
     unittest.main()

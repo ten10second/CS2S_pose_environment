@@ -1,14 +1,7 @@
 import argparse
 import json
 import shutil
-import sys
 from pathlib import Path
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
 
 PATH_KEYS = (
     "image_02_path",
@@ -18,19 +11,17 @@ PATH_KEYS = (
     "calib_cam_to_cam_path",
     "calib_velo_to_cam_path",
 )
-OPTIONAL_PATH_KEYS = ("tracklet_xml_path",)
 CALIB_OPTIONAL_FILES = ("calib_imu_to_velo.txt",)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Copy KITTI raw files referenced by a manifest to a local cache.")
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--source-root", default="/media/shizhm/Lenovo/KITTI_RAW")
+    parser.add_argument("--source-root", required=True)
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--out-manifest", required=True)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--start", type=int, default=0, help="Skip this many manifest rows before caching.")
-    parser.add_argument("--no-tracklets", action="store_true", help="Blank tracklet_xml_path in cached records.")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -43,10 +34,7 @@ def _read_jsonl(path: Path):
 
 
 def _relative_to_source(path: Path, source_root: Path) -> Path:
-    try:
-        return path.resolve().relative_to(source_root.resolve())
-    except ValueError:
-        return Path(path.name)
+    return path.resolve().relative_to(source_root.resolve())
 
 
 def _copy_file(src: Path, dst: Path, overwrite: bool) -> bool:
@@ -68,7 +56,7 @@ def _cache_path(src_value: str, source_root: Path, cache_root: Path) -> Path:
     return cache_root / _relative_to_source(src, source_root)
 
 
-def _cache_record(record: dict, source_root: Path, cache_root: Path, overwrite: bool, no_tracklets: bool):
+def _cache_record(record: dict, source_root: Path, cache_root: Path, overwrite: bool):
     cached = dict(record)
     copied = []
     missing = []
@@ -96,19 +84,6 @@ def _cache_record(record: dict, source_root: Path, cache_root: Path, overwrite: 
             if src.exists():
                 _copy_file(src, dst_calib_dir / file_name, overwrite)
 
-    if no_tracklets:
-        cached["tracklet_xml_path"] = ""
-        cached["has_dynamic_xml"] = False
-    else:
-        for key in OPTIONAL_PATH_KEYS:
-            src_value = record.get(key, "")
-            if not src_value:
-                continue
-            src = Path(src_value)
-            dst = _cache_path(src_value, source_root, cache_root)
-            if _copy_file(src, dst, overwrite):
-                cached[key] = str(dst)
-
     return cached, copied, missing
 
 
@@ -121,7 +96,6 @@ def main():
 
     total = 0
     cached_count = 0
-    skipped = 0
     with out_manifest.open("w") as out:
         for row_index, record in enumerate(_read_jsonl(Path(args.manifest))):
             if row_index < args.start:
@@ -129,22 +103,16 @@ def main():
             if args.limit and total >= args.limit:
                 break
             total += 1
-            try:
-                cached, copied, missing = _cache_record(
-                    record,
-                    source_root=source_root,
-                    cache_root=cache_root,
-                    overwrite=bool(args.overwrite),
-                    no_tracklets=bool(args.no_tracklets),
-                )
-            except Exception as exc:
-                skipped += 1
-                print(json.dumps({"skipped": record.get("sample_id", ""), "error": str(exc)}, ensure_ascii=False))
-                continue
+            cached, copied, missing = _cache_record(
+                record,
+                source_root=source_root,
+                cache_root=cache_root,
+                overwrite=bool(args.overwrite),
+            )
             if missing:
-                skipped += 1
-                print(json.dumps({"skipped": record.get("sample_id", ""), "missing": missing}, ensure_ascii=False))
-                continue
+                raise FileNotFoundError(
+                    f"Sample {record.get('sample_id', '')} is missing required fields/files: {missing}"
+                )
             out.write(json.dumps(cached, ensure_ascii=False, sort_keys=True) + "\n")
             cached_count += 1
             if cached_count == 1 or cached_count % 100 == 0:
@@ -159,7 +127,6 @@ def main():
                 "cache_root": str(cache_root),
                 "seen": total,
                 "cached": cached_count,
-                "skipped": skipped,
             },
             ensure_ascii=False,
             sort_keys=True,

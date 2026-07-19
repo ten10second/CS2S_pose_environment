@@ -27,6 +27,11 @@ def parse_args():
         help="Optional OLD=NEW replacement for manifest paths, e.g. /media/a=/media/b.",
     )
     parser.add_argument("--model", default="dinov2_vits14")
+    parser.add_argument(
+        "--dinov2-root",
+        default=str(REPO_ROOT / "third_party" / "dinov2"),
+        help="Local DINOv2 repository used by torch.hub; defaults to the vendored third_party copy.",
+    )
     parser.add_argument("--input-height", type=int, default=224)
     parser.add_argument("--input-width", type=int, default=896)
     parser.add_argument("--token-height", type=int, default=8)
@@ -53,8 +58,11 @@ def safe_sample_id(sample_id: str) -> str:
     return str(sample_id).replace("/", "__")
 
 
-def load_dinov2(model_name: str, device: torch.device):
-    model = torch.hub.load("facebookresearch/dinov2", model_name, pretrained=True)
+def load_dinov2(model_name: str, device: torch.device, dinov2_root: str):
+    repo_root = Path(dinov2_root).expanduser().resolve()
+    if not (repo_root / "hubconf.py").is_file():
+        raise FileNotFoundError(f"DINOv2 hub repository not found: {repo_root}")
+    model = torch.hub.load(str(repo_root), model_name, pretrained=True, source="local")
     model.eval().to(device)
     return model
 
@@ -98,7 +106,7 @@ def main():
         preview_root.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    model = load_dinov2(args.model, device)
+    model = load_dinov2(args.model, device, args.dinov2_root)
     patch_size = int(getattr(model, "patch_size", 14))
     input_h = int(args.input_height)
     input_w = int(args.input_width)
@@ -151,7 +159,16 @@ def main():
         except Exception as exc:
             failed += 1
             print(json.dumps({"failed": failed, "idx": idx, "sample_id": sample_id, "error": str(exc)}))
-    print(json.dumps({"complete": True, "written": written, "skipped": skipped, "failed": failed, "out_root": str(out_root)}))
+    summary = {
+        "complete": failed == 0,
+        "written": written,
+        "skipped": skipped,
+        "failed": failed,
+        "out_root": str(out_root),
+    }
+    print(json.dumps(summary))
+    if failed:
+        raise SystemExit(f"DINO cache generation failed for {failed} samples; rerun with --skip-existing after fixing errors.")
 
 
 if __name__ == "__main__":

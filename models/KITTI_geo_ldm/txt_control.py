@@ -73,6 +73,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 lidar_counterfactual_point_fallback=True,
                 lidar_counterfactual_exist_weight=1.0,
                 lidar_depth_loss_weight=0.0,
+                lidar_depth_output_scale=1.0,
+                lidar_depth_bottleneck_scale=1.0,
                 lidar_depth_log_eps=1e-3,
                 lidar_semantic_alignment_weight=0.0,
                 lidar_semantic_alignment_key="image_semantic_feat",
@@ -150,6 +152,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.lidar_counterfactual_exist_weight = float(lidar_counterfactual_exist_weight)
         self.last_lidar_counterfactual_metrics = {}
         self.lidar_depth_loss_weight = float(lidar_depth_loss_weight)
+        self.lidar_depth_output_scale = float(lidar_depth_output_scale)
+        self.lidar_depth_bottleneck_scale = float(lidar_depth_bottleneck_scale)
         self.lidar_depth_log_eps = float(lidar_depth_log_eps)
         self.lidar_semantic_alignment_weight = float(lidar_semantic_alignment_weight)
         self.lidar_semantic_alignment_key = str(lidar_semantic_alignment_key or "image_semantic_feat")
@@ -1162,6 +1166,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         lidar_depth_target, lidar_depth_mask = (
             self.lidar_depth_target_mask(lidar_cond, pre_residual_laten.shape)
             if self.lidar_depth_loss_weight > 0.0
+            and (self.lidar_depth_output_scale > 0.0 or self.lidar_depth_bottleneck_scale > 0.0)
             else (None, None)
         )
         needs_foreground_mask = (
@@ -1243,6 +1248,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             "lidar_depth_target": lidar_depth_target,
             "lidar_depth_mask": lidar_depth_mask,
             "lidar_depth_loss_weight": self.lidar_depth_loss_weight,
+            "lidar_depth_output_scale": self.lidar_depth_output_scale,
+            "lidar_depth_bottleneck_scale": self.lidar_depth_bottleneck_scale,
             "lidar_depth_log_eps": self.lidar_depth_log_eps,
         }
         self.last_lidar_counterfactual_metrics = {}
