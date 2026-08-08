@@ -40,6 +40,34 @@ class RayPosteriorTest(unittest.TestCase):
         self.assertIsNone(block.ray_evidence_attn)
         self.assertIsNotNone(block.ray_posterior_fusion)
 
+    def test_zero_hit_transformer_block_matches_satellite_only_path(self):
+        block = BasicTransformerBlock(
+            dim=16,
+            n_heads=2,
+            d_head=8,
+            context_dim=16,
+            use_lidar_cross_attention=True,
+            lidar_context_dim=16,
+            ray_fusion_mode="ray_posterior",
+            use_lidar_ray_posterior=True,
+        ).eval()
+        x = torch.randn(1, 4, 16)
+        lidar_context = torch.randn(1, 4, 16)
+        zero_hit = torch.zeros(1, 1, 1, 4)
+
+        with torch.no_grad():
+            satellite_only = block._forward_without_lidar(x, context=None)
+            zero_lidar = block._forward(
+                x,
+                context=None,
+                lidar_context=lidar_context,
+                lidar_evidence=None,
+                lidar_geometry_mask=zero_hit,
+                latent_hw=(1, 4),
+            )
+
+        torch.testing.assert_close(zero_lidar, satellite_only, rtol=0.0, atol=0.0)
+
     def test_zero_lidar_is_exact_satellite_fallback(self):
         module = _posterior_attention()
         logits = torch.randn(1, 2, 3, 8)
@@ -78,6 +106,39 @@ class RayPosteriorTest(unittest.TestCase):
         self.assertEqual(posterior[0, 0, 0].argmax().item(), 2)
         self.assertLess(module.last_ray_posterior_entropy, module.last_ray_posterior_prior_entropy)
         self.assertGreater(module.last_ray_posterior_weight_shift, 0.0)
+
+    def test_lidar_likelihood_changes_satellite_candidate_gradient(self):
+        module = _posterior_attention()
+        candidate_depth = torch.tensor([[[5.0, 10.0, 20.0, 40.0, 6.0, 12.0, 24.0, 48.0]]])
+        candidate_valid = torch.ones_like(candidate_depth, dtype=torch.bool)
+        candidate_value = torch.linspace(-1.0, 1.0, 8).reshape(1, 1, 1, 8)
+
+        zero_logits = torch.zeros(1, 2, 1, 8, requires_grad=True)
+        zero_evidence = torch.zeros(1, 2, 1, 1)
+        zero_weights = module._apply_lidar_ray_posterior(
+            zero_logits,
+            candidate_depth,
+            candidate_valid,
+            zero_evidence,
+            query_hw=(1, 1),
+        )
+        (zero_weights * candidate_value).sum().backward()
+        zero_grad = zero_logits.grad.detach().clone()
+
+        hit_logits = torch.zeros(1, 2, 1, 8, requires_grad=True)
+        hit_evidence = torch.tensor([[[[20.0 / 80.0]], [[1.0]]]])
+        hit_weights = module._apply_lidar_ray_posterior(
+            hit_logits,
+            candidate_depth,
+            candidate_valid,
+            hit_evidence,
+            query_hw=(1, 1),
+        )
+        (hit_weights * candidate_value).sum().backward()
+        hit_grad = hit_logits.grad.detach()
+
+        self.assertTrue(torch.isfinite(hit_grad).all())
+        self.assertFalse(torch.allclose(hit_grad, zero_grad))
 
     def test_posterior_fusion_only_adds_lidar_on_supported_rays(self):
         module = RayPosteriorEvidenceFusion(dim=8, lidar_gate_bias=-2.0)
