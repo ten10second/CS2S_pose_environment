@@ -22,10 +22,16 @@ RUN_ROOT="${RUN_ROOT:-${DATA_ROOT}/kitti_ray_posterior}"
 RUN_NAME="${RUN_NAME:-ray_posterior_utonia_dino_sd14_fresh_$(date +%Y%m%d_%H%M%S)}"
 TARGET_STEP="${TARGET_STEP:-500000}"
 SAVE_EVERY="${SAVE_EVERY:-10000}"
-SAMPLE_EVERY="${SAMPLE_EVERY:-2500}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-0}"
 NUM_GPUS="${NUM_GPUS:-1}"
 BATCH_PER_GPU="${BATCH_PER_GPU:-2}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-2}"
+DATALOADER_TIMEOUT="${DATALOADER_TIMEOUT:-180}"
+DIST_TIMEOUT_SECONDS="${DIST_TIMEOUT_SECONDS:-600}"
+MIN_FREE_DISK_GB="${MIN_FREE_DISK_GB:-50}"
+MIN_FREE_HOST_MEMORY_GB="${MIN_FREE_HOST_MEMORY_GB:-12}"
+PARALLEL_MODEL_INIT="${PARALLEL_MODEL_INIT:-0}"
+ALLOW_DDP_INLINE_SAMPLING="${ALLOW_DDP_INLINE_SAMPLING:-0}"
 LR="${LR:-1e-5}"
 TRAIN_MANIFEST="${TRAIN_MANIFEST:-${ROOT}/dataset/kitti_raw_sat_lidar/train_manifest.jsonl}"
 VAL_MANIFEST="${VAL_MANIFEST:-${ROOT}/dataset/kitti_raw_sat_lidar/test2_manifest.jsonl}"
@@ -35,7 +41,7 @@ LIDAR_CACHE_ROOT="${LIDAR_CACHE_ROOT:-${CACHE_ROOT}/utonia_ray_depth_all_fp16}"
 DINO_CACHE_ROOT="${DINO_CACHE_ROOT:-${CACHE_ROOT}/dino_vits14_8x32_all_fp16}"
 RESUME_CKPT="${RESUME_CKPT:-}"
 
-for value in NUM_GPUS BATCH_PER_GPU WORKERS_PER_GPU TARGET_STEP SAVE_EVERY SAMPLE_EVERY; do
+for value in NUM_GPUS BATCH_PER_GPU WORKERS_PER_GPU TARGET_STEP SAVE_EVERY SAMPLE_EVERY DATALOADER_TIMEOUT DIST_TIMEOUT_SECONDS MIN_FREE_DISK_GB MIN_FREE_HOST_MEMORY_GB PARALLEL_MODEL_INIT ALLOW_DDP_INLINE_SAMPLING; do
     if ! [[ "${!value}" =~ ^[0-9]+$ ]]; then
         printf 'error: %s must be a non-negative integer, got %q\n' "${value}" "${!value}" >&2
         exit 2
@@ -45,9 +51,29 @@ if (( NUM_GPUS < 1 || BATCH_PER_GPU < 1 )); then
     printf 'error: NUM_GPUS and BATCH_PER_GPU must be at least 1\n' >&2
     exit 2
 fi
+if (( PARALLEL_MODEL_INIT > 1 || ALLOW_DDP_INLINE_SAMPLING > 1 )); then
+    printf 'error: PARALLEL_MODEL_INIT and ALLOW_DDP_INLINE_SAMPLING must be 0 or 1\n' >&2
+    exit 2
+fi
 if ! "${PYTHON}" -c 'import omegaconf, torch' >/dev/null 2>&1; then
     printf 'error: %s is not the ControlS2S training interpreter; activate the environment or set PYTHON\n' \
         "${PYTHON}" >&2
+    exit 2
+fi
+VISIBLE_GPUS="$("${PYTHON}" -c 'import torch; print(torch.cuda.device_count())')"
+if (( NUM_GPUS > VISIBLE_GPUS )); then
+    printf 'error: requested %s GPUs, but PyTorch sees only %s\n' "${NUM_GPUS}" "${VISIBLE_GPUS}" >&2
+    exit 2
+fi
+CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+TOTAL_WORKERS=$((NUM_GPUS * WORKERS_PER_GPU))
+if (( TOTAL_WORKERS > CPU_COUNT )); then
+    printf 'error: requested %s DataLoader workers across ranks, but only %s CPUs are online\n' \
+        "${TOTAL_WORKERS}" "${CPU_COUNT}" >&2
+    exit 2
+fi
+if (( NUM_GPUS > 1 && SAMPLE_EVERY > 0 && ALLOW_DDP_INLINE_SAMPLING == 0 )); then
+    printf 'error: inline sampling is disabled for DDP; set SAMPLE_EVERY=0 and sample checkpoints offline\n' >&2
     exit 2
 fi
 
@@ -95,13 +121,31 @@ RESUME_ARGS=()
 if [[ -n "${RESUME_CKPT}" ]]; then
     RESUME_ARGS=(--resume-ckpt "${RESUME_CKPT}")
 fi
+MODEL_INIT_ARGS=()
+if (( PARALLEL_MODEL_INIT == 1 )); then
+    MODEL_INIT_ARGS=(--parallel-model-init)
+fi
+DDP_SAMPLE_ARGS=()
+if (( ALLOW_DDP_INLINE_SAMPLING == 1 )); then
+    DDP_SAMPLE_ARGS=(--allow-ddp-inline-sampling)
+fi
 
 cd "${ROOT}"
-exec env PYTHONUNBUFFERED=1 "${LAUNCH[@]}" tools/train_kitti_raea.py \
+exec env \
+    PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}" \
+    MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" \
+    OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}" \
+    NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}" \
+    NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}" \
+    TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}" \
+    "${LAUNCH[@]}" tools/train_kitti_raea.py \
     --config configs/Boost_Sat2Den/train/KITTI_raw_sat_lidar_raea.yaml \
     --sd-base-ckpt "${SD_BASE_CKPT}" \
     --kitti-root "${KITTI_ROOT}" \
     "${RESUME_ARGS[@]}" \
+    "${MODEL_INIT_ARGS[@]}" \
+    "${DDP_SAMPLE_ARGS[@]}" \
     --train-manifest "${TRAIN_MANIFEST}" \
     --val-manifest "${VAL_MANIFEST}" \
     --out-root "${RUN_ROOT}" \
@@ -109,6 +153,10 @@ exec env PYTHONUNBUFFERED=1 "${LAUNCH[@]}" tools/train_kitti_raea.py \
     --steps "${TARGET_STEP}" \
     --batch-size "${BATCH_PER_GPU}" \
     --num-workers "${WORKERS_PER_GPU}" \
+    --dataloader-timeout "${DATALOADER_TIMEOUT}" \
+    --dist-timeout-seconds "${DIST_TIMEOUT_SECONDS}" \
+    --min-free-disk-gb "${MIN_FREE_DISK_GB}" \
+    --min-free-host-memory-gb "${MIN_FREE_HOST_MEMORY_GB}" \
     --lr "${LR}" \
     --shuffle \
     --amp \

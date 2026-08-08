@@ -111,7 +111,7 @@ data:
         sat_size: 256
         max_depth: 80.0
         align_satellite_to_camera: true
-        include_range_image: true
+        include_range_image: false
         include_raw_lidar_points: false
         lidar_ray_feature_dim: 576
         lidar_ray_depth_bins: 4

@@ -580,7 +580,7 @@ def main():
         sat_size=256,
         max_depth=80.0,
         align_satellite_to_camera=True,
-        include_range_image=True,
+        include_range_image=bool(cfg_value("include_range_image", False)),
         include_raw_lidar_points=False,
         lidar_ray_feature_cache_root=args.lidar_ray_feature_cache_root,
         lidar_ray_feature_cache_suffix=str(cfg_value("lidar_ray_feature_cache_suffix", ".npz")),

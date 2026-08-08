@@ -10,6 +10,7 @@ from ldm.modules.KITTI_attention import (
     RayPosteriorEvidenceFusion,
 )
 from tools.build_kitti_utonia_ray_cache import pool_ray_depth_features
+from tools.train_kitti_raea import lidar_attention_stats
 
 
 def _posterior_attention():
@@ -25,6 +26,21 @@ def _posterior_attention():
 
 
 class RayPosteriorTest(unittest.TestCase):
+    def test_attention_stats_skip_parent_posterior_flag_without_local_buffers(self):
+        class PosteriorContainer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.use_lidar_ray_posterior = True
+                self.attention = _posterior_attention()
+
+        model = SimpleNamespace(
+            DDPM=SimpleNamespace(denoise_model=PosteriorContainer())
+        )
+
+        stats = lidar_attention_stats(model)
+
+        self.assertEqual(stats["ray_posterior_modules"], 1)
+
     def test_posterior_mode_does_not_instantiate_legacy_raea_router(self):
         block = BasicTransformerBlock(
             dim=16,

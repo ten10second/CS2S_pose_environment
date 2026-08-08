@@ -19,6 +19,9 @@ from tools.train_kitti_raea import (
     ensure_fresh_run_directory,
     load_training_checkpoint,
     merge_distributed_records,
+    save_checkpoint,
+    update_checkpoint_alias,
+    validate_runtime_args,
     validate_memmap_cache,
 )
 
@@ -64,7 +67,7 @@ class KittiDistributedTrainingTest(unittest.TestCase):
             train_manifest="train.jsonl",
             val_manifest="test.jsonl",
             kitti_root="/data/KITTI_RAW",
-            lidar_point_feature_cache_root="/cache/utonia",
+            lidar_ray_feature_cache_root="/cache/utonia_ray",
             image_semantic_cache_root="/cache/dino",
         )
         config_path = (
@@ -76,10 +79,12 @@ class KittiDistributedTrainingTest(unittest.TestCase):
         self.assertIsNone(OmegaConf.select(cfg, "model.params.freeze_for_lidar_control"))
         self.assertEqual(
             cfg.model.params.Lidar_context_config.target,
-            "models.KITTI_geo_ldm.lidar_condition_model.Lidar3DPointRayTokenEncoder",
+            "models.KITTI_geo_ldm.lidar_condition_model.LidarRayDepthSemanticTokenEncoder",
         )
         self.assertEqual(cfg.model.params.DDPM_config.params.unet_config.params.lidar_context_dim, 768)
-        self.assertEqual(cfg.data.params.train.params.raw_lidar_point_count, 4096)
+        self.assertEqual(cfg.model.params.DDPM_config.params.unet_config.params.ray_fusion_mode, "ray_posterior")
+        self.assertFalse(cfg.data.params.train.params.include_range_image)
+        self.assertFalse(cfg.data.params.train.params.include_raw_lidar_points)
         self.assertFalse(cfg.data.params.train.params.include_tracklets)
         self.assertIsNone(OmegaConf.select(cfg, "model.params.dynamic_point_x0_loss_weight"))
         self.assertIsNone(OmegaConf.select(cfg, "model.params.foreground_image_loss_weight"))
@@ -111,12 +116,12 @@ class KittiDistributedTrainingTest(unittest.TestCase):
     def test_metric_records_are_averaged(self):
         merged = merge_distributed_records(
             [
-                {"step": 20, "loss": 1.0, "mode": "ray_evidence"},
-                {"step": 20, "loss": 3.0, "mode": "ray_evidence"},
+                {"step": 20, "loss": 1.0, "mode": "ray_posterior"},
+                {"step": 20, "loss": 3.0, "mode": "ray_posterior"},
             ]
         )
         self.assertEqual(merged["step"], 20)
-        self.assertEqual(merged["mode"], "ray_evidence")
+        self.assertEqual(merged["mode"], "ray_posterior")
         self.assertEqual(merged["loss"], 2.0)
         self.assertEqual(merged["distributed_metrics_world_size"], 2)
 
@@ -192,8 +197,37 @@ class KittiDistributedTrainingTest(unittest.TestCase):
 
             legacy = Path(temp_dir) / "legacy.pt"
             torch.save({"step": 12, "denoise_model_trainable": {}}, legacy)
-            with self.assertRaisesRegex(RuntimeError, "not a current fresh-RAEA"):
+            with self.assertRaisesRegex(RuntimeError, "not a current ray-posterior"):
                 load_training_checkpoint(model, optimizer, legacy, scaler=scaler)
+
+    def test_checkpoint_is_atomic_and_last_alias_reuses_storage(self):
+        model = _StrictResumeModel()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        args = SimpleNamespace(min_free_disk_gb=0.0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = Path(temp_dir) / "step_000001.pt"
+            save_checkpoint(checkpoint, model, optimizer, scaler, 1, args, {})
+            alias = Path(temp_dir) / "last.pt"
+            mode = update_checkpoint_alias(checkpoint, alias)
+
+            self.assertEqual(mode, "hardlink")
+            self.assertEqual(checkpoint.stat().st_ino, alias.stat().st_ino)
+            self.assertFalse(list(Path(temp_dir).glob("*.tmp-*")))
+
+    def test_runtime_guard_rejects_worker_oversubscription(self):
+        args = SimpleNamespace(
+            batch_size=1,
+            num_workers=10 ** 6,
+            dataloader_timeout=180,
+            log_every=20,
+            min_free_disk_gb=50.0,
+            min_free_host_memory_gb=12.0,
+            sample_every=0,
+            allow_ddp_inline_sampling=False,
+        )
+        with self.assertRaisesRegex(ValueError, "DataLoader would start"):
+            validate_runtime_args(args, world_size=8)
 
     def test_inference_rejects_legacy_partial_checkpoint(self):
         model = _StrictResumeModel()
@@ -209,7 +243,7 @@ class KittiDistributedTrainingTest(unittest.TestCase):
 
             legacy = Path(temp_dir) / "legacy.pt"
             torch.save({"denoise_model_trainable": {}}, legacy)
-            with self.assertRaisesRegex(RuntimeError, "not a current fresh-RAEA"):
+            with self.assertRaisesRegex(RuntimeError, "not a current ray-posterior"):
                 load_checkpoint_into_model(model, legacy)
 
     def test_sampling_geometry_mask_uses_projected_lidar_hits(self):

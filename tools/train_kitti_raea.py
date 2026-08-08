@@ -2,8 +2,10 @@ import argparse
 import gc
 import json
 import os
+import shutil
 import sys
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -72,6 +74,12 @@ def parse_args():
         help="Distributed backend used under torchrun. auto selects NCCL on CUDA and Gloo otherwise.",
     )
     parser.add_argument(
+        "--dist-timeout-seconds",
+        type=int,
+        default=600,
+        help="Abort distributed collectives after this many seconds instead of hanging indefinitely.",
+    )
+    parser.add_argument(
         "--ddp-find-unused-parameters",
         dest="ddp_find_unused_parameters",
         action="store_true",
@@ -87,6 +95,22 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument(
+        "--dataloader-timeout",
+        type=int,
+        default=180,
+        help="Seconds to wait for a worker batch before failing the run. Ignored with zero workers.",
+    )
+    parser.add_argument(
+        "--parallel-model-init",
+        action="store_true",
+        help="Load base/resume checkpoints on all ranks concurrently. Disabled by default to limit host RAM and I/O spikes.",
+    )
+    parser.add_argument(
+        "--allow-ddp-inline-sampling",
+        action="store_true",
+        help="Allow rank-0 inline DDIM sampling while other ranks wait. Prefer offline sampling on multi-GPU runs.",
+    )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--save-every", type=int, default=3000)
     parser.add_argument(
@@ -112,6 +136,18 @@ def parse_args():
     )
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--resume-ckpt", default="")
+    parser.add_argument(
+        "--min-free-disk-gb",
+        type=float,
+        default=50.0,
+        help="Refuse checkpoint writes when output storage has less free space than this threshold.",
+    )
+    parser.add_argument(
+        "--min-free-host-memory-gb",
+        type=float,
+        default=12.0,
+        help="Require this much available host RAM before each rank loads model or resume state.",
+    )
 
     parser.add_argument(
         "--lidar-ray-feature-cache-root",
@@ -179,7 +215,11 @@ def init_distributed(args):
         backend = args.dist_backend
         if backend == "auto":
             backend = "nccl" if device.type == "cuda" else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://")
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timedelta(seconds=max(1, int(getattr(args, "dist_timeout_seconds", 600)))),
+        )
     return {
         "distributed": distributed,
         "world_size": world_size,
@@ -198,6 +238,97 @@ def distributed_barrier(distributed):
 def cleanup_distributed():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
+
+def validate_runtime_args(args, world_size):
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    if args.dataloader_timeout < 0:
+        raise ValueError("--dataloader-timeout must be non-negative")
+    if args.log_every < 1:
+        raise ValueError("--log-every must be at least 1")
+    if args.min_free_disk_gb < 0:
+        raise ValueError("--min-free-disk-gb must be non-negative")
+    if args.min_free_host_memory_gb < 0:
+        raise ValueError("--min-free-host-memory-gb must be non-negative")
+    cpu_count = os.cpu_count() or 1
+    total_workers = int(args.num_workers) * int(world_size)
+    if total_workers > cpu_count:
+        raise ValueError(
+            f"DataLoader would start {total_workers} workers across {world_size} ranks, "
+            f"but only {cpu_count} logical CPUs are available"
+        )
+    if world_size > 1 and int(args.sample_every) > 0 and not args.allow_ddp_inline_sampling:
+        raise ValueError(
+            "Inline sampling is disabled by default for DDP because non-main ranks would wait at a "
+            "collective during 50-step DDIM. Set --sample-every 0 and sample checkpoints offline, "
+            "or explicitly pass --allow-ddp-inline-sampling."
+        )
+
+
+def require_host_memory(min_free_host_memory_gb, operation):
+    available_mb = _mem_available_mb()
+    threshold_mb = float(min_free_host_memory_gb) * 1024.0
+    if available_mb >= 0.0 and available_mb < threshold_mb:
+        raise RuntimeError(
+            f"Refusing {operation} with only {available_mb / 1024.0:.1f} GiB host RAM available; "
+            f"required at least {float(min_free_host_memory_gb):.1f} GiB"
+        )
+
+
+def instantiate_model_safely(
+    cfg,
+    device,
+    distributed,
+    rank,
+    world_size,
+    parallel_model_init,
+    min_free_host_memory_gb,
+):
+    if not distributed or parallel_model_init:
+        require_host_memory(min_free_host_memory_gb, "model initialization")
+        return instantiate_from_config(cfg.model).to(device)
+    model = None
+    for owner_rank in range(world_size):
+        if rank == owner_rank:
+            require_host_memory(min_free_host_memory_gb, f"model initialization on rank {rank}")
+            model = instantiate_from_config(cfg.model).to(device)
+        distributed_barrier(distributed)
+    return model
+
+
+def load_training_checkpoint_safely(
+    model,
+    optimizer,
+    ckpt_path,
+    scaler,
+    distributed,
+    rank,
+    world_size,
+    parallel_model_init,
+    min_free_host_memory_gb,
+):
+    if not distributed or parallel_model_init:
+        require_host_memory(min_free_host_memory_gb, "checkpoint resume")
+        return load_training_checkpoint(model, optimizer, ckpt_path, scaler=scaler)
+    start_step = 0
+    for owner_rank in range(world_size):
+        if rank == owner_rank:
+            require_host_memory(min_free_host_memory_gb, f"checkpoint resume on rank {rank}")
+            start_step = load_training_checkpoint(model, optimizer, ckpt_path, scaler=scaler)
+        distributed_barrier(distributed)
+    return start_step
+
+
+def synchronized_loss_finite(loss, distributed):
+    finite = torch.isfinite(loss.detach()).all()
+    if not distributed:
+        return bool(finite.item())
+    finite_flag = finite.to(device=loss.device, dtype=torch.int32)
+    dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+    return bool(finite_flag.item())
 
 
 def move_batch_to_device(batch, device):
@@ -377,7 +508,9 @@ def configure_cfg(cfg, args):
         params.manifest = manifest
         params.kitti_root = args.kitti_root
         params.condition_mode = CONDITION_MODE
-        params.include_range_image = True
+        # The ray-depth encoder consumes lidar_cond plus the offline Utonia cache and
+        # explicitly discards range_img. Avoid building and transferring it per sample.
+        params.include_range_image = False
         params.include_raw_lidar_points = False
         params.lidar_point_feature_cache_root = ""
         params.lidar_point_feature_dim = 0
@@ -427,8 +560,56 @@ def load_training_checkpoint(model, optimizer, ckpt_path, scaler=None):
     return step
 
 
+def free_disk_gb(path):
+    path = Path(path)
+    probe = path if path.exists() else path.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free / (1024 ** 3)
+
+
+def require_checkpoint_disk_space(path, min_free_disk_gb):
+    free_gb = free_disk_gb(path)
+    if free_gb < float(min_free_disk_gb):
+        raise RuntimeError(
+            f"Refusing checkpoint write with only {free_gb:.1f} GiB free at {Path(path).parent}; "
+            f"required at least {float(min_free_disk_gb):.1f} GiB"
+        )
+    return free_gb
+
+
+def atomic_torch_save(payload, path):
+    path = Path(path)
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temp_path.unlink(missing_ok=True)
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def update_checkpoint_alias(source, alias):
+    source = Path(source)
+    alias = Path(alias)
+    temp_alias = alias.with_name(f".{alias.name}.tmp-{os.getpid()}")
+    temp_alias.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(source, temp_alias)
+            mode = "hardlink"
+        except OSError:
+            shutil.copy2(source, temp_alias)
+            mode = "copy"
+        os.replace(temp_alias, alias)
+    finally:
+        temp_alias.unlink(missing_ok=True)
+    return mode
+
+
 def save_checkpoint(path, model, optimizer, scaler, step, args, metadata):
     path.parent.mkdir(parents=True, exist_ok=True)
+    free_gb_before = require_checkpoint_disk_space(path, args.min_free_disk_gb)
     payload = {
         "step": int(step),
         "args": vars(args),
@@ -445,7 +626,18 @@ def save_checkpoint(path, model, optimizer, scaler, step, args, metadata):
             "grad_scaler": scaler.state_dict(),
         }
     )
-    torch.save(payload, path)
+    atomic_torch_save(payload, path)
+    return {
+        "checkpoint_bytes": path.stat().st_size,
+        "checkpoint_free_disk_gb_before": round(free_gb_before, 2),
+    }
+
+
+def save_step_checkpoint(ckpt_dir, model, optimizer, scaler, step, args, metadata):
+    step_path = ckpt_dir / f"step_{step:06d}.pt"
+    save_stats = save_checkpoint(step_path, model, optimizer, scaler, step, args, metadata)
+    alias_mode = update_checkpoint_alias(step_path, ckpt_dir / "last.pt")
+    return step_path, {**save_stats, "checkpoint_alias_mode": alias_mode}
 
 
 def prune_step_checkpoints(ckpt_dir, keep_count):
@@ -488,6 +680,21 @@ def ensure_fresh_run_directory_distributed(out_dir, resume_ckpt, distributed, is
         raise FileExistsError(error_message)
 
 
+def ensure_output_disk_space_distributed(path, min_free_disk_gb, distributed, is_main):
+    error_message = None
+    if is_main:
+        try:
+            require_checkpoint_disk_space(path, min_free_disk_gb)
+        except RuntimeError as error:
+            error_message = str(error)
+    if distributed:
+        error_payload = [error_message]
+        dist.broadcast_object_list(error_payload, src=0)
+        error_message = error_payload[0]
+    if error_message:
+        raise RuntimeError(error_message)
+
+
 def build_inline_sample_dataset(args):
     if int(args.sample_every) <= 0 or not args.sample_manifest:
         return None
@@ -499,7 +706,7 @@ def build_inline_sample_dataset(args):
         sat_size=256,
         max_depth=80.0,
         align_satellite_to_camera=True,
-        include_range_image=True,
+        include_range_image=False,
         include_raw_lidar_points=False,
         lidar_ray_feature_cache_root=args.lidar_ray_feature_cache_root,
         lidar_ray_feature_cache_suffix=".npz",
@@ -694,7 +901,9 @@ def lidar_attention_stats(model):
                 evidence_lidar_mask.append(torch.tensor(module_stat_float(module, "last_evidence_lidar_mask_mean"), dtype=torch.float32))
                 evidence_lidar_masked.append(torch.tensor(module_stat_float(module, "last_evidence_lidar_weight_masked"), dtype=torch.float32))
                 evidence_lidar_background.append(torch.tensor(module_stat_float(module, "last_evidence_lidar_weight_background"), dtype=torch.float32))
-        if bool(getattr(module, "use_lidar_ray_posterior", False)):
+        if bool(getattr(module, "use_lidar_ray_posterior", False)) and hasattr(
+            module, "last_ray_posterior_hit_coverage"
+        ):
             posterior_hit.append(torch.tensor(module_stat_float(module, "last_ray_posterior_hit_coverage"), dtype=torch.float32))
             posterior_prior_entropy.append(torch.tensor(module_stat_float(module, "last_ray_posterior_prior_entropy"), dtype=torch.float32))
             posterior_entropy.append(torch.tensor(module_stat_float(module, "last_ray_posterior_entropy"), dtype=torch.float32))
@@ -849,6 +1058,7 @@ def build_loader(dataset, args, rank=0, world_size=1):
         "num_workers": args.num_workers,
         "drop_last": False,
         "pin_memory": bool(args.pin_memory),
+        "timeout": int(getattr(args, "dataloader_timeout", 0)) if args.num_workers > 0 else 0,
     }
     if args.num_workers > 0:
         kwargs["multiprocessing_context"] = "spawn"
@@ -941,9 +1151,7 @@ def new_metric_window():
     }
 
 
-def main():
-    args = parse_args()
-    dist_info = init_distributed(args)
+def run_training(args, dist_info):
     distributed = dist_info["distributed"]
     world_size = dist_info["world_size"]
     rank = dist_info["rank"]
@@ -997,19 +1205,43 @@ def main():
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "run_config.yaml").write_text(OmegaConf.to_yaml(cfg))
         (out_dir / "run_args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True))
+    ensure_output_disk_space_distributed(
+        ckpt_dir,
+        args.min_free_disk_gb,
+        distributed,
+        is_main,
+    )
     distributed_barrier(distributed)
 
     train_dataset = instantiate_from_config(cfg.data.params.train)
     loader, distributed_sampler = build_loader(train_dataset, args, rank=rank, world_size=world_size)
     inline_sample_dataset = build_inline_sample_dataset(args) if is_main else None
 
-    model = instantiate_from_config(cfg.model).to(device)
+    model = instantiate_model_safely(
+        cfg,
+        device,
+        distributed,
+        rank,
+        world_size,
+        args.parallel_model_init,
+        args.min_free_host_memory_gb,
+    )
     model.learning_rate = args.lr
     optimizer = model.configure_optimizers()[0]
     scaler = GradScaler(enabled=bool(args.amp and torch.cuda.is_available()))
     start_step = 0
     if args.resume_ckpt:
-        start_step = load_training_checkpoint(model, optimizer, args.resume_ckpt, scaler=scaler)
+        start_step = load_training_checkpoint_safely(
+            model,
+            optimizer,
+            args.resume_ckpt,
+            scaler,
+            distributed,
+            rank,
+            world_size,
+            args.parallel_model_init,
+            args.min_free_host_memory_gb,
+        )
         if is_main:
             print(json.dumps({"resumed": args.resume_ckpt, "start_step": start_step}, sort_keys=True))
     model.train()
@@ -1053,6 +1285,11 @@ def main():
         "global_batch_size": int(args.batch_size) * int(world_size),
         "steps_per_epoch": len(loader),
         "ddp_find_unused_parameters": bool(args.ddp_find_unused_parameters),
+        "dist_timeout_seconds": int(args.dist_timeout_seconds),
+        "dataloader_timeout": int(args.dataloader_timeout),
+        "parallel_model_init": bool(args.parallel_model_init),
+        "min_free_disk_gb": float(args.min_free_disk_gb),
+        "min_free_host_memory_gb": float(args.min_free_host_memory_gb),
         "lidar_attention_mode": "local_reference",
         "lidar_fusion_mode": "ray_posterior",
         "lidar_geom_mode": LIDAR_GEOM_MODE,
@@ -1096,6 +1333,7 @@ def main():
     metrics_context = metrics_path.open(mode) if is_main else nullcontext(None)
     with metrics_context as metrics_file:
         window = new_metric_window()
+        last_saved_step = None
         for step in range(start_step + 1, args.steps + 1):
             batch_cpu, iterator, data_epoch = next_batch(
                 loader,
@@ -1112,6 +1350,11 @@ def main():
                         token_structure_loss = lidar_token_structure_loss_tensor(model)
                         token_structure_loss_contrib = (
                             float(args.lidar_token_structure_loss_weight) * token_structure_loss
+                        )
+                    if not synchronized_loss_finite(loss, distributed):
+                        raise FloatingPointError(
+                            f"Non-finite loss at step {step}; rank={rank}; "
+                            f"sample_ids={batch_sample_ids(batch_cpu)}"
                         )
                     scaler.scale(loss).backward()
                     break
@@ -1174,7 +1417,7 @@ def main():
                     "step": step,
                     "loss": scalar(loss),
                     "condition_mode": CONDITION_MODE,
-                    "lidar_fusion_mode": "ray_evidence",
+                    "lidar_fusion_mode": "ray_posterior",
                     "lidar_geom_mode": LIDAR_GEOM_MODE,
                     "ray_evidence_mask_mode": RAY_EVIDENCE_MASK_MODE,
                     "num_projected_lidar_points": int(batch.get("num_projected_lidar_points", torch.zeros(1, device=device)).sum().detach().cpu()),
@@ -1259,8 +1502,8 @@ def main():
             if args.save_every > 0 and step % args.save_every == 0:
                 distributed_barrier(distributed)
                 if is_main:
-                    save_checkpoint(
-                        ckpt_dir / f"step_{step:06d}.pt",
+                    _, save_stats = save_step_checkpoint(
+                        ckpt_dir,
                         model,
                         optimizer,
                         scaler,
@@ -1268,10 +1511,19 @@ def main():
                         args,
                         metadata,
                     )
-                    save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scaler, step, args, metadata)
+                    last_saved_step = step
                     removed = prune_step_checkpoints(ckpt_dir, args.keep_step_checkpoints)
-                    if removed:
-                        print(json.dumps({"pruned_checkpoints": removed, "step": step}, sort_keys=True))
+                    print(
+                        json.dumps(
+                            {
+                                "checkpoint_saved": True,
+                                "pruned_checkpoints": removed,
+                                "step": step,
+                                **save_stats,
+                            },
+                            sort_keys=True,
+                        )
+                    )
                 distributed_barrier(distributed)
             if int(args.sample_every) > 0 and step % int(args.sample_every) == 0:
                 distributed_barrier(distributed)
@@ -1285,10 +1537,40 @@ def main():
 
     distributed_barrier(distributed)
     if is_main:
-        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scaler, args.steps, args, metadata)
+        if last_saved_step != args.steps:
+            _, save_stats = save_step_checkpoint(
+                ckpt_dir,
+                model,
+                optimizer,
+                scaler,
+                args.steps,
+                args,
+                metadata,
+            )
+            removed = prune_step_checkpoints(ckpt_dir, args.keep_step_checkpoints)
+            print(
+                json.dumps(
+                    {
+                        "checkpoint_saved": True,
+                        "pruned_checkpoints": removed,
+                        "step": args.steps,
+                        **save_stats,
+                    },
+                    sort_keys=True,
+                )
+            )
         print(json.dumps({"complete": True, "last_ckpt": str(ckpt_dir / "last.pt"), "steps": args.steps}, sort_keys=True))
     distributed_barrier(distributed)
-    cleanup_distributed()
+
+
+def main():
+    args = parse_args()
+    try:
+        dist_info = init_distributed(args)
+        validate_runtime_args(args, dist_info["world_size"])
+        run_training(args, dist_info)
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
