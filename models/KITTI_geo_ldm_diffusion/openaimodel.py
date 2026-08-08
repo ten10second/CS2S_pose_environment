@@ -470,6 +470,11 @@ class UNetModel(nn.Module):
         ray_evidence_sat_bias=4.0,
         ray_evidence_lidar_bias=-4.0,
         ray_evidence_null_bias=-6.0,
+        ray_fusion_mode="ray_evidence",
+        use_lidar_ray_posterior=False,
+        lidar_posterior_log_depth_sigma=0.35,
+        lidar_posterior_strength=2.0,
+        lidar_message_gate_bias=-2.0,
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
     ):
@@ -514,6 +519,11 @@ class UNetModel(nn.Module):
         self.ray_evidence_sat_bias = float(ray_evidence_sat_bias)
         self.ray_evidence_lidar_bias = float(ray_evidence_lidar_bias)
         self.ray_evidence_null_bias = float(ray_evidence_null_bias)
+        self.ray_fusion_mode = str(ray_fusion_mode or "ray_evidence")
+        self.use_lidar_ray_posterior = bool(use_lidar_ray_posterior)
+        self.lidar_posterior_log_depth_sigma = float(lidar_posterior_log_depth_sigma)
+        self.lidar_posterior_strength = float(lidar_posterior_strength)
+        self.lidar_message_gate_bias = float(lidar_message_gate_bias)
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -579,6 +589,11 @@ class UNetModel(nn.Module):
                             ray_evidence_sat_bias=self.ray_evidence_sat_bias,
                             ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
                             ray_evidence_null_bias=self.ray_evidence_null_bias,
+                            ray_fusion_mode=self.ray_fusion_mode,
+                            use_lidar_ray_posterior=self.use_lidar_ray_posterior,
+                            lidar_posterior_log_depth_sigma=self.lidar_posterior_log_depth_sigma,
+                            lidar_posterior_strength=self.lidar_posterior_strength,
+                            lidar_message_gate_bias=self.lidar_message_gate_bias,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -645,6 +660,11 @@ class UNetModel(nn.Module):
                             ray_evidence_sat_bias=self.ray_evidence_sat_bias,
                             ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
                             ray_evidence_null_bias=self.ray_evidence_null_bias,
+                            ray_fusion_mode=self.ray_fusion_mode,
+                            use_lidar_ray_posterior=self.use_lidar_ray_posterior,
+                            lidar_posterior_log_depth_sigma=self.lidar_posterior_log_depth_sigma,
+                            lidar_posterior_strength=self.lidar_posterior_strength,
+                            lidar_message_gate_bias=self.lidar_message_gate_bias,
                         ),
             ResBlock(
                 ch,
@@ -710,6 +730,11 @@ class UNetModel(nn.Module):
                             ray_evidence_sat_bias=self.ray_evidence_sat_bias,
                             ray_evidence_lidar_bias=self.ray_evidence_lidar_bias,
                             ray_evidence_null_bias=self.ray_evidence_null_bias,
+                            ray_fusion_mode=self.ray_fusion_mode,
+                            use_lidar_ray_posterior=self.use_lidar_ray_posterior,
+                            lidar_posterior_log_depth_sigma=self.lidar_posterior_log_depth_sigma,
+                            lidar_posterior_strength=self.lidar_posterior_strength,
+                            lidar_message_gate_bias=self.lidar_message_gate_bias,
                         )
                     )
                 if level and i == num_res_blocks:

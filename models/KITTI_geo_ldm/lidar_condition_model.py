@@ -218,8 +218,17 @@ class LidarRangeTokenEncoder(nn.Module):
         lidar_points_mask: Optional[torch.Tensor] = None,
         lidar_point_features: Optional[torch.Tensor] = None,
         lidar_point_features_mask: Optional[torch.Tensor] = None,
+        lidar_ray_features: Optional[torch.Tensor] = None,
+        lidar_ray_features_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del lidar_points, lidar_points_mask, lidar_point_features, lidar_point_features_mask
+        del (
+            lidar_points,
+            lidar_points_mask,
+            lidar_point_features,
+            lidar_point_features_mask,
+            lidar_ray_features,
+            lidar_ray_features_mask,
+        )
         evidence_source = raw_lidar_cond if raw_lidar_cond is not None else lidar_cond
         front_input = lidar_cond.float()
         if self.use_evidence_maps:
@@ -655,7 +664,10 @@ class Lidar3DPointRayTokenEncoder(nn.Module):
         lidar_points_mask: Optional[torch.Tensor] = None,
         lidar_point_features: Optional[torch.Tensor] = None,
         lidar_point_features_mask: Optional[torch.Tensor] = None,
+        lidar_ray_features: Optional[torch.Tensor] = None,
+        lidar_ray_features_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        del lidar_ray_features, lidar_ray_features_mask
         del range_img, range_mask, camera_k, camera_to_lidar, image_size
         evidence_source = raw_lidar_cond if raw_lidar_cond is not None else lidar_cond
         batch_size = int(lidar_cond.shape[0])
@@ -695,6 +707,132 @@ class Lidar3DPointRayTokenEncoder(nn.Module):
         fixed_pos = self.coord_encoding_2d(
             self.token_grid[0],
             self.token_grid[1],
+            output_tokens.shape[-1],
+            device=output_tokens.device,
+            dtype=output_tokens.dtype,
+        )
+        return (
+            output_tokens
+            + self.pos_embed.to(device=output_tokens.device, dtype=output_tokens.dtype)
+            + float(self.fixed_coord_pos_scale) * fixed_pos
+        )
+
+
+class LidarRayDepthSemanticTokenEncoder(Lidar3DPointRayTokenEncoder):
+    """Compress offline full-scan 3D features into ray-depth semantic tokens."""
+
+    def __init__(self, ray_depth_bins: int = 4, **kwargs):
+        super().__init__(**kwargs)
+        if self.point_feature_dim <= 0:
+            raise ValueError("point_feature_dim must be positive for ray-depth semantic caches")
+        self.ray_depth_bins = int(ray_depth_bins)
+        hidden_channels = self.point_encoder[-1].out_features
+        self.depth_bin_embed = nn.Parameter(torch.zeros(1, self.ray_depth_bins, 1, 1, hidden_channels))
+        nn.init.normal_(self.depth_bin_embed, std=0.02)
+
+    def forward(
+        self,
+        lidar_cond: torch.Tensor,
+        raw_lidar_cond: Optional[torch.Tensor] = None,
+        range_img: Optional[torch.Tensor] = None,
+        range_mask: Optional[torch.Tensor] = None,
+        camera_k: Optional[torch.Tensor] = None,
+        camera_to_lidar: Optional[torch.Tensor] = None,
+        image_size: Optional[Tuple[int, int]] = None,
+        lidar_points: Optional[torch.Tensor] = None,
+        lidar_points_mask: Optional[torch.Tensor] = None,
+        lidar_point_features: Optional[torch.Tensor] = None,
+        lidar_point_features_mask: Optional[torch.Tensor] = None,
+        lidar_ray_features: Optional[torch.Tensor] = None,
+        lidar_ray_features_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del (
+            range_img,
+            range_mask,
+            camera_k,
+            camera_to_lidar,
+            image_size,
+            lidar_points,
+            lidar_points_mask,
+            lidar_point_features,
+            lidar_point_features_mask,
+        )
+        evidence_source = raw_lidar_cond if raw_lidar_cond is not None else lidar_cond
+        batch_size = int(lidar_cond.shape[0])
+        grid_h, grid_w = int(self.token_grid[0]), int(self.token_grid[1])
+        hidden_channels = self.point_encoder[-1].out_features
+        point_map = lidar_cond.new_zeros((batch_size, hidden_channels, grid_h, grid_w))
+        feature_valid_ratio = point_map.new_zeros(())
+        ray_coverage = point_map.new_zeros(())
+
+        if lidar_ray_features is not None:
+            features = lidar_ray_features.to(device=lidar_cond.device, dtype=lidar_cond.dtype)
+            if features.ndim != 5:
+                raise ValueError(f"lidar_ray_features must be [B,C,K,H,W], got {tuple(features.shape)}")
+            if features.shape[1] != self.point_feature_dim:
+                raise ValueError(
+                    f"lidar_ray_features channels {features.shape[1]} != {self.point_feature_dim}"
+                )
+            if features.shape[2] != self.ray_depth_bins:
+                raise ValueError(
+                    f"lidar_ray_features depth bins {features.shape[2]} != {self.ray_depth_bins}"
+                )
+            if lidar_ray_features_mask is None:
+                feature_mask = features.new_ones((features.shape[0], 1, *features.shape[2:]))
+            else:
+                feature_mask = lidar_ray_features_mask.to(device=features.device, dtype=features.dtype)
+                if feature_mask.ndim == 4:
+                    feature_mask = feature_mask.unsqueeze(1)
+                if feature_mask.shape[1] != 1 or feature_mask.shape[2:] != features.shape[2:]:
+                    raise ValueError(
+                        "lidar_ray_features_mask must be [B,1,K,H,W] matching lidar_ray_features"
+                    )
+                feature_mask = feature_mask.clamp(0.0, 1.0)
+            b, c, k, h, w = features.shape
+            encoded = self.point_feature_encoder(
+                features.permute(0, 2, 3, 4, 1).reshape(-1, c)
+            ).reshape(b, k, h, w, hidden_channels)
+            encoded = encoded + self.depth_bin_embed[:, :k].to(device=encoded.device, dtype=encoded.dtype)
+            mask_bkhw = feature_mask[:, 0].unsqueeze(-1)
+            encoded = (encoded * mask_bkhw).sum(dim=1) / mask_bkhw.sum(dim=1).clamp_min(1.0)
+            point_map = encoded.permute(0, 3, 1, 2).contiguous()
+            if point_map.shape[-2:] != (grid_h, grid_w):
+                point_map = F.interpolate(point_map, size=(grid_h, grid_w), mode="bilinear", align_corners=False)
+            feature_valid_ratio = feature_mask.mean()
+            ray_coverage = (feature_mask.sum(dim=2) > 0.0).to(features.dtype).mean()
+
+        maps = [point_map]
+        if self.use_evidence_maps:
+            evidence = self.make_evidence_maps(evidence_source)
+            maps.append(F.adaptive_avg_pool2d(evidence, self.token_grid).to(dtype=point_map.dtype))
+            self.last_hit_coverage.copy_(evidence[:, 1:2].mean().detach().to(self.last_hit_coverage.device))
+            self.last_empty_coverage.copy_(evidence[:, 5:6].mean().detach().to(self.last_empty_coverage.device))
+
+        tokens = self.token_proj(torch.cat(maps, dim=1)).flatten(2).transpose(1, 2)
+        output_tokens = tokens
+        if self.token_output_norm_mode == "center_layernorm":
+            output_tokens = output_tokens - output_tokens.mean(dim=1, keepdim=True)
+        if self.token_output_norm is not None:
+            output_tokens = self.token_output_norm(output_tokens)
+        self._record_token_stats(tokens, output_tokens)
+        self.last_point_feature_valid_ratio.copy_(
+            feature_valid_ratio.detach().to(self.last_point_feature_valid_ratio.device)
+        )
+        self.last_ray_token_coverage.copy_(ray_coverage.detach().to(self.last_ray_token_coverage.device))
+        self.last_pointmap_coverage.copy_(ray_coverage.detach().to(self.last_pointmap_coverage.device))
+        self.last_point_count_mean.copy_(
+            (ray_coverage * grid_h * grid_w).detach().to(self.last_point_count_mean.device)
+        )
+        self.last_valid_sample_ratio.copy_(
+            feature_valid_ratio.detach().to(self.last_valid_sample_ratio.device)
+        )
+        if self.semantic_head is not None:
+            self.last_semantic_pred_tokens = self.semantic_head(output_tokens)
+        else:
+            self.last_semantic_pred_tokens = None
+        fixed_pos = self.coord_encoding_2d(
+            grid_h,
+            grid_w,
             output_tokens.shape[-1],
             device=output_tokens.device,
             dtype=output_tokens.dtype,

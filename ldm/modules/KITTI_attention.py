@@ -157,13 +157,26 @@ class SpatialSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    def __init__(
+        self,
+        query_dim,
+        context_dim=None,
+        heads=8,
+        dim_head=64,
+        dropout=0.,
+        use_lidar_ray_posterior=False,
+        lidar_posterior_log_depth_sigma=0.35,
+        lidar_posterior_strength=2.0,
+    ):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
         self.scale = dim_head ** -0.5
         self.heads = heads
+        self.use_lidar_ray_posterior = bool(use_lidar_ray_posterior)
+        self.lidar_posterior_log_depth_sigma = float(lidar_posterior_log_depth_sigma)
+        self.lidar_posterior_strength = float(lidar_posterior_strength)
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
@@ -184,8 +197,116 @@ class CrossAttention(nn.Module):
         self.gen_KITTI_sat2grd = gen_KITTI_sat2grd()
         constant_init(self.sampling_offsets, 0.)
         constant_init(self.attention_weights, val=0., bias=0.)
+        self.register_buffer("last_ray_posterior_hit_coverage", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_ray_posterior_prior_entropy", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_ray_posterior_entropy", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_ray_posterior_weight_shift", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_ray_posterior_depth_error", torch.tensor(0.0), persistent=False)
 
-    def forward(self, x, context=None, mask=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+    @staticmethod
+    def _nearest_depth_for_query_grid(ray_depth_evidence, query_hw):
+        if ray_depth_evidence is None or ray_depth_evidence.ndim != 4 or ray_depth_evidence.shape[1] < 2:
+            return None, None
+        query_h, query_w = int(query_hw[0]), int(query_hw[1])
+        evidence = ray_depth_evidence.float()
+        depth = evidence[:, 0:1].clamp(0.0, 1.0)
+        hit = evidence[:, 1:2].clamp(0.0, 1.0)
+        pooled_hit = F.adaptive_max_pool2d(hit, (query_h, query_w))
+        sentinel = torch.full_like(depth, 2.0)
+        masked_depth = torch.where(hit > 0.0, depth, sentinel)
+        pooled_depth = -F.adaptive_max_pool2d(-masked_depth, (query_h, query_w))
+        pooled_depth = torch.where(pooled_hit > 0.0, pooled_depth, torch.zeros_like(pooled_depth))
+        return (
+            pooled_depth.flatten(2).squeeze(1),
+            pooled_hit.flatten(2).squeeze(1),
+        )
+
+    def _apply_lidar_ray_posterior(
+        self,
+        prior_logits,
+        candidate_depth,
+        candidate_valid,
+        ray_depth_evidence,
+        query_hw,
+    ):
+        prior_weights = prior_logits.softmax(dim=-1)
+        if (
+            not self.use_lidar_ray_posterior
+            or candidate_depth is None
+            or candidate_valid is None
+            or ray_depth_evidence is None
+        ):
+            self.last_ray_posterior_hit_coverage.zero_()
+            self.last_ray_posterior_weight_shift.zero_()
+            return prior_weights
+
+        observed_depth_norm, hit = self._nearest_depth_for_query_grid(ray_depth_evidence, query_hw)
+        if observed_depth_norm is None or observed_depth_norm.shape[1] != candidate_depth.shape[1]:
+            self.last_ray_posterior_hit_coverage.zero_()
+            self.last_ray_posterior_weight_shift.zero_()
+            return prior_weights
+
+        observed_depth = observed_depth_norm.to(candidate_depth.dtype) * 80.0
+        hit = hit.to(candidate_depth.dtype).clamp(0.0, 1.0)
+        sigma = max(float(self.lidar_posterior_log_depth_sigma), 1e-3)
+        candidate_depth_safe = candidate_depth.to(prior_logits.dtype).clamp_min(1e-3)
+        observed_depth_safe = observed_depth.to(prior_logits.dtype).clamp_min(1e-3)
+        log_error = torch.log(candidate_depth_safe) - torch.log(observed_depth_safe.unsqueeze(-1))
+        log_likelihood = (-0.5 * (log_error / sigma).square()).clamp(min=-12.0, max=0.0)
+        log_likelihood = torch.where(
+            candidate_valid.to(device=log_likelihood.device),
+            log_likelihood,
+            torch.full_like(log_likelihood, -12.0),
+        )
+        posterior_logits = prior_logits + (
+            float(self.lidar_posterior_strength)
+            * hit[:, None, :, None]
+            * log_likelihood[:, None, :, :]
+        )
+        posterior_weights = posterior_logits.softmax(dim=-1)
+
+        with torch.no_grad():
+            eps = 1e-8
+            prior_entropy = -(prior_weights.float().clamp_min(eps).log() * prior_weights.float()).sum(dim=-1)
+            posterior_entropy = -(
+                posterior_weights.float().clamp_min(eps).log() * posterior_weights.float()
+            ).sum(dim=-1)
+            hit_heads = hit[:, None, :].expand(-1, prior_logits.shape[1], -1)
+            denom = hit_heads.sum().clamp_min(1.0)
+            selected_depth = (
+                posterior_weights.float() * candidate_depth_safe[:, None].float()
+            ).sum(dim=-1)
+            depth_error = (
+                (torch.log(selected_depth.clamp_min(1e-3)) - torch.log(observed_depth_safe[:, None])).abs()
+                * hit_heads
+            ).sum() / denom
+            self.last_ray_posterior_hit_coverage.copy_(hit.float().mean().to(self.last_ray_posterior_hit_coverage.device))
+            self.last_ray_posterior_prior_entropy.copy_(
+                ((prior_entropy * hit_heads).sum() / denom).to(self.last_ray_posterior_prior_entropy.device)
+            )
+            self.last_ray_posterior_entropy.copy_(
+                ((posterior_entropy * hit_heads).sum() / denom).to(self.last_ray_posterior_entropy.device)
+            )
+            self.last_ray_posterior_weight_shift.copy_(
+                (
+                    ((posterior_weights - prior_weights).abs().mean(dim=-1) * hit_heads).sum()
+                    / denom
+                ).to(self.last_ray_posterior_weight_shift.device)
+            )
+            self.last_ray_posterior_depth_error.copy_(depth_error.to(self.last_ray_posterior_depth_error.device))
+        return posterior_weights
+
+    def forward(
+        self,
+        x,
+        context=None,
+        mask=None,
+        left_camera_k=None,
+        gt_shift_x=None,
+        gt_shift_y=None,
+        theta=None,
+        ray_depth_evidence=None,
+    ):
         if context == None:
             h = self.heads
             q = self.to_q(x)
@@ -213,7 +334,23 @@ class CrossAttention(nn.Module):
             bs, num_query, dim = x.shape
             feat_size = int(context.size(1) ** (1/2))
 
-            reference_points_rebatch = self.gen_KITTI_sat2grd.sat2grd_h(int(feat_size), int(num_query**(1/2)/2), int(num_query**(1/2)*2), left_camera_k, gt_shift_x, gt_shift_y, theta)
+            query_hw = (int(num_query**(1/2)/2), int(num_query**(1/2)*2))
+            hypotheses = self.gen_KITTI_sat2grd.sat2grd_h(
+                int(feat_size),
+                query_hw[0],
+                query_hw[1],
+                left_camera_k,
+                gt_shift_x,
+                gt_shift_y,
+                theta,
+                return_ray_hypotheses=self.use_lidar_ray_posterior,
+            )
+            if self.use_lidar_ray_posterior:
+                reference_points_rebatch, candidate_depth, candidate_valid = hypotheses
+            else:
+                reference_points_rebatch = hypotheses
+                candidate_depth = None
+                candidate_valid = None
             # reference_points_rebatch, indexes = CVUSA_grd2sat_uv_h(int(num_query**(1/2)/2), int(num_query**(1/2)*2), int(feat_size), int(feat_size), meter_per_pixel)
             reference_points_rebatch = reference_points_rebatch.to(x.device)
             #需要return out为b, 1024, 320 #1024 = 16*64
@@ -236,9 +373,16 @@ class CrossAttention(nn.Module):
             sampling_grids = sampling_grids.transpose(1, 3).flatten(0, 1) #bs*heads, num_points, 2
 
             _, x_len, _ = x.shape
-            attention_weights = self.attention_weights(x).view(bs, x_len, heads, self.num_points)
-            attention_weights = attention_weights.softmax(-1)
-            attention_weights = attention_weights.transpose(1, 2).reshape(bs, heads, x_len, self.num_points)#bs*heads, num_points
+            attention_logits = self.attention_weights(x).view(bs, x_len, heads, self.num_points)
+            attention_logits = attention_logits.transpose(1, 2)
+            attention_weights = self._apply_lidar_ray_posterior(
+                attention_logits,
+                candidate_depth,
+                candidate_valid,
+                ray_depth_evidence,
+                query_hw=query_hw,
+            )
+            attention_weights = attention_weights.reshape(bs, heads, x_len, self.num_points)#bs*heads, num_points
             
             bs, num_value, _ = cond_sat.shape
             value = self.value_proj(cond_sat)
@@ -753,6 +897,62 @@ class RayAlignedEvidenceAttention(nn.Module):
         return sat_null_ref + mask * lidar_correction
 
 
+class RayPosteriorEvidenceFusion(nn.Module):
+    """Preserve the posterior satellite path and add LiDAR as independent evidence."""
+
+    def __init__(self, dim, lidar_gate_bias=-2.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.lidar_gate = zero_module(nn.Linear(dim, 1))
+        nn.init.constant_(self.lidar_gate.bias, float(lidar_gate_bias))
+        self.register_buffer("last_lidar_confidence", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_lidar_mask_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_lidar_message_ratio", torch.tensor(0.0), persistent=False)
+
+    @staticmethod
+    def _prepare_mask(mask, x, query_hw=None):
+        if mask is None:
+            return x.new_zeros((x.shape[0], x.shape[1], 1))
+        if mask.dim() == 4:
+            if query_hw is None:
+                return x.new_zeros((x.shape[0], x.shape[1], 1))
+            mask = F.interpolate(mask.float(), size=query_hw, mode="area")
+            mask = rearrange(mask, "b c h w -> b (h w) c")
+        elif mask.dim() == 3:
+            if mask.shape[1] != x.shape[1] and mask.shape[-1] == x.shape[1]:
+                mask = mask.transpose(1, 2)
+            if mask.shape[-1] != 1:
+                mask = mask.mean(dim=-1, keepdim=True)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(-1)
+        else:
+            return x.new_zeros((x.shape[0], x.shape[1], 1))
+        if mask.shape[:2] != x.shape[:2]:
+            return x.new_zeros((x.shape[0], x.shape[1], 1))
+        return mask.to(device=x.device, dtype=x.dtype).clamp(0.0, 1.0)
+
+    def forward(self, x, sat_ref, lidar_ref, query_hw=None, lidar_geometry_mask=None):
+        if sat_ref is None:
+            sat_ref = torch.zeros_like(x)
+        if lidar_ref is None:
+            lidar_ref = torch.zeros_like(x)
+        geometry_confidence = self._prepare_mask(lidar_geometry_mask, x, query_hw=query_hw)
+        learned_confidence = torch.sigmoid(self.lidar_gate(self.norm(x + sat_ref + lidar_ref)))
+        lidar_confidence = geometry_confidence * learned_confidence
+        lidar_message = lidar_confidence * lidar_ref
+
+        with torch.no_grad():
+            self.last_lidar_confidence.copy_(
+                lidar_confidence.float().mean().to(self.last_lidar_confidence.device)
+            )
+            self.last_lidar_mask_mean.copy_(
+                geometry_confidence.float().mean().to(self.last_lidar_mask_mean.device)
+            )
+            ratio = lidar_message.float().norm(dim=-1).mean() / sat_ref.float().norm(dim=-1).mean().clamp_min(1e-6)
+            self.last_lidar_message_ratio.copy_(ratio.to(self.last_lidar_message_ratio.device))
+        return sat_ref + lidar_message
+
+
 class BasicTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -769,17 +969,33 @@ class BasicTransformerBlock(nn.Module):
         ray_evidence_sat_bias=4.0,
         ray_evidence_lidar_bias=-4.0,
         ray_evidence_null_bias=-6.0,
+        ray_fusion_mode="ray_evidence",
+        use_lidar_ray_posterior=False,
+        lidar_posterior_log_depth_sigma=0.35,
+        lidar_posterior_strength=2.0,
+        lidar_message_gate_bias=-2.0,
     ):
         super().__init__()
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
-                                    heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+        self.attn2 = CrossAttention(
+            query_dim=dim,
+            context_dim=context_dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+            use_lidar_ray_posterior=use_lidar_ray_posterior,
+            lidar_posterior_log_depth_sigma=lidar_posterior_log_depth_sigma,
+            lidar_posterior_strength=lidar_posterior_strength,
+        )  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
         self.use_lidar_cross_attention = bool(use_lidar_cross_attention)
+        self.ray_fusion_mode = str(ray_fusion_mode or "ray_evidence")
+        if self.ray_fusion_mode not in {"ray_evidence", "ray_posterior"}:
+            raise ValueError(f"Unsupported ray_fusion_mode: {self.ray_fusion_mode}")
         if self.use_lidar_cross_attention:
             self.norm_lidar = nn.LayerNorm(dim)
             self.norm_evidence = nn.LayerNorm(dim)
@@ -791,15 +1007,23 @@ class BasicTransformerBlock(nn.Module):
                 dropout=dropout,
                 reference_window=lidar_reference_window,
             )
-            self.ray_evidence_attn = RayAlignedEvidenceAttention(
-                dim=dim,
-                heads=n_heads,
-                dim_head=d_head,
-                dropout=dropout,
-                sat_bias=ray_evidence_sat_bias,
-                lidar_bias=ray_evidence_lidar_bias,
-                null_bias=ray_evidence_null_bias,
-            )
+            if self.ray_fusion_mode == "ray_posterior":
+                self.ray_evidence_attn = None
+                self.ray_posterior_fusion = RayPosteriorEvidenceFusion(
+                    dim=dim,
+                    lidar_gate_bias=lidar_message_gate_bias,
+                )
+            else:
+                self.ray_evidence_attn = RayAlignedEvidenceAttention(
+                    dim=dim,
+                    heads=n_heads,
+                    dim_head=d_head,
+                    dropout=dropout,
+                    sat_bias=ray_evidence_sat_bias,
+                    lidar_bias=ray_evidence_lidar_bias,
+                    null_bias=ray_evidence_null_bias,
+                )
+                self.ray_posterior_fusion = None
 
     def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
@@ -832,15 +1056,26 @@ class BasicTransformerBlock(nn.Module):
             gt_shift_x=gt_shift_x,
             gt_shift_y=gt_shift_y,
             theta=theta,
+            ray_depth_evidence=lidar_evidence,
         )
         lidar_delta = self.attn_lidar(self.norm_lidar(x_base), lidar_context, query_hw=latent_hw)
-        x = x_base + self.ray_evidence_attn(
-            self.norm_evidence(x_base),
-            sat_delta,
-            lidar_delta,
-            query_hw=latent_hw,
-            lidar_geometry_mask=lidar_geometry_mask,
-        )
+        if self.ray_fusion_mode == "ray_posterior":
+            fused_delta = self.ray_posterior_fusion(
+                self.norm_evidence(x_base),
+                sat_delta,
+                lidar_delta,
+                query_hw=latent_hw,
+                lidar_geometry_mask=lidar_geometry_mask,
+            )
+        else:
+            fused_delta = self.ray_evidence_attn(
+                self.norm_evidence(x_base),
+                sat_delta,
+                lidar_delta,
+                query_hw=latent_hw,
+                lidar_geometry_mask=lidar_geometry_mask,
+            )
+        x = x_base + fused_delta
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -868,6 +1103,11 @@ class SpatialTransformer(nn.Module):
         ray_evidence_sat_bias=4.0,
         ray_evidence_lidar_bias=-4.0,
         ray_evidence_null_bias=-6.0,
+        ray_fusion_mode="ray_evidence",
+        use_lidar_ray_posterior=False,
+        lidar_posterior_log_depth_sigma=0.35,
+        lidar_posterior_strength=2.0,
+        lidar_message_gate_bias=-2.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -894,6 +1134,11 @@ class SpatialTransformer(nn.Module):
                 ray_evidence_sat_bias=ray_evidence_sat_bias,
                 ray_evidence_lidar_bias=ray_evidence_lidar_bias,
                 ray_evidence_null_bias=ray_evidence_null_bias,
+                ray_fusion_mode=ray_fusion_mode,
+                use_lidar_ray_posterior=use_lidar_ray_posterior,
+                lidar_posterior_log_depth_sigma=lidar_posterior_log_depth_sigma,
+                lidar_posterior_strength=lidar_posterior_strength,
+                lidar_message_gate_bias=lidar_message_gate_bias,
             )
                 for d in range(depth)]
         )

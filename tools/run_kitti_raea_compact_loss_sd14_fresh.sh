@@ -16,11 +16,10 @@ else
     exit 2
 fi
 DATA_ROOT="${DATA_ROOT:-/media/shizhm/sda2/CS2S_results}"
-KITTI_ROOT="${KITTI_ROOT:-$(dirname "${DATA_ROOT}")/KITTI_RAW}"
-MANIFEST_ROOT="${MANIFEST_ROOT:-${DATA_ROOT}/kitti_raw_manifests}"
-CACHE_ROOT="${CACHE_ROOT:-${HOME}/CS2S_cache_memmap}"
-RUN_ROOT="${RUN_ROOT:-${DATA_ROOT}/kitti_raea_utonia_dino_curriculum}"
-RUN_NAME="${RUN_NAME:-raea_utonia_dino_sd14_fresh_compactloss_full100_$(date +%Y%m%d_%H%M%S)}"
+KITTI_ROOT="${KITTI_ROOT:-/media/shizhm/Lenovo/KITTI_RAW}"
+CACHE_ROOT="${CACHE_ROOT:-/media/shizhm/sda2/CS2S_cache_memmap}"
+RUN_ROOT="${RUN_ROOT:-${DATA_ROOT}/kitti_ray_posterior}"
+RUN_NAME="${RUN_NAME:-ray_posterior_utonia_dino_sd14_fresh_$(date +%Y%m%d_%H%M%S)}"
 TARGET_STEP="${TARGET_STEP:-500000}"
 SAVE_EVERY="${SAVE_EVERY:-10000}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-2500}"
@@ -28,11 +27,11 @@ NUM_GPUS="${NUM_GPUS:-1}"
 BATCH_PER_GPU="${BATCH_PER_GPU:-2}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-2}"
 LR="${LR:-1e-5}"
-TRAIN_MANIFEST="${TRAIN_MANIFEST:-${MANIFEST_ROOT}/geofence_test2_buffer30_train_sda2_raw.jsonl}"
-VAL_MANIFEST="${VAL_MANIFEST:-${MANIFEST_ROOT}/geofence_test2_buffer30_test_sda2_raw.jsonl}"
+TRAIN_MANIFEST="${TRAIN_MANIFEST:-${ROOT}/dataset/kitti_raw_sat_lidar/train_manifest.jsonl}"
+VAL_MANIFEST="${VAL_MANIFEST:-${ROOT}/dataset/kitti_raw_sat_lidar/test2_manifest.jsonl}"
 SAMPLE_MANIFEST="${SAMPLE_MANIFEST:-${VAL_MANIFEST}}"
 SD_BASE_CKPT="${SD_BASE_CKPT:-${HOME}/Downloads/sd-v1-4.ckpt}"
-LIDAR_CACHE_ROOT="${LIDAR_CACHE_ROOT:-${CACHE_ROOT}/utonia_4096_all_fp16}"
+LIDAR_CACHE_ROOT="${LIDAR_CACHE_ROOT:-${CACHE_ROOT}/utonia_ray_depth_all_fp16}"
 DINO_CACHE_ROOT="${DINO_CACHE_ROOT:-${CACHE_ROOT}/dino_vits14_8x32_all_fp16}"
 RESUME_CKPT="${RESUME_CKPT:-}"
 
@@ -121,7 +120,7 @@ exec env PYTHONUNBUFFERED=1 "${LAUNCH[@]}" tools/train_kitti_raea.py \
     --sample-ddim-steps 50 \
     --sample-probes normal \
     --keep-step-checkpoints 3 \
-    --lidar-point-feature-cache-root "${LIDAR_CACHE_ROOT}" \
+    --lidar-ray-feature-cache-root "${LIDAR_CACHE_ROOT}" \
     --image-semantic-cache-root "${DINO_CACHE_ROOT}" \
     --lidar-support-loss-weight 1.0 \
     --lidar-support-dilation 8 \
@@ -129,7 +128,4 @@ exec env PYTHONUNBUFFERED=1 "${LAUNCH[@]}" tools/train_kitti_raea.py \
     --lidar-semantic-alignment-weight 0.2 \
     --lidar-token-structure-target-ratio 0.08 \
     --lidar-token-structure-loss-weight 0.01 \
-    --lidar-reference-window 3 \
-    --ray-evidence-sat-bias 2.0 \
-    --ray-evidence-lidar-bias -2.0 \
-    --ray-evidence-null-bias -6.0
+    --lidar-reference-window 3

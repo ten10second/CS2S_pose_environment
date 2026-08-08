@@ -21,12 +21,17 @@ from utils.util import instantiate_from_config  # noqa: E402
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate KITTI RAEA samples from a current checkpoint.")
+    parser = argparse.ArgumentParser(description="Generate KITTI ray-posterior samples from a current checkpoint.")
     parser.add_argument("--config", default="configs/Boost_Sat2Den/train/KITTI_raw_sat_lidar_raea.yaml")
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument(
+        "--kitti-root",
+        default="",
+        help="Optional KITTI_RAW root used to rebase paths stored in the manifest.",
+    )
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--lidar-point-feature-cache-root", required=True)
+    parser.add_argument("--lidar-ray-feature-cache-root", required=True)
     parser.add_argument("--image-semantic-cache-root", required=True)
     parser.add_argument("--num-samples", type=int, default=6)
     parser.add_argument("--ddim-steps", type=int, default=50)
@@ -80,13 +85,13 @@ def load_checkpoint_into_model(model, ckpt_path):
     missing = sorted(required.difference(payload))
     if missing:
         raise RuntimeError(
-            "Checkpoint is not a current fresh-RAEA checkpoint; "
+            "Checkpoint is not a current ray-posterior checkpoint; "
             f"missing keys: {missing}"
         )
     model.DDPM.denoise_model.load_state_dict(payload["denoise_model"], strict=True)
     model.condition_model_sat.load_state_dict(payload["condition_model_sat"], strict=True)
     if model.lidar_context_model is None:
-        raise RuntimeError("Current RAEA model is missing lidar_context_model")
+        raise RuntimeError("Current ray-posterior model is missing lidar_context_model")
     model.lidar_context_model.load_state_dict(payload["lidar_context_model"], strict=True)
     del payload
     gc.collect()
@@ -123,7 +128,7 @@ def make_lidar_geometry_mask_for_sampling(model, lidar_evidence):
         return None
     if mode == "lidar_hit" and lidar_evidence is not None and lidar_evidence.shape[1] > 1:
         return lidar_evidence[:, 1:2]
-    raise ValueError(f"Unsupported or unavailable RAEA geometry mask mode: {mode}")
+    raise ValueError(f"Unsupported or unavailable ray-posterior geometry mask mode: {mode}")
 
 
 def lidar_attention_stats(model):
@@ -147,6 +152,14 @@ def lidar_attention_stats(model):
     evidence_lidar_max = []
     evidence_null = []
     evidence_entropy = []
+    posterior_hit = []
+    posterior_prior_entropy = []
+    posterior_entropy = []
+    posterior_weight_shift = []
+    posterior_depth_error = []
+    posterior_lidar_confidence = []
+    posterior_lidar_mask = []
+    posterior_lidar_message_ratio = []
     denoise_model = getattr(getattr(model, "DDPM", None), "denoise_model", None)
     if denoise_model is None:
         return {
@@ -217,8 +230,44 @@ def lidar_attention_stats(model):
                 if torch.is_tensor(value):
                     value = float(value.detach().float().cpu())
                 values.append(float(value))
+        if bool(getattr(module, "use_lidar_ray_posterior", False)) and hasattr(
+            module, "last_ray_posterior_hit_coverage"
+        ):
+            for values, attr in [
+                (posterior_hit, "last_ray_posterior_hit_coverage"),
+                (posterior_prior_entropy, "last_ray_posterior_prior_entropy"),
+                (posterior_entropy, "last_ray_posterior_entropy"),
+                (posterior_weight_shift, "last_ray_posterior_weight_shift"),
+                (posterior_depth_error, "last_ray_posterior_depth_error"),
+            ]:
+                value = getattr(module, attr)
+                if torch.is_tensor(value):
+                    value = float(value.detach().float().cpu())
+                values.append(float(value))
+        if module.__class__.__name__ == "RayPosteriorEvidenceFusion":
+            for values, attr in [
+                (posterior_lidar_confidence, "last_lidar_confidence"),
+                (posterior_lidar_mask, "last_lidar_mask_mean"),
+                (posterior_lidar_message_ratio, "last_lidar_message_ratio"),
+            ]:
+                value = getattr(module, attr)
+                if torch.is_tensor(value):
+                    value = float(value.detach().float().cpu())
+                values.append(float(value))
+
+    posterior_stats = {
+        "ray_posterior_modules": int(len(posterior_hit)),
+        "ray_posterior_hit_coverage_mean": sum(posterior_hit) / float(len(posterior_hit)) if posterior_hit else 0.0,
+        "ray_posterior_prior_entropy_mean": sum(posterior_prior_entropy) / float(len(posterior_prior_entropy)) if posterior_prior_entropy else 0.0,
+        "ray_posterior_entropy_mean": sum(posterior_entropy) / float(len(posterior_entropy)) if posterior_entropy else 0.0,
+        "ray_posterior_weight_shift_mean": sum(posterior_weight_shift) / float(len(posterior_weight_shift)) if posterior_weight_shift else 0.0,
+        "ray_posterior_depth_log_error_mean": sum(posterior_depth_error) / float(len(posterior_depth_error)) if posterior_depth_error else 0.0,
+        "ray_posterior_lidar_confidence_mean": sum(posterior_lidar_confidence) / float(len(posterior_lidar_confidence)) if posterior_lidar_confidence else 0.0,
+        "ray_posterior_lidar_mask_mean": sum(posterior_lidar_mask) / float(len(posterior_lidar_mask)) if posterior_lidar_mask else 0.0,
+        "ray_posterior_lidar_message_ratio_mean": sum(posterior_lidar_message_ratio) / float(len(posterior_lidar_message_ratio)) if posterior_lidar_message_ratio else 0.0,
+    }
     if not entropy:
-        return {
+        stats = {
             "lidar_attn_modules": 0,
             "lidar_sim_std_mean": 0.0,
             "lidar_sim_range_mean": 0.0,
@@ -236,8 +285,10 @@ def lidar_attention_stats(model):
             "ray_evidence_null_weight_mean": sum(evidence_null) / float(len(evidence_null)) if evidence_null else 0.0,
             "ray_evidence_entropy_norm_mean": sum(evidence_entropy) / float(len(evidence_entropy)) if evidence_entropy else 0.0,
         }
+        stats.update(posterior_stats)
+        return stats
     count = float(len(entropy))
-    return {
+    stats = {
         "lidar_attn_modules": int(len(entropy)),
         "lidar_sim_std_mean": sum(sim_std) / count,
         "lidar_sim_range_mean": sum(sim_range) / count,
@@ -261,6 +312,8 @@ def lidar_attention_stats(model):
         "ray_evidence_null_weight_mean": sum(evidence_null) / float(len(evidence_null)) if evidence_null else 0.0,
         "ray_evidence_entropy_norm_mean": sum(evidence_entropy) / float(len(evidence_entropy)) if evidence_entropy else 0.0,
     }
+    stats.update(posterior_stats)
+    return stats
 
 
 def empty_token_structure_stats(prefix):
@@ -436,6 +489,10 @@ def generate_prediction(
     lidar_point_features_mask = (
         batch["lidar_point_features_mask"].cuda().float() if "lidar_point_features_mask" in batch else None
     )
+    lidar_ray_features = batch["lidar_ray_features"].cuda().float() if "lidar_ray_features" in batch else None
+    lidar_ray_features_mask = (
+        batch["lidar_ray_features_mask"].cuda().float() if "lidar_ray_features_mask" in batch else None
+    )
     camera_to_lidar = model.get_input(batch, "camera_to_lidar").squeeze(-1).cuda()
     left_camera_k = model.get_input(batch, "left_camera_k").squeeze(-1).cuda()
     gt_shift_x = batch["gt_shift_x"].cuda()
@@ -449,6 +506,8 @@ def generate_prediction(
     lidar_points_mask = apply_probe_tensor(lidar_points_mask, probe)
     lidar_point_features = apply_probe_tensor(lidar_point_features, probe)
     lidar_point_features_mask = apply_probe_tensor(lidar_point_features_mask, probe)
+    lidar_ray_features = apply_probe_tensor(lidar_ray_features, probe)
+    lidar_ray_features_mask = apply_probe_tensor(lidar_ray_features_mask, probe)
 
     inputs = inputs * 2 - 1
     outputs = outputs * 2 - 1
@@ -463,6 +522,8 @@ def generate_prediction(
         lidar_points_mask=lidar_points_mask,
         lidar_point_features=lidar_point_features,
         lidar_point_features_mask=lidar_point_features_mask,
+        lidar_ray_features=lidar_ray_features,
+        lidar_ray_features_mask=lidar_ray_features_mask,
     )
     lidar_evidence = model.make_lidar_evidence(lidar_cond)
     lidar_geometry_mask = make_lidar_geometry_mask_for_sampling(model, lidar_evidence)
@@ -512,6 +573,7 @@ def main():
 
     dataset = SatLidarRawDataset(
         manifest=args.manifest,
+        kitti_root=args.kitti_root,
         condition_mode=str(cfg_value("condition_mode", "raw_lidar_pointmap")),
         image_height=128,
         image_width=512,
@@ -519,11 +581,13 @@ def main():
         max_depth=80.0,
         align_satellite_to_camera=True,
         include_range_image=True,
-        include_raw_lidar_points=True,
-        raw_lidar_point_count=int(cfg_value("raw_lidar_point_count", 4096)),
-        lidar_point_feature_cache_root=args.lidar_point_feature_cache_root,
-        lidar_point_feature_cache_suffix=str(cfg_value("lidar_point_feature_cache_suffix", ".npz")),
-        lidar_point_feature_dim=int(cfg_value("lidar_point_feature_dim", 576)),
+        include_raw_lidar_points=False,
+        lidar_ray_feature_cache_root=args.lidar_ray_feature_cache_root,
+        lidar_ray_feature_cache_suffix=str(cfg_value("lidar_ray_feature_cache_suffix", ".npz")),
+        lidar_ray_feature_dim=int(cfg_value("lidar_ray_feature_dim", 576)),
+        lidar_ray_depth_bins=int(cfg_value("lidar_ray_depth_bins", 4)),
+        lidar_ray_height=int(cfg_value("lidar_ray_height", 8)),
+        lidar_ray_width=int(cfg_value("lidar_ray_width", 32)),
         image_semantic_cache_root=args.image_semantic_cache_root,
         image_semantic_cache_suffix=str(cfg_value("image_semantic_cache_suffix", ".npz")),
         image_semantic_feature_key=str(cfg_value("image_semantic_feature_key", "dino_feat")),

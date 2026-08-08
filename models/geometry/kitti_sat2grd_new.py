@@ -247,7 +247,17 @@ class gen_KITTI_sat2grd():
         out_val = (nw_val * nw + ne_val * ne + sw_val * sw + se_val * se)
         return out_val, None
     
-    def sat2grd_h(self, sat_feat_A, gen_grd_H, gen_grd_W, left_camera_k, shift_u=None, shift_v=None, heading=None):
+    def sat2grd_h(
+        self,
+        sat_feat_A,
+        gen_grd_H,
+        gen_grd_W,
+        left_camera_k,
+        shift_u=None,
+        shift_v=None,
+        heading=None,
+        return_ray_hypotheses=False,
+    ):
         ori_grdH = 128
         ori_grdW = 512
         # _,C, grd_H, grd_W = grd_feat.size()
@@ -256,6 +266,11 @@ class gen_KITTI_sat2grd():
         A = sat_feat_A
         xyz_grd, mask, xyz_w = self.grd_img2cam_h(gen_grd_H, gen_grd_W, ori_grdH, ori_grdW, left_camera_k)
         uv, _ = self.grd2cam2world2sat_h(xyz_grd, shift_u, shift_v, heading, 0, A)
+
+        # K^{-1}[u,v,1] has unit camera-z, so the z coordinate of each
+        # plane intersection is the metric depth of that ray hypothesis.
+        candidate_depth = xyz_grd[..., 2]
+        candidate_valid = mask > 0.0
 
         uv = uv.reshape(B, 8, gen_grd_H*gen_grd_W, 2)
         uv[..., 0] /= A #sat size
@@ -271,7 +286,13 @@ class gen_KITTI_sat2grd():
             indexes.append(index_query_per_img) 
 
         max_len = max([len(each) for each in indexes])
-        return uv.transpose(1,2)
+        uv = uv.transpose(1, 2)
+        if not return_ray_hypotheses:
+            return uv
+        candidate_depth = candidate_depth.reshape(B, 8, gen_grd_H * gen_grd_W).transpose(1, 2)
+        candidate_valid = candidate_valid.reshape(B, 8, gen_grd_H * gen_grd_W).transpose(1, 2)
+        candidate_valid = candidate_valid & bev_mask.reshape(B, 8, gen_grd_H * gen_grd_W).transpose(1, 2)
+        return uv, candidate_depth, candidate_valid
 
         
     

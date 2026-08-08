@@ -432,6 +432,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         lidar_points_mask=None,
         lidar_point_features=None,
         lidar_point_features_mask=None,
+        lidar_ray_features=None,
+        lidar_ray_features_mask=None,
     ):
         if self.lidar_context_model is None or lidar_cond is None:
             return None
@@ -447,6 +449,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             lidar_points_mask=lidar_points_mask,
             lidar_point_features=lidar_point_features,
             lidar_point_features_mask=lidar_point_features_mask,
+            lidar_ray_features=lidar_ray_features,
+            lidar_ray_features_mask=lidar_ray_features_mask,
         )
 
     def lidar_semantic_alignment_loss(
@@ -575,6 +579,16 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         if hasattr(self.lidar_context_model, "make_evidence_maps"):
             return self.lidar_context_model.make_evidence_maps(lidar_cond)
         return None
+
+    def make_lidar_geometry_mask(self, lidar_evidence, foreground_loss_mask=None):
+        mode = str(getattr(self.DDPM, "ray_evidence_mask_mode", "lidar_hit") or "lidar_hit")
+        if mode == "none":
+            return None
+        if mode == "lidar_hit" and lidar_evidence is not None and lidar_evidence.shape[1] > 1:
+            return lidar_evidence[:, 1:2]
+        if mode == "foreground":
+            return foreground_loss_mask
+        raise ValueError(f"Unsupported or unavailable LiDAR geometry mask mode: {mode}")
 
     def lidar_counterfactual_probe_names(self):
         probes = [item.strip() for item in self.lidar_counterfactual_probes.split(",") if item.strip()]
@@ -708,6 +722,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         lidar_points_mask,
         lidar_point_features,
         lidar_point_features_mask,
+        lidar_ray_features,
+        lidar_ray_features_mask,
         gt_shift_x,
         gt_shift_y,
         theta,
@@ -761,6 +777,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         zero_lidar_points_mask = self.apply_lidar_counterfactual_probe(lidar_points_mask, "zero")
         zero_lidar_point_features = self.apply_lidar_counterfactual_probe(lidar_point_features, "zero")
         zero_lidar_point_features_mask = self.apply_lidar_counterfactual_probe(lidar_point_features_mask, "zero")
+        zero_lidar_ray_features = self.apply_lidar_counterfactual_probe(lidar_ray_features, "zero")
+        zero_lidar_ray_features_mask = self.apply_lidar_counterfactual_probe(lidar_ray_features_mask, "zero")
         stop_negative = (
             self.lidar_counterfactual_stop_negative
             and not needs_zero_reconstruction
@@ -777,6 +795,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 lidar_points_mask=zero_lidar_points_mask,
                 lidar_point_features=zero_lidar_point_features,
                 lidar_point_features_mask=zero_lidar_point_features_mask,
+                lidar_ray_features=zero_lidar_ray_features,
+                lidar_ray_features_mask=zero_lidar_ray_features_mask,
             )
             zero_lidar_evidence = self.make_lidar_evidence(zero_lidar_cond)
             zero_outputs = self.DDPM.p_losses(
@@ -1113,6 +1133,16 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             if self.use_lidar_cond and "lidar_point_features_mask" in batch
             else None
         )
+        lidar_ray_features = (
+            batch["lidar_ray_features"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_ray_features" in batch
+            else None
+        )
+        lidar_ray_features_mask = (
+            batch["lidar_ray_features_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_ray_features_mask" in batch
+            else None
+        )
         camera_to_lidar = (
             self.get_input(batch, "camera_to_lidar").squeeze(-1)
             if self.use_lidar_cond and "camera_to_lidar" in batch
@@ -1140,6 +1170,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             lidar_points_mask=lidar_points_mask,
             lidar_point_features=lidar_point_features,
             lidar_point_features_mask=lidar_point_features_mask,
+            lidar_ray_features=lidar_ray_features,
+            lidar_ray_features_mask=lidar_ray_features_mask,
         )
         semantic_pred_tokens = (
             getattr(self.lidar_context_model, "last_semantic_pred_tokens", None)
@@ -1286,6 +1318,8 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 lidar_points_mask,
                 lidar_point_features,
                 lidar_point_features_mask,
+                lidar_ray_features,
+                lidar_ray_features_mask,
                 gt_shift_x,
                 gt_shift_y,
                 theta,
@@ -1331,6 +1365,16 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             if self.use_lidar_cond and "lidar_point_features_mask" in batch
             else None
         )
+        lidar_ray_features = (
+            batch["lidar_ray_features"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_ray_features" in batch
+            else None
+        )
+        lidar_ray_features_mask = (
+            batch["lidar_ray_features_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_ray_features_mask" in batch
+            else None
+        )
         camera_to_lidar = (
             self.get_input(batch, "camera_to_lidar").squeeze(-1)
             if self.use_lidar_cond and "camera_to_lidar" in batch
@@ -1359,8 +1403,11 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             lidar_points_mask=lidar_points_mask,
             lidar_point_features=lidar_point_features,
             lidar_point_features_mask=lidar_point_features_mask,
+            lidar_ray_features=lidar_ray_features,
+            lidar_ray_features_mask=lidar_ray_features_mask,
         )
         lidar_evidence = self.make_lidar_evidence(lidar_cond)
+        lidar_geometry_mask = self.make_lidar_geometry_mask(lidar_evidence)
         sampler = KITTI_DDIMSampler(self.DDPM, self.pre_AE_model, self.scale_factor)
         n_samples = outputs.size()[0] 
         shape = [1, 4, 16, 64] 
@@ -1386,6 +1433,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                                         range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar,
                                         lidar_context=lidar_context,
                                         lidar_evidence=lidar_evidence,
+                                        lidar_geometry_mask=lidar_geometry_mask,
                                         cond_init_grd = None)
         
         samples_ddim = samples_ddim * (1 / self.scale_factor)
@@ -1505,6 +1553,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                     ".attn_lidar." in name
                     or ".norm_lidar." in name
                     or ".ray_evidence_attn." in name
+                    or ".ray_posterior_fusion." in name
                     or ".evidence_router." in name
                     or ".lidar_depth_head." in name
                     or ".lidar_bottleneck_depth_head." in name
@@ -1592,6 +1641,16 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             if self.use_lidar_cond and "lidar_point_features_mask" in batch
             else None
         )
+        lidar_ray_features = (
+            batch["lidar_ray_features"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_ray_features" in batch
+            else None
+        )
+        lidar_ray_features_mask = (
+            batch["lidar_ray_features_mask"].to(outputs.device).float()
+            if self.use_lidar_cond and "lidar_ray_features_mask" in batch
+            else None
+        )
         camera_to_lidar = (
             self.get_input(batch, "camera_to_lidar").squeeze(-1)
             if self.use_lidar_cond and "camera_to_lidar" in batch
@@ -1619,8 +1678,11 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             lidar_points_mask=lidar_points_mask,
             lidar_point_features=lidar_point_features,
             lidar_point_features_mask=lidar_point_features_mask,
+            lidar_ray_features=lidar_ray_features,
+            lidar_ray_features_mask=lidar_ray_features_mask,
         )
         lidar_evidence = self.make_lidar_evidence(lidar_cond)
+        lidar_geometry_mask = self.make_lidar_geometry_mask(lidar_evidence)
         sampler = KITTI_DDIMSampler(self.DDPM, self.pre_AE_model, self.scale_factor)
 
         n_samples = outputs.size()[0]
@@ -1647,6 +1709,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                                         range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar,
                                         lidar_context=lidar_context,
                                         lidar_evidence=lidar_evidence,
+                                        lidar_geometry_mask=lidar_geometry_mask,
                                         cond_init_grd = None)
         
         samples_ddim = samples_ddim * (1 / self.scale_factor)

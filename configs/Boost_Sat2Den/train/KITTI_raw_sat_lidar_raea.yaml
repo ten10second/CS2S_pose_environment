@@ -49,9 +49,11 @@ model:
             legacy: false
             use_lidar_cross_attention: true
             lidar_context_dim: 768
-            ray_evidence_sat_bias: 2.0
-            ray_evidence_lidar_bias: -2.0
-            ray_evidence_null_bias: -6.0
+            ray_fusion_mode: ray_posterior
+            use_lidar_ray_posterior: true
+            lidar_posterior_log_depth_sigma: 0.35
+            lidar_posterior_strength: 2.0
+            lidar_message_gate_bias: -2.0
             lidar_reference_window: 3
         control_grd: null
     Condition_config_grd:
@@ -59,7 +61,7 @@ model:
     Condition_config_sat:
       target: models.KITTI_geo_ldm.condition_model.VIT_224
     Lidar_context_config:
-      target: models.KITTI_geo_ldm.lidar_condition_model.Lidar3DPointRayTokenEncoder
+      target: models.KITTI_geo_ldm.lidar_condition_model.LidarRayDepthSemanticTokenEncoder
       params:
         point_in_channels: 10
         front_in_channels: 5
@@ -73,6 +75,7 @@ model:
         use_pointmap_pe: true
         point_feature_dim: 576
         semantic_feature_dim: 384
+        ray_depth_bins: 4
         token_output_norm: center_layernorm
         token_structure_target_ratio: 0.08
     pre_sat2grd_model_path:
@@ -109,9 +112,11 @@ data:
         max_depth: 80.0
         align_satellite_to_camera: true
         include_range_image: true
-        include_raw_lidar_points: true
-        raw_lidar_point_count: 4096
-        lidar_point_feature_dim: 576
+        include_raw_lidar_points: false
+        lidar_ray_feature_dim: 576
+        lidar_ray_depth_bins: 4
+        lidar_ray_height: 8
+        lidar_ray_width: 32
         image_semantic_feature_key: dino_feat
         image_semantic_feature_dim: 384
         image_semantic_height: 8

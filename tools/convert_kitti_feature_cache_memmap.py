@@ -12,11 +12,13 @@ POINT_FEATURE_KEY = "utonia_feat"
 POINT_MASK_KEY = "lidar_point_features_mask"
 IMAGE_FEATURE_KEY = "dino_feat"
 IMAGE_MASK_KEY = "image_semantic_mask"
+RAY_FEATURE_KEY = "utonia_ray_feat"
+RAY_MASK_KEY = "utonia_ray_mask"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert KITTI feature NPZ files to float16 NPY memmaps.")
-    parser.add_argument("--kind", choices=["point", "image"], required=True)
+    parser.add_argument("--kind", choices=["point", "image", "ray"], required=True)
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--point-count", type=int, default=4096)
@@ -24,6 +26,9 @@ def parse_args():
     parser.add_argument("--image-channels", type=int, default=384)
     parser.add_argument("--image-height", type=int, default=8)
     parser.add_argument("--image-width", type=int, default=32)
+    parser.add_argument("--ray-depth-bins", type=int, default=4)
+    parser.add_argument("--ray-height", type=int, default=8)
+    parser.add_argument("--ray-width", type=int, default=32)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--workers", type=int, default=4)
@@ -63,6 +68,16 @@ def normalize_image(payload, feature_shape, mask_shape):
     return features, mask
 
 
+def normalize_ray(payload, feature_shape, mask_shape):
+    features = required_array(payload, RAY_FEATURE_KEY)
+    mask = required_array(payload, RAY_MASK_KEY)
+    if tuple(features.shape) != tuple(feature_shape):
+        raise ValueError(f"Utonia ray feature shape {features.shape} != expected {feature_shape}")
+    if tuple(mask.shape) != tuple(mask_shape):
+        raise ValueError(f"Utonia ray mask shape {mask.shape} != expected {mask_shape}")
+    return features.astype(np.float16), (mask > 0.5).astype(np.uint8)
+
+
 def load_and_normalize(path, normalize, feature_shape, mask_shape):
     with np.load(path, allow_pickle=False) as payload:
         return normalize(payload, feature_shape, mask_shape)
@@ -83,10 +98,19 @@ def main():
         feature_shape = (int(args.point_count), int(args.point_dim))
         mask_shape = (int(args.point_count),)
         normalize = normalize_point
-    else:
+    elif args.kind == "image":
         feature_shape = (int(args.image_channels), int(args.image_height), int(args.image_width))
         mask_shape = (1, int(args.image_height), int(args.image_width))
         normalize = normalize_image
+    else:
+        feature_shape = (
+            int(args.point_dim),
+            int(args.ray_depth_bins),
+            int(args.ray_height),
+            int(args.ray_width),
+        )
+        mask_shape = (1, int(args.ray_depth_bins), int(args.ray_height), int(args.ray_width))
+        normalize = normalize_ray
 
     features_path = output_root / "features.npy"
     masks_path = output_root / "masks.npy"

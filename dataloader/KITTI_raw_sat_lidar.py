@@ -98,6 +98,12 @@ class SatLidarRawDataset(Dataset):
         lidar_point_feature_cache_root: str = "",
         lidar_point_feature_cache_suffix: str = ".npz",
         lidar_point_feature_dim: int = 0,
+        lidar_ray_feature_cache_root: str = "",
+        lidar_ray_feature_cache_suffix: str = ".npz",
+        lidar_ray_feature_dim: int = 0,
+        lidar_ray_depth_bins: int = 4,
+        lidar_ray_height: int = 8,
+        lidar_ray_width: int = 32,
         image_semantic_cache_root: str = "",
         image_semantic_cache_suffix: str = ".npz",
         image_semantic_feature_key: str = "image_semantic_feat",
@@ -131,6 +137,18 @@ class SatLidarRawDataset(Dataset):
         )
         self.lidar_point_feature_cache_suffix = lidar_point_feature_cache_suffix
         self.lidar_point_feature_dim = int(lidar_point_feature_dim)
+        self.lidar_ray_feature_cache_root = (
+            Path(lidar_ray_feature_cache_root) if lidar_ray_feature_cache_root else None
+        )
+        self.lidar_ray_feature_cache_suffix = lidar_ray_feature_cache_suffix
+        self.lidar_ray_feature_dim = int(lidar_ray_feature_dim)
+        self.lidar_ray_feature_shape = (
+            self.lidar_ray_feature_dim,
+            int(lidar_ray_depth_bins),
+            int(lidar_ray_height),
+            int(lidar_ray_width),
+        )
+        self.lidar_ray_mask_shape = (1, *self.lidar_ray_feature_shape[1:])
         self.image_semantic_cache_root = Path(image_semantic_cache_root) if image_semantic_cache_root else None
         self.image_semantic_cache_suffix = image_semantic_cache_suffix
         self.image_semantic_feature_key = image_semantic_feature_key
@@ -154,6 +172,16 @@ class SatLidarRawDataset(Dataset):
                 mask_shape=(1, *self.image_semantic_size),
             )
             if self.image_semantic_cache_root is not None and self.image_semantic_feature_dim > 0
+            else None
+        )
+        self._lidar_ray_feature_memmap = (
+            _FeatureMemmapCache(
+                self.lidar_ray_feature_cache_root,
+                kind="ray",
+                feature_shape=self.lidar_ray_feature_shape,
+                mask_shape=self.lidar_ray_mask_shape,
+            )
+            if self.lidar_ray_feature_cache_root is not None and self.lidar_ray_feature_dim > 0
             else None
         )
         self.include_tracklets = bool(include_tracklets)
@@ -307,6 +335,41 @@ class SatLidarRawDataset(Dataset):
             "lidar_point_features": torch.from_numpy(features).float(),
             "lidar_point_features_mask": torch.from_numpy(mask).float(),
             "lidar_point_features_available": torch.from_numpy(available).float(),
+        }
+
+    def _lidar_ray_feature_cache(self, sample_id: str) -> Dict[str, torch.Tensor]:
+        if self.lidar_ray_feature_cache_root is None or self.lidar_ray_feature_dim <= 0:
+            return {}
+        if self._lidar_ray_feature_memmap is not None and self._lidar_ray_feature_memmap.enabled:
+            cached = self._lidar_ray_feature_memmap.get(self._safe_cache_id(sample_id))
+            if cached is not None:
+                features, mask = cached
+                return {
+                    "lidar_ray_features": torch.from_numpy(features),
+                    "lidar_ray_features_mask": torch.from_numpy(mask),
+                    "lidar_ray_features_available": torch.ones(1, dtype=torch.float32),
+                }
+        features = np.zeros(self.lidar_ray_feature_shape, dtype=np.float32)
+        mask = np.zeros(self.lidar_ray_mask_shape, dtype=np.float32)
+        available = np.array([0.0], dtype=np.float32)
+        cache_path = self._cache_path(
+            self.lidar_ray_feature_cache_root,
+            sample_id,
+            self.lidar_ray_feature_cache_suffix,
+        )
+        if cache_path.is_file():
+            with np.load(cache_path, allow_pickle=False) as payload:
+                cached = self._npz_first_array(payload, ("utonia_ray_feat", "lidar_ray_features"))
+                cached_mask = self._npz_first_array(payload, ("utonia_ray_mask", "lidar_ray_features_mask"))
+                if cached is not None and tuple(cached.shape) == self.lidar_ray_feature_shape:
+                    features[...] = np.asarray(cached, dtype=np.float32)
+                    if cached_mask is not None and tuple(cached_mask.shape) == self.lidar_ray_mask_shape:
+                        mask[...] = np.asarray(cached_mask, dtype=np.float32)
+                    available[...] = 1.0
+        return {
+            "lidar_ray_features": torch.from_numpy(features).float(),
+            "lidar_ray_features_mask": torch.from_numpy(mask).float(),
+            "lidar_ray_features_available": torch.from_numpy(available).float(),
         }
 
     def _image_semantic_cache(self, sample_id: str) -> Dict[str, torch.Tensor]:
@@ -540,6 +603,7 @@ class SatLidarRawDataset(Dataset):
                 }
             )
             sample.update(self._lidar_point_feature_cache(record["sample_id"]))
+        sample.update(self._lidar_ray_feature_cache(record["sample_id"]))
         sample.update(self._image_semantic_cache(record["sample_id"]))
         return sample
 
