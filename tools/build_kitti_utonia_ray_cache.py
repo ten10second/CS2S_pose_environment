@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -41,12 +42,25 @@ def parse_args():
     parser.add_argument("--ray-width", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
 
 
 def safe_sample_id(sample_id):
     return str(sample_id).replace("/", "__")
+
+
+def atomic_savez(path: Path, **arrays) -> None:
+    temp_path = path.with_name(f".{path.stem}.tmp-{os.getpid()}{path.suffix}")
+    temp_path.unlink(missing_ok=True)
+    try:
+        np.savez_compressed(temp_path, **arrays)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def rewrite_path(path, args):
@@ -61,6 +75,26 @@ def rewrite_path(path, args):
         if marker in value:
             value = str(Path(args.kitti_root) / value.split(marker, 1)[1])
     return value
+
+
+def resolve_calib_dir(record, args):
+    """Resolve calibration directories from manifests with legacy path variants."""
+    value = Path(rewrite_path(record["calib_dir"], args))
+    if (value / "calib_cam_to_cam.txt").is_file() and (value / "calib_velo_to_cam.txt").is_file():
+        return str(value)
+
+    date = str(record.get("date", ""))
+    if args.kitti_root and date:
+        candidates = (
+            Path(args.kitti_root) / date / f"{date}_calib",
+            Path(args.kitti_root) / date,
+        )
+        for candidate in candidates:
+            if (candidate / "calib_cam_to_cam.txt").is_file() and (
+                candidate / "calib_velo_to_cam.txt"
+            ).is_file():
+                return str(candidate)
+    return str(value)
 
 
 def load_utonia(args, device):
@@ -116,7 +150,7 @@ def pool_ray_depth_features(features, uv, depth, args):
 
 def process_record(record, model, transform, device, args):
     velodyne_path = rewrite_path(record["velodyne_path"], args)
-    calib_dir = rewrite_path(record["calib_dir"], args)
+    calib_dir = resolve_calib_dir(record, args)
     points = load_velodyne_points(velodyne_path)
     calib = load_raw_calibration(calib_dir)
     if points.size == 0:
@@ -169,16 +203,22 @@ def process_record(record, model, transform, device, args):
 
 def main():
     args = parse_args()
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be at least 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num-shards)")
+    np.random.seed(int(args.seed) + int(args.shard_index))
+    torch.manual_seed(int(args.seed) + int(args.shard_index))
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     model, transform = load_utonia(args, device)
-    records = read_jsonl(args.manifest)
+    records = list(enumerate(read_jsonl(args.manifest)))[args.shard_index :: args.num_shards]
     if args.limit > 0:
         records = records[: int(args.limit)]
 
     written = skipped = failed = 0
-    for index, record in enumerate(records):
+    for index, record in records:
         sample_id = record["sample_id"]
         out_path = out_root / f"{safe_sample_id(sample_id)}.npz"
         if args.skip_existing and out_path.is_file():
@@ -186,7 +226,7 @@ def main():
             continue
         try:
             payload = process_record(record, model, transform, device, args)
-            np.savez_compressed(out_path, sample_id=np.asarray(sample_id), **payload)
+            atomic_savez(out_path, sample_id=np.asarray(sample_id), **payload)
             written += 1
             if written == 1 or written % 25 == 0:
                 print(
@@ -214,6 +254,8 @@ def main():
         "written": written,
         "skipped": skipped,
         "failed": failed,
+        "num_shards": int(args.num_shards),
+        "shard_index": int(args.shard_index),
         "out_root": str(out_root),
     }
     print(json.dumps(summary, sort_keys=True), flush=True)
