@@ -23,6 +23,7 @@ from utils.util import instantiate_from_config  # noqa: E402
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate KITTI ray-posterior samples from a current checkpoint.")
     parser.add_argument("--config", default="configs/Boost_Sat2Den/train/KITTI_raw_sat_lidar_raea.yaml")
+    parser.add_argument("--sd-base-ckpt", required=True)
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument(
@@ -33,6 +34,7 @@ def parse_args():
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--lidar-ray-feature-cache-root", required=True)
     parser.add_argument("--image-semantic-cache-root", required=True)
+    parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--num-samples", type=int, default=6)
     parser.add_argument("--ddim-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
@@ -456,7 +458,10 @@ def make_panel(out_dir, sample_id, image_paths):
     panel = Image.new("RGB", (width * len(images), height + label_h), (255, 255, 255))
     draw = ImageDraw.Draw(panel)
     for idx, (label, image) in enumerate(zip(labels, images)):
-        panel.paste(image, (idx * width, label_h))
+        image.thumbnail((width, height), Image.BILINEAR)
+        image_x = idx * width + (width - image.width) // 2
+        image_y = label_h + (height - image.height) // 2
+        panel.paste(image, (image_x, image_y))
         draw.text((idx * width + 4, 4), label, fill=(0, 0, 0))
     panel_path = out_dir / "panels" / f"{safe_sample_id(sample_id)}.png"
     panel_path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,6 +570,8 @@ def generate_prediction(
 def main():
     args = parse_args()
     cfg = OmegaConf.load(args.config)
+    cfg.model.params.AE_ckpt_path = args.sd_base_ckpt
+    cfg.model.params.pre_ldm_model_path = args.sd_base_ckpt
     cfg.data.params.test.params.manifest = args.manifest
     test_params = cfg.data.params.test.params
 
@@ -606,7 +613,9 @@ def main():
             + ", ".join(unsupported)
             + ". Global LiDAR shift_x was removed because it moves road/background geometry; use normal,zero."
         )
-    samples = [dataset[idx] for idx in range(min(args.num_samples, len(dataset)))]
+    start_index = max(0, int(args.start_index))
+    end_index = min(start_index + int(args.num_samples), len(dataset))
+    samples = [dataset[idx] for idx in range(start_index, end_index)]
     records = []
     image_paths_by_id = {}
     attention_stats_by_id = {}
@@ -614,15 +623,22 @@ def main():
         sample_id = sample["sample_id"]
         safe_id = safe_sample_id(sample_id)
         gt_path = out_dir / "images" / "gt" / f"{safe_id}.png"
+        sat_path = out_dir / "images" / "satellite" / f"{safe_id}.png"
         overlay_path = out_dir / "images" / "lidar_overlay" / f"{safe_id}.png"
         cond_path = out_dir / "images" / "lidar_cond" / f"{safe_id}.png"
         target = sample["grd_left_imgs"].unsqueeze(0).clamp(0.0, 1.0)
         save_tensor_image(target[0], gt_path)
+        save_tensor_image(sample["sat_map"], sat_path)
         overlay_path.parent.mkdir(parents=True, exist_ok=True)
         make_lidar_overlay(target[0], sample["lidar_cond"]).save(overlay_path)
         save_tensor_image(make_condition_rgb(sample["lidar_cond"]), cond_path)
 
-        image_paths = {"GT": gt_path, "LiDAR overlay": overlay_path}
+        image_paths = {
+            "Satellite input": sat_path,
+            "LiDAR condition": cond_path,
+            "LiDAR input (on GT)": overlay_path,
+            "GT": gt_path,
+        }
         image_paths_by_id[sample_id] = image_paths
         attention_stats_by_id[sample_id] = {}
 

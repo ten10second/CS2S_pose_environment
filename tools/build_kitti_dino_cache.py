@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,7 +27,13 @@ def parse_args():
         default="",
         help="Optional OLD=NEW replacement for manifest paths, e.g. /media/a=/media/b.",
     )
+    parser.add_argument(
+        "--kitti-root",
+        default="",
+        help="Optional KITTI_RAW root used to rebase machine-specific manifest paths.",
+    )
     parser.add_argument("--model", default="dinov2_vits14")
+    parser.add_argument("--weights", default="", help="Optional local DINOv2 backbone checkpoint.")
     parser.add_argument(
         "--dinov2-root",
         default=str(REPO_ROOT / "third_party" / "dinov2"),
@@ -38,6 +45,8 @@ def parse_args():
     parser.add_argument("--token-width", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--preview-every", type=int, default=0)
     parser.add_argument("--preview-root", default="")
@@ -54,17 +63,42 @@ def apply_path_rewrite(path: str, rule: str) -> str:
     return path.replace(old, new, 1)
 
 
+def rewrite_path(path: str, args) -> str:
+    value = apply_path_rewrite(path, args.path_rewrite)
+    if args.kitti_root:
+        marker = "/KITTI_RAW/"
+        if marker in value:
+            value = str(Path(args.kitti_root) / value.split(marker, 1)[1])
+    return value
+
+
 def safe_sample_id(sample_id: str) -> str:
     return str(sample_id).replace("/", "__")
 
 
-def load_dinov2(model_name: str, device: torch.device, dinov2_root: str):
+def load_dinov2(model_name: str, device: torch.device, dinov2_root: str, weights: str = ""):
     repo_root = Path(dinov2_root).expanduser().resolve()
     if not (repo_root / "hubconf.py").is_file():
         raise FileNotFoundError(f"DINOv2 hub repository not found: {repo_root}")
-    model = torch.hub.load(str(repo_root), model_name, pretrained=True, source="local")
+    load_kwargs = {"pretrained": True, "source": "local"}
+    if weights:
+        weights_path = Path(weights).expanduser().resolve()
+        if not weights_path.is_file():
+            raise FileNotFoundError(f"DINOv2 weights not found: {weights_path}")
+        load_kwargs["weights"] = str(weights_path)
+    model = torch.hub.load(str(repo_root), model_name, **load_kwargs)
     model.eval().to(device)
     return model
+
+
+def atomic_savez(path: Path, **arrays) -> None:
+    temp_path = path.with_name(f".{path.stem}.tmp-{os.getpid()}{path.suffix}")
+    temp_path.unlink(missing_ok=True)
+    try:
+        np.savez_compressed(temp_path, **arrays)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def extract_patch_tokens(model, image_tensor: torch.Tensor):
@@ -106,7 +140,7 @@ def main():
         preview_root.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    model = load_dinov2(args.model, device, args.dinov2_root)
+    model = load_dinov2(args.model, device, args.dinov2_root, args.weights)
     patch_size = int(getattr(model, "patch_size", 14))
     input_h = int(args.input_height)
     input_w = int(args.input_width)
@@ -122,19 +156,23 @@ def main():
         ]
     )
 
-    records = read_jsonl(args.manifest)
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be at least 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num-shards)")
+    records = list(enumerate(read_jsonl(args.manifest)))[args.shard_index :: args.num_shards]
     if int(args.limit) > 0:
         records = records[: int(args.limit)]
     written = 0
     skipped = 0
     failed = 0
-    for idx, record in enumerate(records):
+    for idx, record in records:
         sample_id = record["sample_id"]
         out_path = out_root / f"{safe_sample_id(sample_id)}.npz"
         if args.skip_existing and out_path.is_file():
             skipped += 1
             continue
-        image_path = Path(apply_path_rewrite(record["image_02_path"], args.path_rewrite))
+        image_path = Path(rewrite_path(record["image_02_path"], args))
         try:
             with Image.open(image_path) as img:
                 tensor = transform(img.convert("RGB")).unsqueeze(0).to(device)
@@ -142,7 +180,7 @@ def main():
             feat = patch_tokens.reshape(1, grid_h, grid_w, -1).permute(0, 3, 1, 2)
             feat = F.adaptive_avg_pool2d(feat.float(), (int(args.token_height), int(args.token_width)))
             feat_chw = feat[0].detach().cpu().numpy().astype(np.float32)
-            np.savez_compressed(
+            atomic_savez(
                 out_path,
                 dino_feat=feat_chw.transpose(1, 2, 0),
                 image_semantic_mask=np.ones((int(args.token_height), int(args.token_width)), dtype=np.float32),
@@ -164,6 +202,8 @@ def main():
         "written": written,
         "skipped": skipped,
         "failed": failed,
+        "num_shards": int(args.num_shards),
+        "shard_index": int(args.shard_index),
         "out_root": str(out_root),
     }
     print(json.dumps(summary))

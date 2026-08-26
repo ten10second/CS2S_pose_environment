@@ -23,6 +23,7 @@ RUN_NAME="${RUN_NAME:-ray_posterior_utonia_dino_sd14_fresh_$(date +%Y%m%d_%H%M%S
 TARGET_STEP="${TARGET_STEP:-500000}"
 SAVE_EVERY="${SAVE_EVERY:-10000}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-0}"
+KEEP_STEP_CHECKPOINTS="${KEEP_STEP_CHECKPOINTS:-3}"
 NUM_GPUS="${NUM_GPUS:-1}"
 BATCH_PER_GPU="${BATCH_PER_GPU:-2}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-2}"
@@ -41,7 +42,7 @@ LIDAR_CACHE_ROOT="${LIDAR_CACHE_ROOT:-${CACHE_ROOT}/utonia_ray_depth_all_fp16}"
 DINO_CACHE_ROOT="${DINO_CACHE_ROOT:-${CACHE_ROOT}/dino_vits14_8x32_all_fp16}"
 RESUME_CKPT="${RESUME_CKPT:-}"
 
-for value in NUM_GPUS BATCH_PER_GPU WORKERS_PER_GPU TARGET_STEP SAVE_EVERY SAMPLE_EVERY DATALOADER_TIMEOUT DIST_TIMEOUT_SECONDS MIN_FREE_DISK_GB MIN_FREE_HOST_MEMORY_GB PARALLEL_MODEL_INIT ALLOW_DDP_INLINE_SAMPLING; do
+for value in NUM_GPUS BATCH_PER_GPU WORKERS_PER_GPU TARGET_STEP SAVE_EVERY SAMPLE_EVERY KEEP_STEP_CHECKPOINTS DATALOADER_TIMEOUT DIST_TIMEOUT_SECONDS MIN_FREE_DISK_GB MIN_FREE_HOST_MEMORY_GB PARALLEL_MODEL_INIT ALLOW_DDP_INLINE_SAMPLING; do
     if ! [[ "${!value}" =~ ^[0-9]+$ ]]; then
         printf 'error: %s must be a non-negative integer, got %q\n' "${value}" "${!value}" >&2
         exit 2
@@ -167,7 +168,7 @@ exec env \
     --sample-num-samples 2 \
     --sample-ddim-steps 50 \
     --sample-probes normal \
-    --keep-step-checkpoints 3 \
+    --keep-step-checkpoints "${KEEP_STEP_CHECKPOINTS}" \
     --lidar-ray-feature-cache-root "${LIDAR_CACHE_ROOT}" \
     --image-semantic-cache-root "${DINO_CACHE_ROOT}" \
     --lidar-support-loss-weight 1.0 \
