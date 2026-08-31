@@ -13,6 +13,7 @@ temporal model.
 - A ratio near 1 means the amount of frame-to-frame change is similar to the
   real sequence. The metric alone does not measure semantic correctness,
   geometry, identity preservation, or perceptual quality.
+- Results cover one seed and two clips. They are not confidence intervals.
 
 ## Inference Variants
 
@@ -25,6 +26,12 @@ temporal model.
   (`ar_strength=0.5`)
 - `posewarp2`: apply the homography only where it agrees with a local
   LiDAR-derived affine flow, and preserve unwarped history elsewhere
+
+This is not an equal-compute ablation. The per-frame and shared-noise variants
+run all 50 DDIM steps. After their first frame, `autoregressive` runs 15 steps,
+while `posewarp` and `posewarp2` run 25 steps. The measurements therefore
+compare complete inference strategies, not the isolated effect of warping or
+history reuse at a fixed denoising budget.
 
 ## Measured Results
 
@@ -59,6 +66,9 @@ The exact output snapshot is stored at:
 4. These experiments establish that temporal information is useful, but they
    do not establish a final temporal architecture or an overall quality gain.
    Image quality and condition fidelity must be evaluated alongside tLPIPS.
+5. The run metadata does not independently preserve every provenance field,
+   including checkpoint, manifest slice, sampling arguments, and Git commit.
+   Future formal experiments must record those fields in `run_summary.json`.
 
 ## Recommended Resume Point
 
