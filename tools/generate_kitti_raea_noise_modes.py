@@ -12,6 +12,13 @@ crowns). Modes:
                  start from the previous frame's latent noised to an
                  intermediate timestep (SDEdit-style img2img chain)
 
+  instance      segmented transport on top of the warp2 machinery: static
+                 cells keep the agreement-gated homography transport, while
+                 moving objects associated across scans by LiDAR cluster
+                 matching (label-free) inherit content through their OWN
+                 image-space displacement instead of being reset; unmatched
+                 new objects and disappeared cells still reset to noise
+
 The autoregressive chain calls ddim_sampling directly with the k smallest
 ddim timesteps; index alignment with ddim_alphas/ddim_alphas_prev holds
 because both are built over the same ascending timestep list.
@@ -37,6 +44,7 @@ from models.KITTI_geo_ldm_diffusion.ddim_KITTI import KITTI_DDIMSampler  # noqa:
 from utils.util import instantiate_from_config  # noqa: E402
 
 import pose_warp_utils as pwu  # noqa: E402
+import lidar_object_association as loa  # noqa: E402
 
 from generate_kitti_raea_samples import (  # noqa: E402
     lidar_key_structure_stats,
@@ -69,7 +77,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--noise-mode",
-        choices=["per_frame", "shared", "autoregressive", "warp", "warp2"],
+        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance"],
         default="shared",
     )
     parser.add_argument(
@@ -325,6 +333,7 @@ def main():
     prev_target = None
     prev_row = None
     geoms = {}
+    object_tracker = loa.ObjectTracker()
     warp_debug_left = int(args.warp_debug)
     for idx, sample in enumerate(samples_list):
         sample_id = sample["sample_id"]
@@ -342,7 +351,7 @@ def main():
             x_T = shared_x_T.clone()
             timesteps = None
             noise_info = {"mode": "shared", "seed": args.seed}
-        elif args.noise_mode in ("warp", "warp2"):
+        elif args.noise_mode in ("warp", "warp2", "instance"):
             if prev_latent is None or prev_row is None:
                 x_T = shared_x_T.clone()
                 timesteps = None
@@ -409,6 +418,59 @@ def main():
                         extra = {
                             "agree_frac": float(agree.mean().item()),
                             "affine_cells": int(nfitted),
+                        }
+                    if args.noise_mode == "instance":
+                        # plane tuple (a, b, c) with ground z = a*x + b*y - c,
+                        # recovered from the normalized normal form (n, d).
+                        plane = (-n_v[0] / n_v[2], -n_v[1] / n_v[2], d_v / n_v[2])
+                        matched, assoc_stats = loa.associate_objects(
+                            p1, p2, T_v, geom, img_w, img_h, 16, 64, plane=plane
+                        )
+                        obj_ids = object_tracker.update(matched)
+                        obj_cell_np = np.zeros((16, 64), bool)
+                        obj_records = []
+                        for oid, obj in zip(obj_ids, matched):
+                            ys_np, xs_np = np.meshgrid(
+                                np.arange(16, dtype=np.float32) + 0.5,
+                                np.arange(64, dtype=np.float32) + 0.5,
+                                indexing="ij",
+                            )
+                            # backward transport: current cell center minus the
+                            # object's latent displacement reaches its previous
+                            # content.
+                            src_np = np.stack(
+                                [
+                                    xs_np - obj["d_lat"][0],
+                                    ys_np - obj["d_lat"][1],
+                                ],
+                                axis=0,
+                            )
+                            m_t = torch.from_numpy(obj["cell_mask"]).to("cuda")
+                            grid_src = torch.where(
+                                m_t.unsqueeze(0),
+                                torch.from_numpy(src_np).to("cuda"),
+                                grid_src[0],
+                            ).unsqueeze(0)
+                            obj_cell_np |= obj["cell_mask"]
+                            obj_records.append(
+                                {
+                                    "oid": int(oid),
+                                    "bbox": obj["bbox"],
+                                    "d_lat": [float(x) for x in obj["d_lat"]],
+                                    "d_velo_norm": float(np.linalg.norm(obj["d_velo"])),
+                                    "count": obj["count"],
+                                    "depth": obj["depth"],
+                                }
+                            )
+                        obj_t = torch.from_numpy(obj_cell_np.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
+                        # matched object cells are exempt from the dynamic reset:
+                        # they inherit via their own motion instead.
+                        keep = keep * (1.0 - obj_t) + obj_t
+                        extra = {
+                            **extra,
+                            **assoc_stats,
+                            "n_objects_inherited": len(matched),
+                            "objects": obj_records,
                         }
                     fill = torch.randn_like(warped)
                     L = warped * keep + fill * (1.0 - keep)
