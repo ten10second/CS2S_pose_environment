@@ -33,6 +33,13 @@ while `posewarp` and `posewarp2` run 25 steps. The measurements therefore
 compare complete inference strategies, not the isolated effect of warping or
 history reuse at a fixed denoising budget.
 
+It is also not a fully seed-controlled ablation. `ddim_KITTI.py` creates its
+per-step noise when the module is imported, before this script calls
+`torch.manual_seed`. The CLI seed controls the initial `x_T`, but separate
+method processes can use different per-step DDIM noise. The sharded 300-frame
+baseline can also use different per-step noise in each process. Future runs
+must pass explicitly seeded step noise into the sampler.
+
 ## Measured Results
 
 | Test clip | Frames | Method | Generated tLPIPS | GT tLPIPS | Ratio |
@@ -52,9 +59,10 @@ The exact output snapshot is stored at:
 
 ## Conclusions
 
-1. Sharing only the initial noise is insufficient. On drive 0057 its ratio is
-   1.975 versus 1.978 for independent noise, so changing conditions and the
-   denoising trajectory dominate the visible flicker.
+1. In the observed drive 0057 runs, sharing only the initial noise changed the
+   ratio from 1.978 to 1.975, which is negligible. Because per-step DDIM noise
+   was not held fixed across processes, this does not isolate the effect of
+   initial-noise sharing and must be repeated as a controlled multi-seed test.
 2. Autoregressive latent reuse is the strongest inference-only stabilizer. It
    brings the 58-frame ratio close to 1, but the 300-frame ratio of 0.820 is
    below the real sequence. This indicates over-smoothing or history locking
