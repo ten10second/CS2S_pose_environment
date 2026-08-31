@@ -90,3 +90,29 @@ regions must be excluded from rigid-warp supervision.
 
 The full UNet should not be naively unrolled over four frames: the single-frame
 run already uses roughly 21 GB per GPU.
+
+## Instance-Transport Round (2026-08-31)
+
+New since the frozen results above: `lidar_object_association.py` (label-free
+cross-frame cluster association) and noise mode `instance` — segmented
+transport where matched moving objects inherit content through their own
+image-space displacement instead of the dynamic reset.
+
+- drive_0020, 300 frames, `instance` @ `ar_strength=0.5`: tLPIPS ratio 1.302
+  (vs posewarp2 1.305, per-frame 1.630, autoregressive 0.820). Global flicker
+  is unchanged, as expected: transported regions are small.
+- Association fires on 100/300 frames (131 object instances). Validation
+  overlays confirm correct clustering/matching mechanics; dominant false
+  positives are foliage and glass returns (benign under transport).
+- Key negative result: objects moving below ~0.35 m/frame (3.5 m/s) fall
+  below the Euclidean explain-tolerance floor set by oxts pose noise and
+  range quantization, so typical slow city traffic is H-transported as
+  background and its identity is still re-rolled. The object-identity CLIP
+  metric (`analyze_object_identity.py`) has only n=5 comparable pairs this
+  round — too small to score.
+- Conclusion: geometry-only inference-time transport cannot bind identity for
+  slow movers. This is the boundary of the noise/latent-init family and the
+  concrete motivation for the learned temporal-evidence stream
+  (third evidence source in RayPosteriorEvidenceFusion with a learned gate,
+  trained on same-drive T=4 clips per the resume point above): feature-level
+  memory can bind slow-mover identity where geometric correspondence cannot.

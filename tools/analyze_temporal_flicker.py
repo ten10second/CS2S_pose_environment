@@ -26,6 +26,7 @@ RUNS = {
     "drive0020_300f autoreg_s07": "contiguous_seq_drive0020_300f_autoreg_s07",
     "drive0020_300f posewarp_s05": "contiguous_seq_drive0020_300f_posewarp_s05",
     "drive0020_300f posewarp2_s05": "contiguous_seq_drive0020_300f_posewarp2_s05",
+    "drive0020_300f instance_s05": "contiguous_seq_drive0020_300f_instance_s05",
 }
 
 
