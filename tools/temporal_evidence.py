@@ -148,3 +148,14 @@ def temporal_gate_parameters(blocks):
     for block in blocks:
         params.extend(block.ray_posterior_fusion.temporal_gate.parameters())
     return params
+
+
+def freeze_temporal_snapshot(blocks):
+    """Snapshot each block's current fused posterior as the frozen temporal
+    reference for the NEXT frame's entire DDIM trajectory. Without this, the
+    later denoising steps of frame t would consume frame t's own intermediate
+    state instead of the previous frame's posterior."""
+    for block in blocks:
+        block.frozen_fused_delta = (
+            None if block.last_fused_delta is None else block.last_fused_delta.clone()
+        )

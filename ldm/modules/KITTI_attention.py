@@ -1027,6 +1027,7 @@ class BasicTransformerBlock(nn.Module):
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
         self.temporal_hub = None
         self.last_fused_delta = None
+        self.frozen_fused_delta = None
         self.attn2 = CrossAttention(
             query_dim=dim,
             context_dim=context_dim,
@@ -1080,12 +1081,13 @@ class BasicTransformerBlock(nn.Module):
         recompute pass sees identical tensors; the cache itself is never
         touched here."""
         payload = self.temporal_hub.payload if self.temporal_hub is not None else None
-        if payload is None or self.last_fused_delta is None:
+        delta = self.frozen_fused_delta if self.frozen_fused_delta is not None else self.last_fused_delta
+        if payload is None or delta is None:
             return None, None
         b, n, c = x.shape
         h, w = int(latent_hw[0]), int(latent_hw[1])
         grid, validity = payload["transport"]((h, w), x.device, x.dtype)
-        delta_map = self.last_fused_delta.reshape(b, h, w, c).permute(0, 3, 1, 2)
+        delta_map = delta.reshape(b, h, w, c).permute(0, 3, 1, 2)
         warped = F.grid_sample(
             delta_map, grid.to(dtype=delta_map.dtype), mode="bilinear", padding_mode="zeros", align_corners=False
         )

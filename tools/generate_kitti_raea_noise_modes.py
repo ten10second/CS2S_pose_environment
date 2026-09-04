@@ -45,6 +45,7 @@ from utils.util import instantiate_from_config  # noqa: E402
 
 import pose_warp_utils as pwu  # noqa: E402
 import lidar_object_association as loa  # noqa: E402
+import temporal_evidence as te  # noqa: E402
 
 from generate_kitti_raea_samples import (  # noqa: E402
     lidar_key_structure_stats,
@@ -77,9 +78,11 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--noise-mode",
-        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance"],
+        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "temporal_net"],
         default="shared",
     )
+    parser.add_argument("--temporal-gates", default="",
+                        help="gate checkpoint from train_kitti_temporal.py; required for temporal_net")
     parser.add_argument(
         "--ar-strength",
         type=float,
@@ -310,6 +313,18 @@ def main():
 
     model = instantiate_from_config(cfg.model).cuda().eval()
     load_checkpoint_into_model(model, args.ckpt)
+    temporal_hub, temporal_blocks = None, None
+    if args.noise_mode == "temporal_net":
+        temporal_hub, temporal_blocks = te.enable_temporal_evidence(model)
+        gates_path = Path(args.temporal_gates)
+        if not gates_path.exists():
+            raise FileNotFoundError(f"--temporal-gates not found: {gates_path}")
+        gate_ckpt = torch.load(gates_path, map_location="cpu")
+        for name, block in enumerate(temporal_blocks):
+            key = str(name)
+            if key in gate_ckpt.get("temporal_gates", {}):
+                block.ray_posterior_fusion.temporal_gate.load_state_dict(gate_ckpt["temporal_gates"][key])
+        print(f"[noise-modes] temporal gates loaded from {gates_path} (step {gate_ckpt.get('step', '?')})")
     sampler = KITTI_DDIMSampler(model.DDPM, model.pre_AE_model, model.scale_factor)
     sampler.make_schedule(ddim_num_steps=args.ddim_steps, ddim_eta=args.eta, verbose=False)
 
@@ -341,6 +356,19 @@ def main():
         batch = sample_to_batch(sample)
         pack = prepare_frame_inputs(model, batch)
         key_stats = lidar_key_structure_stats(model, pack["lidar_context"], max_tokens=args.key_stats_max_tokens)
+
+        if args.noise_mode == "temporal_net":
+            # frame boundary: snapshot the previous frame's final posterior and
+            # install this pair's transport payload; the whole DDIM trajectory
+            # of this frame consumes the frozen snapshot.
+            if temporal_hub is not None:
+                temporal_hub.clear()
+                if idx > 0:
+                    te.freeze_temporal_snapshot(temporal_blocks)
+                    builder_t = te.TemporalTransportBuilder(prev_row, row, kitti_root=args.kitti_root)
+                    pl = builder_t.payload(strength=1.0)
+                    if pl is not None:
+                        temporal_hub.set(pl)
 
         if args.noise_mode == "per_frame":
             torch.manual_seed(args.seed + idx)
@@ -498,6 +526,13 @@ def main():
                             wimg,
                         )
                         warp_debug_left -= 1
+        elif args.noise_mode == "temporal_net":
+            # fresh initial noise every frame — consistency must come from the
+            # learned temporal evidence stream, not from noise chaining
+            torch.manual_seed(args.seed + idx)
+            x_T = torch.randn((1, 4, 16, 64), device="cuda")
+            timesteps = None
+            noise_info = {"mode": "temporal_net", "frame": idx, "seed": args.seed + idx}
         else:
             if prev_latent is None:
                 x_T = shared_x_T.clone()
@@ -516,6 +551,10 @@ def main():
                 }
 
         pred, latent = sample_frame(model, sampler, pack, x_T, timesteps, args.guidance_scale, args.temperature)
+        if args.noise_mode == "temporal_net" and temporal_blocks is not None:
+            confs = [float(b.ray_posterior_fusion.last_temporal_confidence) for b in temporal_blocks]
+            noise_info["temporal_conf_mean"] = float(np.mean(confs))
+            noise_info["temporal_conf_max"] = float(np.max(confs))
         prev_latent = latent.detach()
         prev_target = pack["target"][0].detach()
         prev_row = row
