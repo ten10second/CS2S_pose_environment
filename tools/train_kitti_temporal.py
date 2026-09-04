@@ -6,17 +6,24 @@ Phase-1 design (see docs/temporal_preliminary_findings.md, resume point):
     module (third evidence stream: previous frame's fused posterior,
     transported by the ground homography, validity-masked to reliable static
     history);
-  - train only the gates with the unchanged single-frame diffusion objective
-    on adjacent same-drive frame pairs (teacher-forced previous frame).
+  - train only the gates with the unchanged single-frame diffusion objective.
 
-Run with torchrun, e.g. 4 GPUs:
-  torchrun --standalone --nproc_per_node 4 tools/train_kitti_temporal.py ...
+Infra: pairs are walked in drive order (streaming), so the previous step's
+current frame IS this step's previous frame. The per-module caches from that
+forward are reused directly and the redundant teacher forward is skipped
+(cache_valid=True items), and the dataset's single-slot sample reuse avoids
+reloading the shared frame. num_workers must be 1 so consecutive items land
+in the same worker.
+
+Run with torchrun, e.g. 2 GPUs:
+  torchrun --standalone --nproc_per_node 2 tools/train_kitti_temporal.py ...
 """
 import argparse
 import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -72,54 +79,83 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--batch-per-gpu", type=int, default=1)
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=1,
+                   help="must stay 1: streaming sample reuse is single-worker")
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--save-every", type=int, default=2000)
-    p.add_argument("--temporal-strength-min", type=float, default=0.3,
-                   help="per-step lower bound of the temporal feature strength "
-                        "multiplier (regularises against over-trusting history)")
+    p.add_argument("--temporal-strength-min", type=float, default=0.3)
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--gate-bias", type=float, default=-6.0)
     p.add_argument("--resume", default="")
     return p.parse_args()
 
 
-def build_pair_index(manifest_path):
-    rows = [json.loads(line) for line in open(manifest_path)]
-    pairs = []
-    for i in range(len(rows) - 1):
-        a, b = rows[i], rows[i + 1]
-        if a.get("drive") != b.get("drive"):
-            continue
+def build_stream_plan(rows):
+    """Ordered (prev_idx, cur_idx, cache_valid) triples.
+
+    Each drive is split into maximal strictly-consecutive frame runs; within a
+    run the walk is sequential, so every pair except a run's first reuses the
+    cache left by the previous step's forward (cache_valid=True).
+    """
+    by_drive = defaultdict(list)
+    for i, r in enumerate(rows):
         try:
-            gap = int(b["frame_index"]) - int(a["frame_index"])
+            fi = int(r["frame_index"])
         except (KeyError, ValueError):
             continue
-        if gap == 1:
-            pairs.append((i, i + 1))
-    return rows, pairs
+        by_drive[r.get("drive")].append((fi, i))
+
+    def emit_run(run, out):
+        for k in range(1, len(run)):
+            out.append((run[k - 1], run[k], k > 1))
+
+    plan = []
+    for drive in sorted(by_drive):
+        idxs = [i for _, i in sorted(by_drive[drive])]
+        run = []
+        for k, i in enumerate(idxs):
+            if run and int(rows[i]["frame_index"]) - int(rows[run[-1]]["frame_index"]) != 1:
+                emit_run(run, plan)
+                run = []
+            run.append(i)
+        emit_run(run, plan)
+    return plan
 
 
-class PairDataset(Dataset):
-    """Returns {cur: sample, prev: sample, transport: TemporalTransportBuilder}."""
+class StreamDataset(Dataset):
+    """Streams a plan in order. Single-slot sample reuse assumes num_workers=1
+    (consecutive items share a worker); with more workers it only loses the
+    reuse optimization, never correctness."""
 
-    def __init__(self, dataset, rows, pairs, kitti_root):
+    def __init__(self, dataset, rows, plan, kitti_root):
         self.dataset = dataset
         self.rows = rows
-        self.pairs = pairs
+        self.plan = plan
         self.kitti_root = kitti_root
+        self._last_idx = None
+        self._last_sample = None
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.plan)
+
+    def _load(self, idx):
+        if self._last_idx == idx and self._last_sample is not None:
+            return self._last_sample
+        sample = self.dataset[idx]
+        self._last_idx, self._last_sample = idx, sample
+        return sample
 
     def __getitem__(self, i):
-        pi, ci = self.pairs[i]
-        prev_sample = self.dataset[pi]
-        cur_sample = self.dataset[ci]
+        pi, ci, cache_valid = self.plan[i]
+        # A rank's first item always loads prev: the module caches are empty
+        # in a fresh process regardless of what the plan says.
+        cache_valid = bool(cache_valid) and i > 0
+        cur = self._load(ci)
+        prev = None if cache_valid else self._load(pi)
         transport = TemporalTransportBuilder(
             self.rows[pi], self.rows[ci], kitti_root=self.kitti_root
         )
-        return {"cur": cur_sample, "prev": prev_sample, "transport": transport}
+        return {"cur": cur, "prev": prev, "cache_valid": bool(cache_valid), "transport": transport}
 
 
 class TrainingStepModule(torch.nn.Module):
@@ -135,14 +171,14 @@ class TrainingStepModule(torch.nn.Module):
 
 def pair_collate(batch):
     """batch_size is always 1. Each sub-sample must be default-collated into a
-    B=1 batch exactly like the original training loader produced; the
-    non-tensor transport builder is wrapped in a list instead."""
+    B=1 batch exactly like the original training loader produced; non-tensor
+    fields are passed through wrapped."""
     from torch.utils.data._utils.collate import default_collate
 
     assert len(batch) == 1
     item = batch[0]
     item["cur"] = default_collate([item["cur"]])
-    item["prev"] = default_collate([item["prev"]])
+    item["prev"] = None if item["prev"] is None else default_collate([item["prev"]])
     item["transport"] = [item["transport"]]
     return item
 
@@ -176,12 +212,12 @@ def main():
     cfg.model.params.pre_ldm_model_path = args.sd_base_ckpt
     train_params = cfg.data.params.train.params
 
-    rows, pairs = build_pair_index(args.manifest)
+    rows = [json.loads(line) for line in open(args.manifest)]
+    plan = build_stream_plan(rows)
+    shard_plan = plan[rank::world]
+    n_reuse = sum(1 for _, _, v in shard_plan if v)
     if rank == 0:
-        print(f"[temporal-train] adjacent same-drive pairs: {len(pairs)}")
-    # rank-shard the pair order (deterministic; no epoch shuffle needed for
-    # this scale, the dataset itself is much larger than one pass needs)
-    shard_pairs = pairs[rank::world]
+        print(f"[temporal-train] stream pairs: {len(plan)} (cache reuse {100.0 * n_reuse / max(len(plan), 1):.1f}%)")
 
     dataset = SatLidarRawDataset(
         manifest=args.manifest,
@@ -208,14 +244,15 @@ def main():
         image_semantic_width=CONSTANTS["image_semantic_width"],
         include_tracklets=False,
     )
-    pair_dataset = PairDataset(dataset, rows, shard_pairs, args.kitti_root)
+    stream_dataset = StreamDataset(dataset, rows, shard_plan, args.kitti_root)
     loader = DataLoader(
-        pair_dataset,
+        stream_dataset,
         batch_size=args.batch_per_gpu,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
+        prefetch_factor=6 if args.num_workers > 0 else None,
         collate_fn=pair_collate,
     )
 
@@ -250,8 +287,10 @@ def main():
                 block.ray_posterior_fusion.temporal_gate.load_state_dict(gates_state[key])
         start_step = int(payload.get("step", 0))
         optimizer.load_state_dict(payload.get("optimizer", optimizer.state_dict()))
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr  # saved state carries the old lr; CLI wins
         if rank == 0:
-            print(f"[temporal-train] resumed from {args.resume} at step {start_step}")
+            print(f"[temporal-train] resumed from {args.resume} at step {start_step}, lr={args.lr}")
 
     def gate_stats():
         confs, maxs = [], []
@@ -267,6 +306,7 @@ def main():
     metrics_file = (out_dir / "temporal_metrics.jsonl").open("a") if rank == 0 else None
     iterator = iter(loader)
     data_epoch = 0
+    cache_warm = False  # module caches populated by a previous cur forward?
     running = []
     t0 = time.time()
     for step in range(start_step + 1, args.steps + 1):
@@ -277,16 +317,19 @@ def main():
             iterator = iter(loader)
             item = next(iterator)
         cur_batch = move_batch_to_device(item["cur"], device)
-        prev_batch = move_batch_to_device(item["prev"], device)
         builder = item["transport"][0] if isinstance(item["transport"], list) else item["transport"]
 
-        # 1) teacher-forced previous frame: populate per-module fused-posterior
-        #    caches under no_grad, with the hub cleared (pure single-frame pass)
+        # Sequential streaming: when the previous step's forward produced this
+        # frame's predecessor (cache_valid AND caches warm), the per-module
+        # caches are already in place and the teacher forward is skipped.
+        # Otherwise run it once under no_grad with the hub cleared.
         hub.clear()
-        with torch.no_grad(), autocast(enabled=args.amp):
-            _ = training_model(prev_batch)
+        if item["prev"] is not None and not cache_warm:
+            prev_batch = move_batch_to_device(item["prev"], device)
+            with torch.no_grad(), autocast(enabled=args.amp):
+                _ = training_model(prev_batch)
+        cache_warm = True
 
-        # 2) current frame: consume the transported caches through the gates
         strength = float(np.random.uniform(args.temporal_strength_min, 1.0))
         payload = builder.payload(strength=strength)
         if payload is None:
@@ -327,7 +370,7 @@ def main():
 
         if step % args.save_every == 0 or step == args.steps:
             if rank == 0:
-                payload_ckpt = {
+                ckpt_payload = {
                     "step": step,
                     "temporal_gates": {
                         str(i): b.ray_posterior_fusion.temporal_gate.state_dict()
@@ -336,8 +379,8 @@ def main():
                     "optimizer": optimizer.state_dict(),
                     "args": vars(args),
                 }
-                torch.save(payload_ckpt, out_dir / "temporal_latest.pt")
-                torch.save(payload_ckpt, out_dir / f"temporal_step_{step}.pt")
+                torch.save(ckpt_payload, out_dir / "temporal_latest.pt")
+                torch.save(ckpt_payload, out_dir / f"temporal_step_{step}.pt")
             if distributed:
                 torch.distributed.barrier()
 

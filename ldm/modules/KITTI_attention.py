@@ -1098,12 +1098,20 @@ class BasicTransformerBlock(nn.Module):
     def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
             temporal_ref, temporal_validity = self._build_temporal(latent_hw, x)
-            return checkpoint(
+            out = checkpoint(
                 self._forward,
                 (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, temporal_ref, temporal_validity),
                 self.parameters(),
                 self.checkpoint,
             )
+            # Promote outside the checkpointed region: a recompute pass may
+            # overwrite _pending_delta, but the recomputed value is identical
+            # (checkpoint preserves RNG), so promotion is re-run safe.
+            pending = getattr(self, "_pending_delta", None)
+            if pending is not None:
+                self.last_fused_delta = pending
+                self._pending_delta = None
+            return out
         return checkpoint(
             self._forward_without_lidar,
             (x, context, left_camera_k, gt_shift_x, gt_shift_y, theta),
@@ -1150,14 +1158,12 @@ class BasicTransformerBlock(nn.Module):
             )
         x = x_base + fused_delta
         x = self.ff(self.norm3(x)) + x
-        # Cache the fused posterior for the next frame's temporal evidence.
-        # Write only when the write cannot corrupt an in-flight read: either no
-        # payload is set (teacher/clean forward) or gradients are off
-        # (inference). During a gradient-checkpoint recompute both conditions
-        # are false, so the previous frame's cache survives the re-run.
+        # Stash the fused posterior for the next frame's temporal evidence.
+        # The caller (forward) promotes it to last_fused_delta OUTSIDE the
+        # checkpointed region, so gradient-checkpoint recomputes can never
+        # corrupt the previous frame's cache.
         if self.temporal_hub is not None and self.ray_fusion_mode == "ray_posterior":
-            if (not self.temporal_hub.active()) or (not torch.is_grad_enabled()):
-                self.last_fused_delta = fused_delta.detach()
+            self._pending_delta = fused_delta.detach()
         return x
 
 
