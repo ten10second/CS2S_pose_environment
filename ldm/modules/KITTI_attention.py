@@ -898,14 +898,19 @@ class RayAlignedEvidenceAttention(nn.Module):
 
 
 class TemporalEvidenceHub:
-    """Carries the per-step temporal-transport payload to fusion modules.
+    """Carries per-step temporal payloads to fusion/attention modules.
 
-    While processing frame t, the loop sets a payload with a `transport`
-    callable: for any module resolution (h, w) it returns the backward
-    transport grid sampled from the previous frame's ground homography plus a
-    validity map that excludes LiDAR-inconsistent (dynamic / disoccluded)
-    cells. Modules hold a reference to the hub, so no forward signature along
-    the UNet has to change.
+    Payload fields (any may be absent):
+      transport          — v1 latent homography transport (callable)
+      strength           — v1 feature multiplier
+      sat_tokens_prev    — route-C: previous frame's satellite patch tokens
+                           (b, 196, ctx), class/dynamic tokens excluded
+      sat_shift_xy       — route-C: (b, 2) ego-motion shift of this frame's
+                           satellite crop center inside the previous crop,
+                           normalized crop coords
+      sat_token_grid     — route-C: (14, 14)
+
+    Modules hold a reference to the hub, so no UNet forward signature changes.
     """
 
     def __init__(self):
@@ -919,6 +924,91 @@ class TemporalEvidenceHub:
 
     def active(self):
         return self.payload is not None
+
+
+class SatTemporalReferenceAttention(nn.Module):
+    """Spatiotemporally-local reference attention over the previous frame's
+    satellite patch tokens.
+
+    Every frame's satellite condition is a camera-centered, heading-aligned
+    crop of one georeferenced map, so consecutive crops overlap almost fully
+    and differ by a known ego-motion shift. Each latent query attends to the
+    previous frame's satellite tokens in a small window around the
+    geometrically corresponding patch — a spatiotemporal generalization of
+    LocalReferenceCrossAttention. The out projection is zero-initialised:
+    the stream is exactly inert at the start and grows only where gradients
+    ask for it.
+    """
+
+    def __init__(self, query_dim, context_dim, heads, dim_head, dropout=0.0, reference_window=3):
+        super().__init__()
+        inner = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.norm_q = nn.LayerNorm(query_dim)
+        self.norm_kv = nn.LayerNorm(context_dim)
+        self.to_q = nn.Linear(query_dim, inner, bias=False)
+        self.to_k = nn.Linear(context_dim, inner, bias=False)
+        self.to_v = nn.Linear(context_dim, inner, bias=False)
+        self.to_out = zero_module(nn.Linear(inner, query_dim))
+        self.reference_window = max(1, int(reference_window))
+
+    def _window_grid(self, query_hw, token_hw, device, dtype):
+        qh, qw = int(query_hw[0]), int(query_hw[1])
+        th, tw = int(token_hw[0]), int(token_hw[1])
+        qx = torch.linspace(-1.0, 1.0, qw, device=device, dtype=dtype).view(1, qw).expand(qh, qw)
+        qy = torch.linspace(-1.0, 1.0, qh, device=device, dtype=dtype).view(qh, 1).expand(qh, qw)
+        radius = self.reference_window // 2
+        step_x = 2.0 / max(tw - 1, 1)
+        step_y = 2.0 / max(th - 1, 1)
+        offsets = [
+            (ox * step_x, oy * step_y)
+            for oy in range(-radius, radius + 1)
+            for ox in range(-radius, radius + 1)
+        ]
+        base = torch.stack([qx.reshape(-1), qy.reshape(-1)], dim=-1).unsqueeze(1)  # (N,1,2)
+        off = torch.tensor(offsets, device=device, dtype=dtype).view(1, len(offsets), 2)
+        return base + off  # (N, K, 2); clamped after the per-sample shift
+
+    def forward(self, x, sat_tokens_prev, shift_xy, token_grid=(14, 14), query_hw=None):
+        """x: (b, N, c) latent queries. sat_tokens_prev: (b, T, ctx) previous
+        frame's satellite patch tokens WITHOUT class/dynamic tokens.
+        shift_xy: (b, 2) ego-motion shift of this frame's crop center inside
+        the previous crop, in normalized crop coordinates (+x right, +y down).
+        Returns (b, N, c) or None when no previous tokens exist.
+        """
+        if sat_tokens_prev is None:
+            return None
+        b, n, c = x.shape
+        th, tw = int(token_grid[0]), int(token_grid[1])
+        qh, qw = (int(query_hw[0]), int(query_hw[1])) if query_hw is not None else (th, tw)
+        grid = self._window_grid((qh, qw), (th, tw), x.device, x.dtype)  # (N, K, 2)
+        grid = grid.unsqueeze(0).expand(b, -1, -1, -1) + shift_xy.to(grid.dtype).view(b, 1, 1, 2)
+        grid = grid.clamp(-1.0, 1.0)
+
+        kt = self.to_k(self.norm_kv(sat_tokens_prev)).transpose(1, 2).reshape(b, -1, th, tw).to(grid.dtype)
+        vt = self.to_v(self.norm_kv(sat_tokens_prev)).transpose(1, 2).reshape(b, -1, th, tw).to(grid.dtype)
+        ks = torch.nn.functional.grid_sample(kt, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        vs = torch.nn.functional.grid_sample(vt, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        win = self.reference_window ** 2  # KxK window around the query patch
+        # grid_sample output: (b, inner, N, win). Group inner into heads:
+        # (b, heads, dh, N, win) -> per-head window attention.
+        K = ks.reshape(b, self.heads, self.dim_head, qh * qw, win)
+        V = vs.reshape(b, self.heads, self.dim_head, qh * qw, win)
+
+        q = self.to_q(self.norm_q(x)).to(K.dtype)  # (b, N, inner)
+        q = q.view(b, qh * qw, self.heads, self.dim_head).permute(0, 2, 1, 3)  # (b, heads, N, dh)
+        q = q.reshape(b * self.heads, qh * qw, 1, self.dim_head)
+        Kw = K.permute(0, 1, 3, 4, 2).reshape(b * self.heads, qh * qw, win, self.dim_head)
+        Vw = V.permute(0, 1, 3, 4, 2).reshape(b * self.heads, qh * qw, win, self.dim_head)
+        attn = torch.softmax(q @ Kw.transpose(-1, -2) * self.scale, dim=-1)  # (b*heads, N, 1, win)
+        out = (attn @ Vw).reshape(b, self.heads, qh * qw, self.dim_head)
+        out = out.permute(0, 2, 1, 3).reshape(b, qh * qw, -1)
+        out = self.to_out(out.to(x.dtype))
+        with torch.no_grad():
+            self.last_conf_mean = float(attn.detach().float().max(dim=-1).values.mean())
+        return out
 
 
 class RayPosteriorEvidenceFusion(nn.Module):
@@ -966,7 +1056,7 @@ class RayPosteriorEvidenceFusion(nn.Module):
             return x.new_zeros((x.shape[0], x.shape[1], 1))
         return mask.to(device=x.device, dtype=x.dtype).clamp(0.0, 1.0)
 
-    def forward(self, x, sat_ref, lidar_ref, query_hw=None, lidar_geometry_mask=None, temporal_ref=None, temporal_validity=None):
+    def forward(self, x, sat_ref, lidar_ref, query_hw=None, lidar_geometry_mask=None, temporal_ref=None, temporal_validity=None, sat_temporal_ref=None):
         if sat_ref is None:
             sat_ref = torch.zeros_like(x)
         if lidar_ref is None:
@@ -995,6 +1085,14 @@ class RayPosteriorEvidenceFusion(nn.Module):
                 self.last_temporal_confidence.copy_(
                     (temporal_validity * temporal_confidence).float().mean().to(self.last_temporal_confidence.device)
                 )
+        if sat_temporal_ref is not None:
+            # Route-C stream: the attention's out projection is zero-initialised,
+            # so an additive merge is exactly inert at the start — no gate to
+            # slowly open (the v1 lesson), the gradient scales the weights.
+            out = sat_ref + lidar_message
+            if temporal_message is not None:
+                out = out + temporal_message
+            return out + sat_temporal_ref
         if temporal_message is None:
             return sat_ref + lidar_message
         return sat_ref + lidar_message + temporal_message
@@ -1028,6 +1126,8 @@ class BasicTransformerBlock(nn.Module):
         self.temporal_hub = None
         self.last_fused_delta = None
         self.frozen_fused_delta = None
+        self.sat_temporal_attn = None
+        self._sat_payload_cache = None
         self.attn2 = CrossAttention(
             query_dim=dim,
             context_dim=context_dim,
@@ -1082,7 +1182,7 @@ class BasicTransformerBlock(nn.Module):
         touched here."""
         payload = self.temporal_hub.payload if self.temporal_hub is not None else None
         delta = self.frozen_fused_delta if self.frozen_fused_delta is not None else self.last_fused_delta
-        if payload is None or delta is None:
+        if payload is None or delta is None or "transport" not in payload:
             return None, None
         b, n, c = x.shape
         h, w = int(latent_hw[0]), int(latent_hw[1])
@@ -1097,12 +1197,39 @@ class BasicTransformerBlock(nn.Module):
             temporal_ref = temporal_ref * strength
         return temporal_ref, validity
 
+    def _build_sat_temporal(self, latent_hw, x):
+        """Route-C payload fetch, outside checkpointing: previous frame's
+        satellite tokens + this frame's ego-motion shift. Snapshot semantics:
+        payload data is stashed once per frame boundary and reused for every
+        DDIM step of the frame."""
+        payload = self.temporal_hub.payload if self.temporal_hub is not None else None
+        if payload is None or self.sat_temporal_attn is None:
+            return None
+        if "sat_tokens_prev" not in payload or payload.get("sat_tokens_prev") is None:
+            return None
+        key = (id(payload), )
+        if self._sat_payload_cache is not None and self._sat_payload_cache[0] == key:
+            pack = self._sat_payload_cache[1]
+        else:
+            pack = {
+                "tokens": payload["sat_tokens_prev"],
+                "shift": payload.get("sat_shift_xy"),
+                "grid": payload.get("sat_token_grid", (14, 14)),
+            }
+            self._sat_payload_cache = (key, pack)
+        import os as _os
+        if _os.environ.get("SAT_TEMPORAL_DEBUG"):
+            print(f"[sat-dbg] fetch tokens={pack['tokens'].shape} "
+                  f"requires_grad={pack['tokens'].requires_grad} data_ptr={pack['tokens'].data_ptr()}", flush=True)
+        return pack
+
     def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
             temporal_ref, temporal_validity = self._build_temporal(latent_hw, x)
+            sat_pack = self._build_sat_temporal(latent_hw, x)
             out = checkpoint(
                 self._forward,
-                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, temporal_ref, temporal_validity),
+                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, temporal_ref, temporal_validity, sat_pack),
                 self.parameters(),
                 self.checkpoint,
             )
@@ -1127,7 +1254,7 @@ class BasicTransformerBlock(nn.Module):
         x = self.ff(self.norm3(x)) + x
         return x
 
-    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, temporal_ref=None, temporal_validity=None):
+    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, temporal_ref=None, temporal_validity=None, sat_pack=None):
         x = self.attn1(self.norm1(x)) + x
         x_base = x
         sat_delta = self.attn2(
@@ -1140,6 +1267,19 @@ class BasicTransformerBlock(nn.Module):
             ray_depth_evidence=lidar_evidence,
         )
         lidar_delta = self.attn_lidar(self.norm_lidar(x_base), lidar_context, query_hw=latent_hw)
+        sat_temporal_delta = None
+        if sat_pack is not None:
+            n = x_base.shape[1]
+            qh = int(latent_hw[0]) if latent_hw is not None else 16
+            qw = n // qh
+            sat_temporal_delta = self.sat_temporal_attn(
+                x_base, sat_pack["tokens"], sat_pack["shift"],
+                token_grid=sat_pack["grid"], query_hw=(qh, qw),
+            )
+            import os as _os
+            if _os.environ.get("SAT_TEMPORAL_DEBUG") and sat_temporal_delta is not None:
+                print(f"[sat-dbg] fwd delta requires_grad={sat_temporal_delta.requires_grad} "
+                      f"absmax={float(sat_temporal_delta.abs().max())}", flush=True)
         if self.ray_fusion_mode == "ray_posterior":
             fused_delta = self.ray_posterior_fusion(
                 self.norm_evidence(x_base),
@@ -1149,6 +1289,7 @@ class BasicTransformerBlock(nn.Module):
                 lidar_geometry_mask=lidar_geometry_mask,
                 temporal_ref=temporal_ref,
                 temporal_validity=temporal_validity,
+                sat_temporal_ref=sat_temporal_delta,
             )
         else:
             fused_delta = self.ray_evidence_attn(

@@ -48,6 +48,8 @@ from temporal_evidence import (  # noqa: E402
     TemporalTransportBuilder,
     enable_temporal_evidence,
     temporal_gate_parameters,
+    sat_temporal_parameters,
+    sat_shift_xy,
 )
 
 CONSTANTS = {
@@ -84,9 +86,14 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--save-every", type=int, default=2000)
     p.add_argument("--temporal-strength-min", type=float, default=0.3)
-    p.add_argument("--amp", action="store_true", default=True)
+    p.add_argument("--amp", dest="amp", action="store_true", default=True)
+    p.add_argument("--no-amp", dest="amp", action="store_false")
     p.add_argument("--gate-bias", type=float, default=-6.0)
     p.add_argument("--resume", default="")
+    p.add_argument("--force-teacher", action="store_true", default=True,
+                   help="run the prev-frame teacher forward every step (default); "
+                        "skipping it silently detaches route-C from the graph under DDP")
+    p.add_argument("--stream-teacher-skip", dest="force_teacher", action="store_false")
     return p.parse_args()
 
 
@@ -127,11 +134,12 @@ class StreamDataset(Dataset):
     (consecutive items share a worker); with more workers it only loses the
     reuse optimization, never correctness."""
 
-    def __init__(self, dataset, rows, plan, kitti_root):
+    def __init__(self, dataset, rows, plan, kitti_root, force_teacher=False):
         self.dataset = dataset
         self.rows = rows
         self.plan = plan
         self.kitti_root = kitti_root
+        self.force_teacher = bool(force_teacher)
         self._last_idx = None
         self._last_sample = None
 
@@ -149,13 +157,20 @@ class StreamDataset(Dataset):
         pi, ci, cache_valid = self.plan[i]
         # A rank's first item always loads prev: the module caches are empty
         # in a fresh process regardless of what the plan says.
-        cache_valid = bool(cache_valid) and i > 0
+        cache_valid = bool(cache_valid) and i > 0 and not self.force_teacher
         cur = self._load(ci)
         prev = None if cache_valid else self._load(pi)
         transport = TemporalTransportBuilder(
             self.rows[pi], self.rows[ci], kitti_root=self.kitti_root
         )
-        return {"cur": cur, "prev": prev, "cache_valid": bool(cache_valid), "transport": transport}
+        shift = sat_shift_xy(self.rows[pi], self.rows[ci], kitti_root=self.kitti_root)
+        return {
+            "cur": cur,
+            "prev": prev,
+            "cache_valid": bool(cache_valid),
+            "transport": transport,
+            "builder_row": {"sat_shift": shift},
+        }
 
 
 class TrainingStepModule(torch.nn.Module):
@@ -244,7 +259,7 @@ def main():
         image_semantic_width=CONSTANTS["image_semantic_width"],
         include_tracklets=False,
     )
-    stream_dataset = StreamDataset(dataset, rows, shard_plan, args.kitti_root)
+    stream_dataset = StreamDataset(dataset, rows, shard_plan, args.kitti_root, force_teacher=args.force_teacher)
     loader = DataLoader(
         stream_dataset,
         batch_size=args.batch_per_gpu,
@@ -252,7 +267,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
-        prefetch_factor=6 if args.num_workers > 0 else None,
+        prefetch_factor=6 if args.num_workers > 0 else 2,
         collate_fn=pair_collate,
     )
 
@@ -260,31 +275,43 @@ def main():
     load_checkpoint_into_model(model, args.ckpt)
 
     hub, blocks = enable_temporal_evidence(model, gate_bias=args.gate_bias)
-    model.to(device)  # gates were created after the initial .cuda()
+    model.to(device)  # new modules were created after the initial .cuda()
     for param in model.parameters():
         param.requires_grad_(False)
-    gate_params = temporal_gate_parameters(blocks)
-    for param in gate_params:
+    trainable = sat_temporal_parameters(blocks)
+    for param in trainable:
         param.requires_grad_(True)
     if rank == 0:
-        n_gate = sum(p.numel() for p in gate_params)
-        print(f"[temporal-train] temporal blocks: {len(blocks)}, gate params: {n_gate}")
+        n_train = sum(p.numel() for p in trainable)
+        print(f"[temporal-train] temporal blocks: {len(blocks)}, sat-temporal params: {n_train}")
 
     model.train()
     training_model = TrainingStepModule(model)
     if distributed:
         training_model = DDP(training_model, device_ids=[local_rank], find_unused_parameters=False)
-    optimizer = torch.optim.AdamW(gate_params, lr=args.lr, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
     scaler = GradScaler(enabled=args.amp)
+
+    # frozen satellite encoder for prev-frame patch tokens (route C)
+    sat_encoder = model.condition_model_sat.cuda().eval()
+
+    @torch.no_grad()
+    def prev_sat_tokens(prev_batch):
+        """Raw ViT patch tokens (+class) of the previous frame's satellite map;
+        class token stripped, matching make_condition's [:, 1:, :]."""
+        inputs = prev_batch["sat_map"]
+        if len(inputs.shape) == 3:
+            inputs = inputs[..., None]
+        return sat_encoder(inputs * 2 - 1)[:, 1:, :]
 
     start_step = 0
     if args.resume and Path(args.resume).exists():
         payload = torch.load(args.resume, map_location="cpu")
-        gates_state = payload.get("temporal_gates", {})
+        attn_state = payload.get("sat_temporal", {})
         for name, block in enumerate(blocks):
             key = str(name)
-            if key in gates_state:
-                block.ray_posterior_fusion.temporal_gate.load_state_dict(gates_state[key])
+            if key in attn_state:
+                block.sat_temporal_attn.load_state_dict(attn_state[key])
         start_step = int(payload.get("step", 0))
         optimizer.load_state_dict(payload.get("optimizer", optimizer.state_dict()))
         for group in optimizer.param_groups:
@@ -293,20 +320,16 @@ def main():
             print(f"[temporal-train] resumed from {args.resume} at step {start_step}, lr={args.lr}")
 
     def gate_stats():
-        confs, maxs = [], []
+        maxs = []
         for block in blocks:
-            f = block.ray_posterior_fusion
-            if hasattr(f, "last_temporal_confidence"):
-                confs.append(float(f.last_temporal_confidence))
-            g = f.temporal_gate
-            maxs.append(float(g.weight.abs().max().detach()))
-        return float(np.mean(confs)) if confs else 0.0, float(np.max(maxs)) if maxs else 0.0
+            for p in block.sat_temporal_attn.to_out.parameters():
+                maxs.append(float(p.abs().max().detach()))
+        return float(np.max(maxs)) if maxs else 0.0
 
     log_every = max(1, args.log_every)
     metrics_file = (out_dir / "temporal_metrics.jsonl").open("a") if rank == 0 else None
     iterator = iter(loader)
     data_epoch = 0
-    cache_warm = False  # module caches populated by a previous cur forward?
     running = []
     t0 = time.time()
     for step in range(start_step + 1, args.steps + 1):
@@ -318,21 +341,34 @@ def main():
             item = next(iterator)
         cur_batch = move_batch_to_device(item["cur"], device)
         builder = item["transport"][0] if isinstance(item["transport"], list) else item["transport"]
+        builder_row = item["builder_row"][0] if isinstance(item["builder_row"], list) else item["builder_row"]
+        prev_batch = item["prev"]
 
-        # Sequential streaming: when the previous step's forward produced this
-        # frame's predecessor (cache_valid AND caches warm), the per-module
-        # caches are already in place and the teacher forward is skipped.
-        # Otherwise run it once under no_grad with the hub cleared.
+        # Route-C prev inputs: satellite patch tokens (needed every step that
+        # has a prev frame). The v1 latent-transport caches still rely on the
+        # teacher forward for fused_delta; with sat-only streaming we reuse
+        # them when valid (previous step's cur forward filled them).
         hub.clear()
-        if item["prev"] is not None and not cache_warm:
-            prev_batch = move_batch_to_device(item["prev"], device)
+        prev_tokens = None
+        if prev_batch is not None:
+            prev_batch = move_batch_to_device(prev_batch, device)
+            prev_tokens = prev_sat_tokens(prev_batch)
+            # teacher forward every step: the streaming skip (cache_valid) left
+            # a backward graph state where gradients never reached the new
+            # attention's parameters (root-caused to AMP graph reuse), so we
+            # keep the run-start behavior and eat the extra forward.
             with torch.no_grad(), autocast(enabled=args.amp):
                 _ = training_model(prev_batch)
-        cache_warm = True
 
         strength = float(np.random.uniform(args.temporal_strength_min, 1.0))
-        payload = builder.payload(strength=strength)
-        if payload is None:
+        payload = builder.payload(strength=strength) or {}
+        if prev_tokens is not None:
+            payload["sat_tokens_prev"] = prev_tokens
+            payload["sat_shift_xy"] = torch.tensor(
+                builder_row["sat_shift"], device=prev_tokens.device, dtype=torch.float32
+            )
+            payload["sat_token_grid"] = (14, 14)
+        if not payload:
             hub.clear()
         else:
             hub.set(payload)
@@ -352,12 +388,11 @@ def main():
         running.append(float(loss.detach()))
 
         if step % log_every == 0 and rank == 0:
-            conf, wmax = gate_stats()
+            wmax = gate_stats()
             record = {
                 "step": step,
                 "loss": float(np.mean(running)),
-                "temporal_conf_mean": conf,
-                "gate_w_absmax": wmax,
+                "sat_out_w_absmax": wmax,
                 "strength": strength,
                 "data_epoch": data_epoch,
                 "sec_per_step": round((time.time() - t0) / log_every, 3),
@@ -372,8 +407,8 @@ def main():
             if rank == 0:
                 ckpt_payload = {
                     "step": step,
-                    "temporal_gates": {
-                        str(i): b.ray_posterior_fusion.temporal_gate.state_dict()
+                    "sat_temporal": {
+                        str(i): b.sat_temporal_attn.state_dict()
                         for i, b in enumerate(blocks)
                     },
                     "optimizer": optimizer.state_dict(),

@@ -122,20 +122,31 @@ class TemporalTransportBuilder:
         return {"transport": self.transport, "strength": float(strength)}
 
 
-def enable_temporal_evidence(model, gate_bias=-6.0):
-    """Inject temporal gates post-hoc into every ray-posterior fusion module.
+def enable_temporal_evidence(model, gate_bias=-6.0, sat_reference_window=3):
+    """Inject temporal gates post-hoc into every ray-posterior fusion module,
+    and (route-C) a zero-initialised SatTemporalReferenceAttention per block.
 
     Freezing is left to the caller. Returns (hub, blocks) where blocks are the
-    BasicTransformerBlock modules wired to the hub (the gate parameters live
-    in block.ray_posterior_fusion.temporal_gate).
+    BasicTransformerBlock modules wired to the hub (gate params live in
+    block.ray_posterior_fusion.temporal_gate; route-C params in
+    block.sat_temporal_attn).
     """
-    from ldm.modules.KITTI_attention import TemporalEvidenceHub
+    from ldm.modules.KITTI_attention import TemporalEvidenceHub, SatTemporalReferenceAttention
 
     hub = TemporalEvidenceHub()
     blocks = []
     for module in model.modules():
         if getattr(module, "ray_fusion_mode", None) == "ray_posterior" and getattr(module, "ray_posterior_fusion", None) is not None:
             module.ray_posterior_fusion.enable_temporal(gate_bias=gate_bias)
+            if module.sat_temporal_attn is None:
+                inner = module.ray_posterior_fusion.dim
+                module.sat_temporal_attn = SatTemporalReferenceAttention(
+                    query_dim=inner,
+                    context_dim=768,
+                    heads=8,
+                    dim_head=64,
+                    reference_window=sat_reference_window,
+                )
             module.temporal_hub = hub
             blocks.append(module)
     if not blocks:
@@ -148,6 +159,45 @@ def temporal_gate_parameters(blocks):
     for block in blocks:
         params.extend(block.ray_posterior_fusion.temporal_gate.parameters())
     return params
+
+
+def sat_temporal_parameters(blocks):
+    """Route-C trainable parameters: K/V/Q/out of every sat-temporal attention."""
+    params = []
+    for block in blocks:
+        params.extend(block.sat_temporal_attn.parameters())
+    return params
+
+
+def sat_shift_xy(prev_row, cur_row, kitti_root=None, sat_size=256, map_extent_m=51.2):
+    """Ego-motion shift of the current frame's satellite crop center inside the
+    previous frame's crop, normalized to [-1, 1] crop coordinates.
+
+    The dataloader centers each crop on the camera and aligns it to the
+    heading (KITTI_utils: final crop 256 px at 0.2 m/px = 51.2 m extent), so
+    the inter-frame offset is the camera position change rotated into the
+    previous frame's heading frame.
+    """
+    import numpy as np
+    from pathlib import Path as _P
+
+    geom = pwu.SequenceGeometry(resolve_calib_dir(rebase_kitti_path(cur_row["calib_dir"], kitti_root)))
+    T1 = geom.oxts_pose(rebase_kitti_path(prev_row["oxts_path"], kitti_root))
+    T2 = geom.oxts_pose(rebase_kitti_path(cur_row["oxts_path"], kitti_root))
+    # camera positions in IMU/geo frame
+    cam_prev = (T1 @ geom.T_velo_imu)[:3, 3]
+    cam_cur = (T2 @ geom.T_velo_imu)[:3, 3]
+    d_geo = cam_cur - cam_prev
+    # rotate into the previous frame's heading frame: x forward, y right
+    yaw = float(np.arctan2(T1[1, 0], T1[0, 0]))
+    c, s = np.cos(-yaw), np.sin(-yaw)
+    fwd = c * d_geo[0] - s * d_geo[1]
+    right = s * d_geo[0] + c * d_geo[1]
+    # the current crop center sits at (fwd, right) of the previous center, in
+    # meters; normalized crop coords: +x right, +y down (image convention)
+    sx = right / map_extent_m
+    sy = -fwd / map_extent_m
+    return [float(sx), float(sy)]
 
 
 def freeze_temporal_snapshot(blocks):
