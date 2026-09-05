@@ -78,11 +78,13 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--noise-mode",
-        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "temporal_net"],
+        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "temporal_net", "sat_temporal_net"],
         default="shared",
     )
     parser.add_argument("--temporal-gates", default="",
                         help="gate checkpoint from train_kitti_temporal.py; required for temporal_net")
+    parser.add_argument("--sat-window", type=int, default=3,
+                        help="route-C: attention window radius in satellite patch grid")
     parser.add_argument(
         "--ar-strength",
         type=float,
@@ -311,20 +313,41 @@ def main():
             row[key] = rebase_kitti_path(row[key], args.kitti_root)
     print(f"[noise-modes] {len(samples_list)} frames, mode={args.noise_mode}")
 
-    model = instantiate_from_config(cfg.model).cuda().eval()
+    model = instantiate_from_config(cfg.model)
     load_checkpoint_into_model(model, args.ckpt)
     temporal_hub, temporal_blocks = None, None
-    if args.noise_mode == "temporal_net":
-        temporal_hub, temporal_blocks = te.enable_temporal_evidence(model)
+    if args.noise_mode in ("temporal_net", "sat_temporal_net"):
+        temporal_hub, temporal_blocks = te.enable_temporal_evidence(
+            model, sat_reference_window=args.sat_window
+        )
+    model = model.cuda().eval()
+    if args.noise_mode in ("temporal_net", "sat_temporal_net"):
         gates_path = Path(args.temporal_gates)
         if not gates_path.exists():
             raise FileNotFoundError(f"--temporal-gates not found: {gates_path}")
         gate_ckpt = torch.load(gates_path, map_location="cpu")
         for name, block in enumerate(temporal_blocks):
             key = str(name)
-            if key in gate_ckpt.get("temporal_gates", {}):
+            if args.noise_mode == "temporal_net" and key in gate_ckpt.get("temporal_gates", {}):
                 block.ray_posterior_fusion.temporal_gate.load_state_dict(gate_ckpt["temporal_gates"][key])
-        print(f"[noise-modes] temporal gates loaded from {gates_path} (step {gate_ckpt.get('step', '?')})")
+            if args.noise_mode == "sat_temporal_net" and key in gate_ckpt.get("sat_temporal", {}):
+                block.sat_temporal_attn.load_state_dict(gate_ckpt["sat_temporal"][key])
+        if args.noise_mode == "temporal_net":
+            devs = {n: str(b.ray_posterior_fusion.temporal_gate.weight.device) for n, b in enumerate(temporal_blocks)}
+            assert all(d == "cuda:0" for d in devs.values()), f"gates on wrong devices: {devs}"
+        else:
+            devs = {n: str(b.sat_temporal_attn.to_out.weight.device) for n, b in enumerate(temporal_blocks)}
+            assert all(d == "cuda:0" for d in devs.values()), f"sat-temporal attn on wrong devices: {devs}"
+        print(f"[noise-modes] weights loaded from {gates_path} (step {gate_ckpt.get('step', '?')}); all on cuda:0")
+    # frozen satellite encoder for prev-frame patch tokens (route C)
+    sat_encoder = model.condition_model_sat.cuda().eval() if args.noise_mode == "sat_temporal_net" else None
+
+    @torch.no_grad()
+    def prev_sat_tokens_fn(prev_sample):
+        """Raw ViT patch tokens (class token stripped) of a previous frame's
+        satellite map; takes the pre-collate sample dict."""
+        inputs = prev_sample["sat_map"].unsqueeze(0).cuda() * 2 - 1
+        return sat_encoder(inputs)[:, 1:, :]
     sampler = KITTI_DDIMSampler(model.DDPM, model.pre_AE_model, model.scale_factor)
     sampler.make_schedule(ddim_num_steps=args.ddim_steps, ddim_eta=args.eta, verbose=False)
 
@@ -369,6 +392,22 @@ def main():
                     pl = builder_t.payload(strength=1.0)
                     if pl is not None:
                         temporal_hub.set(pl)
+        elif args.noise_mode == "sat_temporal_net":
+            # route-C frame boundary: previous frame's raw satellite tokens +
+            # ego-motion shift. Non-recursive (tokens come from the data, not
+            # from the previous generation), so no snapshot of generated state
+            # is needed; the whole DDIM trajectory of this frame consumes it.
+            if temporal_hub is not None:
+                temporal_hub.clear()
+                if idx > 0:
+                    temporal_hub.set({
+                        "sat_tokens_prev": prev_sat_tokens_fn(samples_list[idx - 1]),
+                        "sat_shift_xy": torch.tensor(
+                            te.sat_shift_xy(prev_row, row, kitti_root=args.kitti_root),
+                            device="cuda", dtype=torch.float32,
+                        ),
+                        "sat_token_grid": (14, 14),
+                    })
 
         if args.noise_mode == "per_frame":
             torch.manual_seed(args.seed + idx)
@@ -533,6 +572,13 @@ def main():
             x_T = torch.randn((1, 4, 16, 64), device="cuda")
             timesteps = None
             noise_info = {"mode": "temporal_net", "frame": idx, "seed": args.seed + idx}
+        elif args.noise_mode == "sat_temporal_net":
+            # same policy as temporal_net: fresh noise, consistency from the
+            # learned spatiotemporal satellite reference stream
+            torch.manual_seed(args.seed + idx)
+            x_T = torch.randn((1, 4, 16, 64), device="cuda")
+            timesteps = None
+            noise_info = {"mode": "sat_temporal_net", "frame": idx, "seed": args.seed + idx}
         else:
             if prev_latent is None:
                 x_T = shared_x_T.clone()
@@ -555,6 +601,11 @@ def main():
             confs = [float(b.ray_posterior_fusion.last_temporal_confidence) for b in temporal_blocks]
             noise_info["temporal_conf_mean"] = float(np.mean(confs))
             noise_info["temporal_conf_max"] = float(np.max(confs))
+        if args.noise_mode == "sat_temporal_net" and temporal_blocks is not None:
+            confs = [float(b.sat_temporal_attn.last_conf_mean) for b in temporal_blocks
+                     if b.sat_temporal_attn.last_conf_mean is not None]
+            if confs:
+                noise_info["sat_attn_max_mean"] = float(np.mean(confs))
         prev_latent = latent.detach()
         prev_target = pack["target"][0].detach()
         prev_row = row

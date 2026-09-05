@@ -953,6 +953,7 @@ class SatTemporalReferenceAttention(nn.Module):
         self.to_v = nn.Linear(context_dim, inner, bias=False)
         self.to_out = zero_module(nn.Linear(inner, query_dim))
         self.reference_window = max(1, int(reference_window))
+        self.last_conf_mean = None
 
     def _window_grid(self, query_hw, token_hw, device, dtype):
         qh, qw = int(query_hw[0]), int(query_hw[1])
