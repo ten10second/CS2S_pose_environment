@@ -1,0 +1,181 @@
+model:
+  base_learning_rate: 1.0e-05
+  target: models.KITTI_geo_ldm.txt_control.Boost_Sat2Den_ddpm
+  params:
+    AE_config:
+      target: models.autoencoder.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: models.loss_fun.LPIPSWithDiscriminator
+          params:
+            disc_start: 50001
+            kl_weight: 1.0e-06
+            disc_weight: 0.5
+    AE_ckpt_path: /mnt/shizhm/BasicModel/checkpoints/sd-v1-4.ckpt
+    DDPM_config:
+      target: models.KITTI_geo_ldm_diffusion.latent_diffusion.DDPM
+      params:
+        linear_start: 0.00085
+        linear_end: 0.012
+        timesteps: 1000
+        unet_config:
+          target: models.KITTI_geo_ldm_diffusion.openaimodel.UNetModel
+          params:
+            image_size: 32
+            in_channels: 4
+            out_channels: 4
+            model_channels: 320
+            attention_resolutions:
+            - 4
+            - 2
+            - 1
+            num_res_blocks: 2
+            channel_mult:
+            - 1
+            - 2
+            - 4
+            - 4
+            num_heads: 8
+            use_spatial_transformer: true
+            transformer_depth: 1
+            context_dim: 768
+            use_checkpoint: false
+            legacy: false
+            use_lidar_cross_attention: true
+            lidar_context_dim: 768
+            ray_fusion_mode: ray_posterior
+            use_lidar_ray_posterior: true
+            lidar_posterior_log_depth_sigma: 0.35
+            lidar_posterior_strength: 2.0
+            lidar_message_gate_bias: -2.0
+            lidar_reference_window: 3
+        control_grd: null
+    Condition_config_grd:
+      target: ldm.modules.encoders.modules.CLIPVisionEmbedder
+    Condition_config_sat:
+      target: models.KITTI_geo_ldm.condition_model.VIT_224
+    Lidar_context_config:
+      target: models.KITTI_geo_ldm.lidar_condition_model.LidarRayDepthSemanticTokenEncoder
+      params:
+        point_in_channels: 10
+        front_in_channels: 5
+        hidden_channels: 128
+        token_dim: 768
+        token_grid:
+        - 8
+        - 32
+        image_size:
+        - 128
+        - 512
+        use_evidence_maps: true
+        evidence_dilation: 4
+        evidence_free_space_dilation: 14
+        token_output_norm: center_layernorm
+        token_structure_target_ratio: 0.08
+        use_pointmap_pe: true
+        point_pretrained_ckpt: ''
+        point_feature_dim: 576
+        semantic_feature_dim: 384
+        ray_depth_bins: 4
+    pre_sat2grd_model_path: null
+    pre_ldm_model_path: /mnt/shizhm/BasicModel/checkpoints/sd-v1-4.ckpt
+    scale_factor: 0.18215
+    Condition_config_txt:
+      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+    use_lidar_cond: true
+    lidar_condition_key: lidar_cond
+    lidar_geom_mode: ray_depth_inv
+    dynamic_point_loss_weight: 1.0
+    dynamic_point_dilation: 8
+    lidar_depth_loss_weight: 1.0
+    lidar_depth_output_scale: 0.0
+    lidar_depth_bottleneck_scale: 1.0
+    lidar_semantic_alignment_weight: 0.2
+    lidar_semantic_alignment_mask_mode: lidar_hit
+    ray_evidence_mask_mode: lidar_hit
+    lidar_depth_log_eps: 0.001
+    lidar_semantic_alignment_key: image_semantic_feat
+    satellite_condition_dropout_prob: 0.1
+data:
+  target: dataloader.dataload.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 2
+    wrap: false
+    train:
+      target: dataloader.KITTI_raw_sat_lidar.SatLidarRawDataset
+      params:
+        manifest: /mnt/shizhm/CS2S_pose_environment_sat-lidar-ray-posterior-evidence/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/train_manifest.jsonl
+        condition_mode: raw_lidar_pointmap
+        image_height: 128
+        image_width: 512
+        sat_size: 256
+        max_depth: 80.0
+        align_satellite_to_camera: true
+        include_range_image: false
+        include_raw_lidar_points: false
+        lidar_ray_feature_dim: 576
+        lidar_ray_depth_bins: 4
+        lidar_ray_height: 8
+        lidar_ray_width: 32
+        image_semantic_feature_key: dino_feat
+        image_semantic_feature_dim: 384
+        image_semantic_height: 8
+        image_semantic_width: 32
+        include_tracklets: false
+        range_height: 64
+        range_width: 1024
+        kitti_root: /mnt/shizhm/DATA/KITTI/KITTI_RAW
+        lidar_point_feature_cache_root: ''
+        lidar_point_feature_dim: 0
+        lidar_ray_feature_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/utonia_ray_depth_all_fp16
+        lidar_ray_feature_cache_suffix: .npz
+        image_semantic_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/dino_vits14_8x32_all_fp16
+        image_semantic_cache_suffix: .npz
+    test:
+      target: dataloader.KITTI_raw_sat_lidar.SatLidarRawDatasetTest
+      params:
+        manifest: /mnt/shizhm/CS2S_pose_environment_sat-lidar-ray-posterior-evidence/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/test_manifest.jsonl
+        condition_mode: raw_lidar_pointmap
+        image_height: 128
+        image_width: 512
+        sat_size: 256
+        max_depth: 80.0
+        align_satellite_to_camera: true
+        include_range_image: false
+        include_raw_lidar_points: false
+        lidar_ray_feature_dim: 576
+        lidar_ray_depth_bins: 4
+        lidar_ray_height: 8
+        lidar_ray_width: 32
+        image_semantic_feature_key: dino_feat
+        image_semantic_feature_dim: 384
+        image_semantic_height: 8
+        image_semantic_width: 32
+        include_tracklets: false
+        range_height: 64
+        range_width: 1024
+        kitti_root: /mnt/shizhm/DATA/KITTI/KITTI_RAW
+        lidar_point_feature_cache_root: ''
+        lidar_point_feature_dim: 0
+        lidar_ray_feature_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/utonia_ray_depth_all_fp16
+        lidar_ray_feature_cache_suffix: .npz
+        image_semantic_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/dino_vits14_8x32_all_fp16
+        image_semantic_cache_suffix: .npz
