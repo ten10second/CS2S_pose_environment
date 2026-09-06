@@ -25,24 +25,33 @@ else:
 EOF
 
 echo "=== flicker ratio (gen/GT consecutive-frame LPIPS) ==="
-CUDA_VISIBLE_DEVICES=5 $PY - <<EOF
+CUDA_VISIBLE_DEVICES=${EVAL_GPU:-5} $PY - <<EOF
 import json, numpy as np, torch, lpips
 from pathlib import Path
 import PIL.Image as I
 run = Path("$RUN")
 dev = torch.device("cuda:0")
 fn = lpips.LPIPS(net="alex").to(dev).eval()
+
 def t(p):
-    a = np.asarray(I.open(p).convert("RGB")).astype(np.float32)/255.
-    return torch.from_numpy(a).permute(2,0,1)[None].to(dev)
-gen = sorted((run/"images"/"normal").glob("*.png"))
-tg, tt = [], []
+    a = np.asarray(I.open(p).convert("RGB")).astype(np.float32) / 255.0
+    return torch.from_numpy(a).permute(2, 0, 1)[None].to(dev)
+
+def pair_lpips(pa, pb):
+    # P2-01: scale BOTH inputs to [-1,1] BEFORE calling LPIPS; never touch its output
+    return float(fn(t(pa) * 2 - 1, t(pb) * 2 - 1))
+
+gen = sorted((run / "images" / "normal").glob("*.png"))
+tg, tt, pairs = [], [], []
 with torch.no_grad():
     for a, b in zip(gen, gen[1:]):
-        tg.append(float(fn(t(a)*2-1, t(b)*2-1)))
-        tt.append(float(fn(t(run/"images"/"gt"/b.name)*2-1,
-                          t(run/"images"/"gt"/b.name.replace(b.name, a.name)) if False else t(run/"images"/"gt"/a.name))*2-1))
+        ga, gb = run / "images" / "gt" / a.name, run / "images" / "gt" / b.name
+        if not (run/"images"/"normal"/a.name).exists() or not gb.exists():
+            continue  # P2-02 (partial): skip unpaired frames, count them
+        tg.append(pair_lpips(run/"images"/"normal"/a.name, run/"images"/"normal"/b.name))
+        tt.append(pair_lpips(ga, gb))
+        pairs.append(a.name)
 mg, mt = float(np.mean(tg)), float(np.mean(tt))
-print(f"  tLPIPS gen={mg:.4f}  gt={mt:.4f}  RATIO={mg/mt:.3f}  (n={len(tg)})")
-print("  baselines: per_frame 1.630 | warp2 1.305 | autoreg 0.820 | target <1.3")
+print(f"  tLPIPS gen={mg:.4f}  gt={mt:.4f}  RATIO={mg/mt:.3f}  (n={len(tg)}, skipped {len(gen)-1-len(tg)})")
+print("  baselines: per_frame 1.630 | warp2 1.305 | autoreg 0.820 | instance 1.302 | target <1.3")
 EOF

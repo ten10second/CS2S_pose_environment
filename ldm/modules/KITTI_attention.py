@@ -1129,6 +1129,8 @@ class BasicTransformerBlock(nn.Module):
         self.frozen_fused_delta = None
         self.sat_temporal_attn = None
         self._sat_payload_cache = None
+        self.history_attn = None
+        self.history_ratio = None
         self.attn2 = CrossAttention(
             query_dim=dim,
             context_dim=context_dim,
@@ -1224,13 +1226,25 @@ class BasicTransformerBlock(nn.Module):
                   f"requires_grad={pack['tokens'].requires_grad} data_ptr={pack['tokens'].data_ptr()}", flush=True)
         return pack
 
+    def _build_history_pack(self):
+        """v2 history payload fetch (pre-checkpoint, like the v1/route-C packs).
+        No cross-step caching: tokens are freshly built per frame boundary."""
+        payload = self.temporal_hub.payload if self.temporal_hub is not None else None
+        if payload is None or self.history_attn is None or "history_tokens" not in payload:
+            return None
+        return {
+            "history_tokens": payload["history_tokens"],
+            "has_history": bool(payload.get("has_history", True)),
+        }
+
     def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
             temporal_ref, temporal_validity = self._build_temporal(latent_hw, x)
             sat_pack = self._build_sat_temporal(latent_hw, x)
+            hist_pack = self._build_history_pack()
             out = checkpoint(
                 self._forward,
-                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, temporal_ref, temporal_validity, sat_pack),
+                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, temporal_ref, temporal_validity, sat_pack, hist_pack),
                 self.parameters(),
                 self.checkpoint,
             )
@@ -1255,7 +1269,7 @@ class BasicTransformerBlock(nn.Module):
         x = self.ff(self.norm3(x)) + x
         return x
 
-    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, temporal_ref=None, temporal_validity=None, sat_pack=None):
+    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, temporal_ref=None, temporal_validity=None, sat_pack=None, hist_pack=None):
         x = self.attn1(self.norm1(x)) + x
         x_base = x
         sat_delta = self.attn2(
@@ -1300,7 +1314,26 @@ class BasicTransformerBlock(nn.Module):
                 query_hw=latent_hw,
                 lidar_geometry_mask=lidar_geometry_mask,
             )
-        x = x_base + fused_delta
+        # v2 history readout: the query sees the current conditions' fused
+        # summary (detached — routing signal only), the residual is added on
+        # top of the fused delta. Zero-init keeps this inert until trained.
+        hist_delta = None
+        if hist_pack is not None and self.history_attn is not None:
+            hist_delta = self.history_attn(
+                x_base,
+                fused_delta.detach(),
+                hist_pack["history_tokens"],
+                has_history=hist_pack["has_history"],
+            )
+        if hist_delta is not None:
+            with torch.no_grad():
+                denom = float(fused_delta.detach().float().norm(dim=-1).mean())
+                self.history_ratio = (
+                    float(hist_delta.detach().float().norm(dim=-1).mean()) / max(denom, 1e-6)
+                )
+            x = x_base + fused_delta + hist_delta
+        else:
+            x = x_base + fused_delta
         x = self.ff(self.norm3(x)) + x
         # Stash the fused posterior for the next frame's temporal evidence.
         # The caller (forward) promotes it to last_fused_delta OUTSIDE the

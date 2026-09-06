@@ -1,0 +1,129 @@
+{
+  "date": "2026-09-06",
+  "git_branch": "temporal-model",
+  "git_commit": "8395215",
+  "env_python": "/home/shizhm/miniconda3/envs/ControlS2S/bin/python",
+  "env_note": "TODO doc's /home/shizhm/anaconda3 path is wrong on this machine; miniconda3 verified",
+  "purpose": "P0 archive: provenance of assets before temporal-v2 work",
+  "assets": [
+    {
+      "path": "/mnt/shizhm/BasicModel/checkpoints/sd-v1-4.ckpt",
+      "role": "sd_vae_base",
+      "exists": true,
+      "is_dir": false,
+      "size": 4265380512,
+      "sha256_16": "SKIPPED(size=4265380512)",
+      "note": "hash skipped >1GB"
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior/ray_posterior_utonia_dino_sd14_4gpu_20260812/checkpoints/step_500000.pt",
+      "role": "frozen_single_frame_backbone",
+      "exists": true,
+      "is_dir": false,
+      "size": 11904146397,
+      "sha256_16": "SKIPPED(size=11904146397)",
+      "note": "hash skipped >1GB"
+    },
+    {
+      "path": "/mnt/shizhm/CS2S_pose_environment_sat-lidar-ray-posterior-evidence/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/train_manifest.jsonl",
+      "role": "train_manifest",
+      "exists": true,
+      "is_dir": false,
+      "size": 21719888,
+      "sha256_16": "deadffce21be97cf",
+      "note": ""
+    },
+    {
+      "path": "/mnt/shizhm/CS2S_pose_environment_sat-lidar-ray-posterior-evidence/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/test_manifest.jsonl",
+      "role": "test_manifest",
+      "exists": true,
+      "is_dir": false,
+      "size": 9122583,
+      "sha256_16": "4e8461c4e0cf84c5",
+      "note": ""
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/utonia_ray_depth_all_fp16/features.npy",
+      "role": "lidar_ray_cache",
+      "exists": true,
+      "is_dir": false,
+      "size": 29015801984,
+      "sha256_16": "SKIPPED(size=29015801984)",
+      "note": "hash skipped >1GB"
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/dino_vits14_8x32_all_fp16/features.npy",
+      "role": "dino_cache",
+      "exists": true,
+      "is_dir": false,
+      "size": 4835967104,
+      "sha256_16": "SKIPPED(size=4835967104)",
+      "note": "hash skipped >1GB"
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/KITTI_RAW",
+      "role": "kitti_raw_root",
+      "exists": true,
+      "is_dir": true,
+      "size": null,
+      "sha256_16": "DIR",
+      "note": ""
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior/temporal_v1_4gpu_20260904/temporal_step_20000.pt",
+      "role": "v1_gate_checkpoint",
+      "exists": true,
+      "is_dir": false,
+      "size": 189081,
+      "sha256_16": "2cacc9ae9f213c7e",
+      "note": "gates-only, 20k steps"
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior/temporal_v1_4gpu_20260904/temporal_metrics.jsonl",
+      "role": "v1_train_log",
+      "exists": true,
+      "is_dir": false,
+      "size": 83627,
+      "sha256_16": "5394433a3b179f90",
+      "note": ""
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior/sat_temporal_v2_2gpu_20260905/temporal_step_13000.pt",
+      "role": "routeC_checkpoint",
+      "exists": true,
+      "is_dir": false,
+      "size": 305269145,
+      "sha256_16": "0efa850972d2d3fa",
+      "note": "NOTE: dir named v2 but is route-C sat-token attention, stopped at 13.6k"
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior/sat_temporal_v2_2gpu_20260905/train.log",
+      "role": "routeC_train_log",
+      "exists": true,
+      "is_dir": false,
+      "size": 50787,
+      "sha256_16": "a9908b6642b17100",
+      "note": ""
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior/ray_posterior_utonia_dino_sd14_4gpu_20260812/inference/sat_temporal_net_s7000_300f/records.json",
+      "role": "routeC_eval_300f",
+      "exists": true,
+      "is_dir": false,
+      "size": 5892792,
+      "sha256_16": "675f44a4248ac860",
+      "note": ""
+    },
+    {
+      "path": "/mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior/ray_posterior_utonia_dino_sd14_4gpu_20260812/inference/temporal_flicker_analysis.json",
+      "role": "flicker_baselines_json",
+      "exists": true,
+      "is_dir": false,
+      "size": 2456,
+      "sha256_16": "307722fadceddaeb",
+      "note": ""
+    }
+  ],
+  "legacy_eval_caveat": "s7000 flicker 1.644 was computed while eval script had the P2-01 LPIPS sign bug on the GT term; the reported ratio used a separately verified gt mean (0.1858); treat as approximate until P2-02 strict pairing re-eval",
+  "missing": []
+}
