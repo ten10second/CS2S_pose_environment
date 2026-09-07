@@ -259,10 +259,15 @@ class TestHistoryProbe(unittest.TestCase):
         correct = torch.zeros(1, 4, 1, 1)
         wrong = torch.ones(1, 4, 1, 1)
         losses = probe_history_effect(
-            _ProbeModel(), {}, correct, seed=123, amp=False, wrong_history_latent=wrong
+            _ProbeModel(), {}, correct, seed=123, amp=False,
+            wrong_history_latents={"wrong": wrong},
         )
-        self.assertEqual(float(losses[0]), float(losses[1]))
-        self.assertAlmostEqual(float(losses[2] - losses[0]), 1.0, places=6)
+        # identical random draw: history vs disabled differ only by the history
+        # term; wrong (ones) adds exactly 1.0 over correct (zeros)
+        self.assertEqual(losses["loss_history"], losses["loss_disabled"])
+        self.assertAlmostEqual(
+            losses["loss_wrong:wrong"] - losses["loss_history"], 1.0, places=6
+        )
 
 
 if __name__ == "__main__":

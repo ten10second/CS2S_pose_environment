@@ -126,38 +126,35 @@ def require_resume_payload(payload, args, blocks):
 
 
 def probe_history_effect(
-    training_model, cur_batch, history_latent, seed, amp=True, wrong_history_latent=None
+    training_model, cur_batch, history_latent, seed, amp=True, wrong_history_latents=None
 ):
-    """Compare correct, disabled, and optional wrong history under identical noise."""
+    """Compare correct / disabled / N named wrong histories under identical
+    noise (same current frame, same restored RNG → same timestep). Returns a
+    flat dict: loss_history, loss_disabled, loss_wrong:<name>...
+    """
     if history_latent is None:
         return None
+    wrong_history_latents = wrong_history_latents or {}
     cpu_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    results = {}
     try:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        with torch.no_grad(), autocast(enabled=amp):
-            loss_history = training_model(cur_batch, history_latent, True).detach()
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        with torch.no_grad(), autocast(enabled=amp):
-            loss_disabled = training_model(cur_batch, None, False).detach()
-        loss_wrong = None
-        if wrong_history_latent is not None:
+        def probe_once(tokens, has_history):
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
             with torch.no_grad(), autocast(enabled=amp):
-                loss_wrong = training_model(
-                    cur_batch, wrong_history_latent, True
-                ).detach()
+                return training_model(cur_batch, tokens, has_history).detach()
+
+        results["loss_history"] = float(probe_once(history_latent, True))
+        results["loss_disabled"] = float(probe_once(None, False))
+        for name, latent in wrong_history_latents.items():
+            results[f"loss_wrong:{name}"] = float(probe_once(latent, True))
     finally:
         torch.random.set_rng_state(cpu_state)
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
-    return loss_history, loss_disabled, loss_wrong
+    return results
 
 
 def grad_l2(parameters):
@@ -192,6 +189,14 @@ def parse_args():
     p.add_argument("--probe-seed", type=int, default=20260907)
     p.add_argument("--overfit-pairs", type=int, default=0,
                    help="repeat only the first N consecutive pairs; 0 uses the full plan")
+    p.add_argument("--train-pairs", type=int, default=0,
+                   help="use only the first N consecutive pairs for training; 0 = full plan")
+    p.add_argument("--val-pairs", type=int, default=0,
+                   help="pairs immediately after the training slice are held out for the "
+                        "generalization probe; they never contribute gradients")
+    p.add_argument("--val-every", type=int, default=0,
+                   help="run the held-out generalization probe every N steps; 0 disables")
+    p.add_argument("--val-max-pairs", type=int, default=8)
     p.add_argument("--resume", default="")
     return p.parse_args()
 
@@ -225,8 +230,20 @@ def main():
     plan = full_plan
     if args.overfit_pairs > 0:
         plan = plan[:args.overfit_pairs]
+    if args.train_pairs > 0:
+        plan = plan[:args.train_pairs]
     if not plan:
         raise RuntimeError("manifest produced no consecutive-frame training pairs")
+    # held-out generalization pairs: the slice immediately after training,
+    # same drive(s) so the scene distribution matches but the frames were
+    # never trained on.
+    val_plan = []
+    if args.val_pairs > 0:
+        start = len(plan)
+        val_plan = full_plan[start : start + args.val_pairs]
+        if len(val_plan) < args.val_pairs and rank == 0:
+            print(f"[hist-v2] WARNING: only {len(val_plan)} held-out pairs available "
+                  f"(requested {args.val_pairs})")
     shard_plan = plan[rank::world]
     if rank == 0:
         print(f"[hist-v2] stream pairs: {len(plan)} (per rank {len(shard_plan)})")
@@ -338,26 +355,43 @@ def main():
     if distributed:
         training_model = DDP(training_model, device_ids=[local_rank], find_unused_parameters=False)
 
-    wrong_history_latent = None
+    # Multiple wrong-history probe sources (P5-03): same drive but temporally
+    # distant, and a different drive entirely.
+    wrong_history_latents = {}
     if args.probe_every > 0 and shard_plan:
+        from torch.utils.data._utils.collate import default_collate
+
         reference_pi = shard_plan[0][0]
         reference_drive = rows[reference_pi].get("drive")
-        candidates = [
-            pi for pi, _ci, _valid in full_plan
-            if pi != reference_pi and rows[pi].get("drive") != reference_drive
-        ]
-        if not candidates:
-            candidates = [pi for pi, _ci, _valid in full_plan if pi != reference_pi]
-        if candidates:
-            from torch.utils.data._utils.collate import default_collate
+        reference_frame = int(rows[reference_pi].get("frame_index", 0))
 
-            wrong_prev = move_batch_to_device(default_collate([dataset[candidates[0]]]), device)
-            wrong_history_latent = history_latent_from_gt(model, wrong_prev)
+        same_drive_candidates = [
+            pi for pi, _ci, _v in full_plan
+            if rows[pi].get("drive") == reference_drive
+            and abs(int(rows[pi].get("frame_index", 0)) - reference_frame) >= 500
+        ]
+        other_drive_candidates = [
+            pi for pi, _ci, _v in full_plan if rows[pi].get("drive") != reference_drive
+        ]
+        if not same_drive_candidates:
+            same_drive_candidates = [
+                pi for pi, _ci, _v in full_plan if rows[pi].get("drive") == reference_drive
+                and pi != reference_pi
+            ]
+        if same_drive_candidates:
+            wrong_prev = move_batch_to_device(
+                default_collate([dataset[same_drive_candidates[-1]]]), device
+            )
+            wrong_history_latents["same_drive_far"] = history_latent_from_gt(model, wrong_prev)
             if rank == 0:
-                print(
-                    f"[hist-v2] wrong-history probe source: "
-                    f"{rows[candidates[0]].get('drive')}:{rows[candidates[0]].get('frame_index')}"
-                )
+                print(f"[hist-v2] wrong-history 'same_drive_far': {rows[same_drive_candidates[-1]].get('drive')}:{rows[same_drive_candidates[-1]].get('frame_index')}")
+        if other_drive_candidates:
+            wrong_prev = move_batch_to_device(
+                default_collate([dataset[other_drive_candidates[0]]]), device
+            )
+            wrong_history_latents["other_drive"] = history_latent_from_gt(model, wrong_prev)
+            if rank == 0:
+                print(f"[hist-v2] wrong-history 'other_drive': {rows[other_drive_candidates[0]].get('drive')}:{rows[other_drive_candidates[0]].get('frame_index')}")
 
     log_every = max(1, args.log_every)
     metrics_file = (out_dir / "metrics.jsonl").open("a") if rank == 0 else None
@@ -390,27 +424,21 @@ def main():
                 history_latent,
                 args.probe_seed,
                 args.amp,
-                wrong_history_latent,
+                wrong_history_latents,
             )
             if probe0 is not None and distributed:
-                probe0_tensor = torch.stack([value for value in probe0 if value is not None])
-                torch.distributed.all_reduce(probe0_tensor)
-                probe0_tensor /= world
-                values = list(probe0_tensor.unbind())
-                probe0 = (values[0], values[1], values[2] if len(values) == 3 else None)
+                probe0_values = torch.tensor(
+                    [v for v in probe0.values()], device=cur_batch["grd_left_imgs"].device
+                )
+                torch.distributed.all_reduce(probe0_values)
+                probe0_values /= world
+                probe0 = dict(zip(probe0.keys(), probe0_values.tolist()))
             if rank == 0 and probe0 is not None:
                 record0 = {
                     "step": 0,
-                    "probe_loss_history": float(probe0[0]),
-                    "probe_loss_disabled": float(probe0[1]),
-                    "probe_loss_wrong_history": (
-                        float(probe0[2]) if probe0[2] is not None else None
-                    ),
-                    "probe_history_benefit": float(probe0[1] - probe0[0]),
-                    "probe_correct_vs_wrong_benefit": (
-                        float(probe0[2] - probe0[0]) if probe0[2] is not None else None
-                    ),
                     "event": "fresh_run_baseline_before_first_update",
+                    **{k: float(v) for k, v in probe0.items()},
+                    "probe_history_benefit": float(probe0["loss_disabled"] - probe0["loss_history"]),
                 }
                 metrics_file.write(json.dumps(record0) + "\n")
                 metrics_file.flush()
@@ -446,14 +474,53 @@ def main():
                 history_latent,
                 args.probe_seed,
                 args.amp,
-                wrong_history_latent,
+                wrong_history_latents,
             )
             if probe is not None and distributed:
-                probe_tensor = torch.stack([value for value in probe if value is not None])
-                torch.distributed.all_reduce(probe_tensor)
-                probe_tensor /= world
-                values = list(probe_tensor.unbind())
-                probe = (values[0], values[1], values[2] if len(values) == 3 else None)
+                probe_values = torch.tensor(
+                    [v for v in probe.values()], device=cur_batch["grd_left_imgs"].device
+                )
+                torch.distributed.all_reduce(probe_values)
+                probe_values /= world
+                probe = dict(zip(probe.keys(), probe_values.tolist()))
+
+        # Held-out generalization probe (multi-sample validation): same fixed
+        # noise protocol on pairs excluded from training. Mean per pair set;
+        # gradient-free, cheap.
+        val_probe = None
+        if args.val_every > 0 and val_plan and step % args.val_every == 0:
+            from torch.utils.data._utils.collate import default_collate
+
+            val_rows = []
+            for pi, ci, _v in val_plan[: args.val_max_pairs]:
+                cb = move_batch_to_device(
+                    default_collate([dataset[ci]]), device
+                )
+                pb = move_batch_to_device(
+                    default_collate([dataset[pi]]), device
+                )
+                z_hist = history_latent_from_gt(model, pb)
+                pr = probe_history_effect(
+                    training_model, cb, z_hist, args.probe_seed, args.amp,
+                    wrong_history_latents,
+                )
+                if pr is not None:
+                    val_rows.append(pr)
+            if val_rows:
+                keys = val_rows[0].keys()
+                val_probe = {
+                    k: float(np.mean([r[k] for r in val_rows])) for k in keys
+                }
+                val_probe["val_benefit"] = (
+                    val_probe["loss_disabled"] - val_probe["loss_history"]
+                )
+                for name in wrong_history_latents:
+                    key = f"loss_wrong:{name}"
+                    if key in val_probe:
+                        val_probe[f"val_correct_vs_wrong:{name}"] = float(
+                            val_probe[key] - val_probe["loss_history"]
+                        )
+                val_probe["val_pairs"] = len(val_rows)
 
         if step % log_every == 0 and rank == 0:
             record = {
@@ -462,24 +529,21 @@ def main():
                 "hist_ratio_mean": float(np.mean(ratios)) if ratios else None,
                 "hist_ratio_max": float(np.max(ratios)) if ratios else None,
                 "has_history_frac": float(np.mean([has_history])),
-                "probe_loss_history": float(probe[0]) if probe is not None else None,
-                "probe_loss_disabled": float(probe[1]) if probe is not None else None,
-                "probe_loss_wrong_history": (
-                    float(probe[2]) if probe is not None and probe[2] is not None else None
-                ),
-                "probe_history_benefit": (
-                    float(probe[1] - probe[0]) if probe is not None else None
-                ),
-                "probe_correct_vs_wrong_benefit": (
-                    float(probe[2] - probe[0])
-                    if probe is not None and probe[2] is not None else None
-                ),
                 "encoder_grad_l2": encoder_grad_l2,
                 "cond_query_grad_l2": cond_query_grad_l2,
                 "history_out_grad_l2": history_out_grad_l2,
                 "data_epoch": data_epoch,
                 "sec_per_step": round((time.time() - t0) / log_every, 3),
             }
+            if probe is not None:
+                record.update({k: float(v) for k, v in probe.items()})
+                record["probe_history_benefit"] = float(probe["loss_disabled"] - probe["loss_history"])
+                for name in wrong_history_latents:
+                    key = f"loss_wrong:{name}"
+                    if key in probe:
+                        record[f"probe_correct_vs_wrong:{name}"] = float(probe[key] - probe["loss_history"])
+            if val_probe is not None:
+                record["val"] = {k: v for k, v in val_probe.items()}
             running, ratios = [], []
             t0 = time.time()
             metrics_file.write(json.dumps(record) + "\n")
