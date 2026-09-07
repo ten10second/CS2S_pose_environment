@@ -78,7 +78,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--noise-mode",
-        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "temporal_net", "sat_temporal_net"],
+        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "ar_dyn", "temporal_net", "sat_temporal_net"],
         default="shared",
     )
     parser.add_argument("--temporal-gates", default="",
@@ -418,6 +418,109 @@ def main():
             x_T = shared_x_T.clone()
             timesteps = None
             noise_info = {"mode": "shared", "seed": args.seed}
+        elif args.noise_mode == "ar_dyn":
+            # Autoregressive appearance chaining with LiDAR-gated refresh.
+            # Static world and slow movers inherit the previous latent RAW
+            # (no homography warp — the camera moves little at 10 Hz and the
+            # denoise steps re-anchor geometry via current conditions); this
+            # is the appearance lock that pure AR proved (ratio 0.82).
+            # Vacated cells (prev returns gone) and unmatched current moving
+            # clusters get fresh noise so old content is repainted, killing
+            # the AR ghosting; matched objects carry their appearance by
+            # their own displacement (colour follows the car).
+            if prev_latent is None or prev_row is None:
+                torch.manual_seed(args.seed + idx)
+                x_T = torch.randn((1, 4, 16, 64), device="cuda")
+                timesteps = None
+                noise_info = {"mode": "ar_dyn", "frame": idx, "init": "fresh"}
+            else:
+                geom = geoms.setdefault(
+                    row["calib_dir"],
+                    pwu.SequenceGeometry(resolve_calib_dir(row["calib_dir"])),
+                )
+                p1 = pwu.load_velodyne(prev_row["velodyne_path"])
+                p2 = pwu.load_velodyne(row["velodyne_path"])
+                T_v = geom.relative_velo_pose(prev_row["oxts_path"], row["oxts_path"])
+                q = (T_v[:3, :3] @ p1.T).T + T_v[:3, 3]
+                img_w, img_h = geom.img_size
+                status = pwu.consistency_status(q, p2)
+                mask, mask_stats = build_dynamic_mask_latent(
+                    geom, p1, p2, q, img_w, img_h, 16, 64, "cuda"
+                )
+                n_v, d_v = pwu.fit_ground_plane_velo(p1)
+                plane = None if n_v is None else (-n_v[0] / n_v[2], -n_v[1] / n_v[2], d_v / n_v[2])
+                matched, assoc_stats = loa.associate_objects(
+                    p1, p2, T_v, geom, img_w, img_h, 16, 64, plane=plane
+                )
+                L = prev_latent
+                obj_cell_np = np.zeros((16, 64), bool)
+                obj_records = []
+                for obj in matched:
+                    obj_cell_np |= obj["cell_mask"]
+                    obj_records.append({
+                        "bbox": obj["bbox"],
+                        "d_velo_norm": float(np.linalg.norm(obj["d_velo"])),
+                        "depth": obj["depth"],
+                    })
+                # object transport done cell-wise on a copy (grid_sample needs a full grid)
+                L = prev_latent.clone()
+                if matched:
+                    ys_np, xs_np = np.meshgrid(
+                        np.arange(16, dtype=np.float32) + 0.5,
+                        np.arange(64, dtype=np.float32) + 0.5,
+                        indexing="ij",
+                    )
+                    base = torch.stack([torch.from_numpy(xs_np), torch.from_numpy(ys_np)]).unsqueeze(0).to("cuda")
+                    src_list = base.clone()
+                    for obj in matched:
+                        m_t = torch.from_numpy(obj["cell_mask"].astype(np.float32)).to("cuda").unsqueeze(0)
+                        shift = torch.tensor(obj["d_lat"], device="cuda").view(1, 2, 1, 1)
+                        src_list = torch.where(m_t > 0.5, base - shift, src_list)
+                    gx = 2.0 * src_list[:, 0] / 64 - 1.0
+                    gy = 2.0 * src_list[:, 1] / 16 - 1.0
+                    grid_t = torch.stack([gx, gy], dim=-1).unsqueeze(2)  # (1,16,64,1,2)->squeeze
+                    grid_t = grid_t.squeeze(2)
+                    transported = torch.nn.functional.grid_sample(
+                        prev_latent, grid_t, mode="bilinear", padding_mode="zeros", align_corners=False
+                    )
+                    keep_obj = torch.from_numpy(obj_cell_np.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
+                    L = transported * keep_obj + prev_latent * (1.0 - keep_obj)
+                # current-frame unmatched moving clusters → repaint
+                repaint_np = obj_cell_np.copy()
+                if plane is not None:
+                    tree_q = None
+                    from scipy.spatial import cKDTree as _KD
+                    _q1 = q
+                    _tree = _KD(_q1[:, :3])
+                    _d2, _ = _tree.query(p2[:, :3], k=1)
+                    _unexpl = _d2 > 0.35
+                    _ag = loa.above_ground_mask(p2, plane) & loa._in_fov(p2, geom, img_w, img_h)
+                    pool = loa.voxel_downsample(p2[_unexpl & _ag], 0.3)
+                    for cand in loa.cluster_objects(pool):
+                        if cand["count"] < 12:
+                            continue
+                        u_c, v_c, dep_c = geom.project_velo_to_rect_img(pool[cand["idx"]][:, :3])
+                        ok_c = (dep_c > 1.0) & (u_c >= 0) & (u_c < img_w) & (v_c >= 0) & (v_c < img_h)
+                        if ok_c.sum() < 3:
+                            continue
+                        repaint_np |= loa._latent_cells(u_c[ok_c], v_c[ok_c], img_w, img_h, 64, 16)
+                repaint = torch.from_numpy(repaint_np.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
+                # vacated dynamic cells ∪ unmatched new clusters → fresh content
+                fill_mask = torch.clamp(mask + repaint, 0.0, 1.0)
+                garbage = torch.randn_like(L)
+                L = L * (1.0 - fill_mask) + garbage * fill_mask
+                x_T = (ar_abar ** 0.5) * L + ((1.0 - ar_abar) ** 0.5) * shared_eps
+                timesteps = ar_steps_arg
+                noise_info = {
+                    "mode": "ar_dyn", "frame": idx, "init": "ar_chained",
+                    "steps": ar_keep, "ar_strength": args.ar_strength,
+                    "fill_frac": float(fill_mask.mean().item()),
+                    "vacated_frac": float(mask.mean().item()),
+                    "obj_transported": len(matched),
+                    "objects": obj_records,
+                    **assoc_stats,
+                    **mask_stats,
+                }
         elif args.noise_mode in ("warp", "warp2", "instance"):
             if prev_latent is None or prev_row is None:
                 x_T = shared_x_T.clone()
