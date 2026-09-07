@@ -76,7 +76,10 @@ class HistoryCrossAttention(nn.Module):
         # reject option: learned key, FIXED zero value — mass on null contributes exactly 0
         self.null_key = nn.Parameter(torch.randn(inner) * 0.02)
         self.register_buffer("null_value", torch.zeros(inner))
-        self.to_out = zero_module(nn.Linear(inner, dim))
+        # Bias-free is part of the reject-history contract: if all attention
+        # mass is assigned to the fixed zero null value, the projected
+        # residual must remain exactly zero after training as well as at init.
+        self.to_out = zero_module(nn.Linear(inner, dim, bias=False))
         self.last_null_frac = None
         self.last_ratio = None  # ||hist_delta|| / ||cond_summary||, filled under no_grad
 

@@ -77,20 +77,22 @@ def history_trainable_parameters(encoder, blocks):
 
 
 @torch.no_grad()
-def history_tokens_from_gt(model, encoder, prev_batch):
-    """Teacher-forced history (P4-01): encode the previous GT frame with the
-    frozen VAE and the shared history encoder. Latent is scale-multiplied
-    (P1-01). prev_batch must contain grd_left_imgs in [0,1]."""
+def history_latent_from_gt(model, prev_batch):
+    """Encode previous GT with the frozen VAE and return its scaled latent.
+
+    The trainable history encoder deliberately does not run here: it must be
+    called inside the DDP-wrapped training module so its gradients are reduced
+    across ranks.
+    """
     outputs = prev_batch["grd_left_imgs"] * 2 - 1
     z = model.pre_AE_model.encode(outputs).sample() * model.scale_factor
-    return encoder(z)
+    return z
 
 
 def build_payload(encoder, tokens, has_history):
     """P1-02: the payload consumed by every history attention block. With no
     history, routes the learned null token through the K/V weights so all
     parameters stay in the graph (P4-04)."""
-    if has_history:
-        return {"history_tokens": tokens, "has_history": True}
-    b = tokens.shape[0] if tokens is not None else 1
-    return {"history_tokens": encoder.null_tokens(b), "has_history": False}
+    if tokens is None:
+        tokens = encoder.null_tokens(1)
+    return {"history_tokens": tokens, "has_history": bool(has_history)}

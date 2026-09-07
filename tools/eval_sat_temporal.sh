@@ -46,11 +46,13 @@ tg, tt, pairs = [], [], []
 with torch.no_grad():
     for a, b in zip(gen, gen[1:]):
         ga, gb = run / "images" / "gt" / a.name, run / "images" / "gt" / b.name
-        if not (run/"images"/"normal"/a.name).exists() or not gb.exists():
+        if not ga.exists() or not gb.exists():
             continue  # P2-02 (partial): skip unpaired frames, count them
         tg.append(pair_lpips(run/"images"/"normal"/a.name, run/"images"/"normal"/b.name))
         tt.append(pair_lpips(ga, gb))
         pairs.append(a.name)
+if not tg:
+    raise RuntimeError("no valid consecutive generated/GT frame pairs found")
 mg, mt = float(np.mean(tg)), float(np.mean(tt))
 print(f"  tLPIPS gen={mg:.4f}  gt={mt:.4f}  RATIO={mg/mt:.3f}  (n={len(tg)}, skipped {len(gen)-1-len(tg)})")
 print("  baselines: per_frame 1.630 | warp2 1.305 | autoreg 0.820 | instance 1.302 | target <1.3")
