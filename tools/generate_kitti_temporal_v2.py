@@ -44,6 +44,7 @@ from generate_kitti_raea_noise_modes import (  # noqa: E402
     sample_to_batch,
 )
 from temporal_history import enable_history_attention  # noqa: E402
+from temporal_history import HistoryState, should_use_history  # noqa: E402
 
 
 def parse_args():
@@ -122,27 +123,30 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     records = []
-    z_prev = None  # previous frame's GENERATED final latent
+    state = None  # HistoryState: previous frame's GENERATED final latent
     for idx in range(args.start_index, args.start_index + args.num_samples):
         sample = dataset[idx]
         sample_id = sample["sample_id"]
+        seq_id = sample["sample_id"].split("/")[1]
+        frame_index = int(sample.get("frame_index", idx))
         batch = sample_to_batch(sample)
         pack = prepare_frame_inputs(model, batch)
 
-        if z_prev is None:
+        # review HIGH fix: history only for strictly consecutive frames of the
+        # same drive; any discontinuity resets to exact single-frame behaviour
+        has_history = should_use_history(state, seq_id, frame_index)
+        if not has_history:
             hub.clear()
-            has_history = False
         else:
-            tokens = encoder(z_prev)
+            tokens = encoder(state.latent)
             hub.set({"history_tokens": tokens, "has_history": True})
-            has_history = True
 
         torch.manual_seed(args.seed + idx)
         x_T = torch.randn((1, 4, 16, 64), device="cuda")
         pred, latent = sample_frame(
             model, sampler, pack, x_T, None, args.guidance_scale, 1.0
         )
-        z_prev = latent.detach()  # becomes the next frame's history
+        state = HistoryState(seq_id, frame_index, latent.detach())
 
         safe_id = str(sample_id).replace("/", "__")
         image_paths = {
@@ -175,7 +179,7 @@ def main():
         records.append(
             {
                 "sample_id": sample_id,
-                "frame_index": int(sample.get("frame_index", idx)),
+                "frame_index": frame_index,
                 "has_history": has_history,
                 "latent_rms": lat_norm,
                 "panel_path": str(panel_path),
