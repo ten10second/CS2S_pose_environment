@@ -909,6 +909,11 @@ class TemporalEvidenceHub:
                            satellite crop center inside the previous crop,
                            normalized crop coords
       sat_token_grid     — route-C: (14, 14)
+      history_tokens     — v2/v3: previous-frame latent features
+      history_grid       — v3: current query anchors in previous history map
+                           grid_sample coords, align_corners=False
+      history_valid      — v3: valid geometry correspondences for anchors
+      history_hw         — v2/v3: previous history feature map size
 
     Modules hold a reference to the hub, so no UNet forward signature changes.
     """
@@ -1232,10 +1237,17 @@ class BasicTransformerBlock(nn.Module):
         payload = self.temporal_hub.payload if self.temporal_hub is not None else None
         if payload is None or self.history_attn is None or "history_tokens" not in payload:
             return None
-        return {
+        pack = {
             "history_tokens": payload["history_tokens"],
+            "history_hw": payload.get("history_hw"),
             "has_history": bool(payload.get("has_history", True)),
         }
+        if "history_grid" in payload or "history_valid" in payload:
+            if "history_grid" not in payload or "history_valid" not in payload:
+                raise ValueError("history_grid and history_valid must both be in history payload")
+            pack["history_grid"] = payload["history_grid"]
+            pack["history_valid"] = payload["history_valid"]
+        return pack
 
     def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
@@ -1319,12 +1331,24 @@ class BasicTransformerBlock(nn.Module):
         # top of the fused delta. Zero-init keeps this inert until trained.
         hist_delta = None
         if hist_pack is not None and self.history_attn is not None:
-            hist_delta = self.history_attn(
-                x_base,
-                fused_delta.detach(),
-                hist_pack["history_tokens"],
-                has_history=hist_pack["has_history"],
-            )
+            if getattr(self.history_attn, "uses_geometry", False):
+                hist_delta = self.history_attn(
+                    x_base,
+                    fused_delta.detach(),
+                    hist_pack["history_tokens"],
+                    has_history=hist_pack["has_history"],
+                    history_grid=hist_pack.get("history_grid"),
+                    history_valid=hist_pack.get("history_valid"),
+                    query_hw=latent_hw,
+                    history_hw=hist_pack.get("history_hw"),
+                )
+            else:
+                hist_delta = self.history_attn(
+                    x_base,
+                    fused_delta.detach(),
+                    hist_pack["history_tokens"],
+                    has_history=hist_pack["has_history"],
+                )
         if hist_delta is not None:
             with torch.no_grad():
                 denom = float(fused_delta.detach().float().norm(dim=-1).mean())

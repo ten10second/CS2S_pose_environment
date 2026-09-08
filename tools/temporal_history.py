@@ -36,7 +36,14 @@ def should_use_history(prev_state, cur_sequence_id, cur_frame_index):
     return int(cur_frame_index) == prev_state.frame_index + 1
 
 
-def enable_history_attention(model, heads=8, dim_head=64, history_dim=256):
+def enable_history_attention(
+    model,
+    heads=None,
+    dim_head=None,
+    history_dim=None,
+    geometry=False,
+    block_indices=None,
+):
     """Inject condition-aware history attention into every ray-posterior fusion
     block. Deliberately does NOT touch the v1 temporal gate or the route-C
     satellite attention (P3-02): those stay disabled/uninitialised.
@@ -45,16 +52,62 @@ def enable_history_attention(model, heads=8, dim_head=64, history_dim=256):
     token) + per-block attention; freezing the backbone is the caller's job.
     """
     from ldm.modules.KITTI_attention import TemporalEvidenceHub
-    from ldm.modules.temporal_history_attention import HistoryCrossAttention, HistoryLatentEncoder
+    from ldm.modules.temporal_history_attention import (
+        GeometryHistoryAttention,
+        HistoryCrossAttention,
+        HistoryLatentEncoder,
+    )
 
     hub = TemporalEvidenceHub()
-    encoder = HistoryLatentEncoder(out_dim=history_dim)
-    blocks = []
+    if geometry:
+        history_dim = 64 if history_dim is None else history_dim
+        heads = 4 if heads is None else heads
+        dim_head = 32 if dim_head is None else dim_head
+    else:
+        history_dim = 256 if history_dim is None else history_dim
+        heads = 8 if heads is None else heads
+        dim_head = 64 if dim_head is None else dim_head
+    encoder = HistoryLatentEncoder(hidden=64 if geometry else 256, out_dim=history_dim)
+    candidates = []
     for module in model.modules():
         if (
             getattr(module, "ray_fusion_mode", None) == "ray_posterior"
             and getattr(module, "ray_posterior_fusion", None) is not None
         ):
+            candidates.append(module)
+    if not candidates:
+        raise RuntimeError("no ray_posterior fusion blocks found")
+    if block_indices is None:
+        selected_indices = list(range(len(candidates)))
+    else:
+        selected_indices = [int(i) for i in block_indices]
+        if not selected_indices:
+            raise ValueError("history block_indices must not be empty")
+        if len(set(selected_indices)) != len(selected_indices):
+            raise ValueError(f"history block_indices contain duplicates: {selected_indices}")
+        bad = [i for i in selected_indices if i < 0 or i >= len(candidates)]
+        if bad:
+            raise ValueError(
+                f"history block_indices out of range: {bad}; available 0..{len(candidates) - 1}"
+            )
+
+    blocks = []
+    for history_index, module_index in enumerate(selected_indices):
+        module = candidates[module_index]
+        expected_geometry = bool(getattr(module.history_attn, "uses_geometry", False))
+        if module.history_attn is not None and expected_geometry != bool(geometry):
+            raise RuntimeError(
+                f"history block {module_index} already has incompatible history attention"
+            )
+        if geometry:
+            if module.history_attn is None:
+                module.history_attn = GeometryHistoryAttention(
+                    dim=module.ray_posterior_fusion.dim,
+                    history_dim=history_dim,
+                    heads=heads,
+                    dim_head=dim_head,
+                )
+        else:
             if module.history_attn is None:
                 module.history_attn = HistoryCrossAttention(
                     dim=module.ray_posterior_fusion.dim,
@@ -62,10 +115,10 @@ def enable_history_attention(model, heads=8, dim_head=64, history_dim=256):
                     heads=heads,
                     dim_head=dim_head,
                 )
-            module.temporal_hub = hub
-            blocks.append(module)
-    if not blocks:
-        raise RuntimeError("no ray_posterior fusion blocks found")
+        module.temporal_hub = hub
+        module.history_attn_index = history_index
+        module.history_block_index = module_index
+        blocks.append(module)
     return hub, encoder, blocks
 
 
@@ -89,10 +142,24 @@ def history_latent_from_gt(model, prev_batch):
     return z
 
 
-def build_payload(encoder, tokens, has_history):
+def build_payload(encoder, tokens, has_history, history_grid=None, history_valid=None):
     """P1-02: the payload consumed by every history attention block. With no
     history, routes the learned null token through the K/V weights so all
     parameters stay in the graph (P4-04)."""
     if tokens is None:
         tokens = encoder.null_tokens(1)
-    return {"history_tokens": tokens, "has_history": bool(has_history)}
+    payload = {
+        "history_tokens": tokens,
+        "history_hw": tuple(encoder.grid),
+        "has_history": bool(has_history),
+    }
+    if history_grid is not None or history_valid is not None:
+        if history_grid is None or history_valid is None:
+            raise ValueError("history_grid and history_valid must be provided together")
+        if history_grid.dim() != 4 or history_grid.shape[-1] != 2:
+            raise ValueError("history_grid must have shape (B,H,W,2)")
+        if history_valid.shape != history_grid.shape[:3]:
+            raise ValueError("history_valid must have shape (B,H,W)")
+        payload["history_grid"] = history_grid
+        payload["history_valid"] = history_valid.bool()
+    return payload
