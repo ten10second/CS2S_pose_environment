@@ -35,6 +35,47 @@ def above_ground_mask(points, plane, h_min=0.4, h_max=4.0):
     return (h > h_min) & (h < h_max)
 
 
+def transform_ground_plane(plane, T_cur_prev):
+    """Transform previous-frame ground z = a*x + b*y - c into current coords."""
+    if plane is None:
+        return None
+    a, b, c = plane
+    n_src = np.array([-a, -b, 1.0], dtype=np.float64)
+    R = T_cur_prev[:3, :3]
+    t = T_cur_prev[:3, 3]
+    n_dst = R @ n_src
+    if abs(n_dst[2]) < 1e-8:
+        return None
+    c_dst = float(c - n_dst @ t)
+    return (-n_dst[0] / n_dst[2], -n_dst[1] / n_dst[2], c_dst / n_dst[2])
+
+
+AZ_BIN = 0.2
+EL_BIN = 0.4
+AZ_MAX = 360.0
+EL_MIN, EL_MAX = -26.0, 4.0
+NA = int(AZ_MAX / AZ_BIN)
+NE = int((EL_MAX - EL_MIN) / EL_BIN)
+
+
+def _sph_coords(points):
+    r = np.linalg.norm(points, axis=1)
+    az = np.degrees(np.arctan2(points[:, 1], points[:, 0])) % 360
+    el = np.degrees(np.arctan2(points[:, 2], np.hypot(points[:, 0], points[:, 1])))
+    return az, el, r
+
+
+def _range_image(points):
+    az, el, r = _sph_coords(points)
+    ri = np.full((NE, NA), np.inf, np.float32)
+    valid = np.isfinite(r) & (r > 0.0) & (el >= EL_MIN) & (el < EL_MAX)
+    if valid.any():
+        ia = ((az[valid] / AZ_BIN).astype(int)) % NA
+        ie = ((el[valid] - EL_MIN) / EL_BIN).astype(int)
+        np.minimum.at(ri, (ie, ia), r[valid].astype(np.float32))
+    return ri
+
+
 def cluster_objects(points, radius=0.8, min_points=12):
     """Radius-graph connected components. Returns list of
     {idx, centroid, count} sorted by count desc."""
@@ -50,6 +91,8 @@ def cluster_objects(points, radius=0.8, min_points=12):
         )
         _, lab = connected_components(g, directed=False)
         labels = lab
+    else:
+        labels = np.arange(n, dtype=np.int64)
     objects = []
     for lid in np.unique(labels):
         idx = np.where(labels == lid)[0]
@@ -84,6 +127,75 @@ def _in_fov(points, geom, img_w, img_h, min_depth=1.0):
     return (d > min_depth) & (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
 
 
+def raw_previous_refresh_mask(
+    points_prev,
+    points_cur,
+    T_cur_prev,
+    geom,
+    img_w,
+    img_h,
+    lat_h,
+    lat_w,
+    plane=None,
+    tol=0.3,
+):
+    """Cells in the previous raw latent footprint that should be refreshed.
+
+    Previous above-ground in-FOV returns are ego-transformed into the current
+    LiDAR frame and compared against current-scan angular range neighborhoods.
+    Any observed depth disagreement beyond tol, closer or farther, marks the
+    original previous-frame projection. This is a conservative range-bin
+    heuristic: unobserved angular bins and bins with any agreeing neighbor are
+    left unchanged.
+    """
+    mask = np.zeros((lat_h, lat_w), bool)
+    stats = {
+        "raw_prev_candidates": 0,
+        "raw_prev_observed": 0,
+        "raw_prev_refresh_points": 0,
+        "raw_prev_refresh_point_frac": 0.0,
+        "raw_prev_refresh_mask_frac": 0.0,
+    }
+    if len(points_prev) == 0 or plane is None:
+        return mask, stats
+
+    prev_ok = above_ground_mask(points_prev, plane) & _in_fov(points_prev, geom, img_w, img_h)
+    stats["raw_prev_candidates"] = int(prev_ok.sum())
+    if not prev_ok.any() or len(points_cur) == 0:
+        return mask, stats
+
+    p1 = points_prev[prev_ok]
+    q1 = (T_cur_prev[:3, :3] @ p1.T).T + T_cur_prev[:3, 3]
+    ri = _range_image(points_cur)
+    az, el, r = _sph_coords(q1[:, :3])
+    valid_ang = np.isfinite(r) & (r > 0.0) & (el >= EL_MIN) & (el < EL_MAX)
+    ia = ((az / AZ_BIN).astype(int)) % NA
+    ie = ((el - EL_MIN) / EL_BIN).astype(int)
+
+    observed = np.zeros(len(r), bool)
+    agrees = np.zeros(len(r), bool)
+    for da in (-1, 0, 1):
+        for de in (-1, 0, 1):
+            cur_r = ri[np.clip(ie + de, 0, NE - 1), (ia + da) % NA]
+            finite = np.isfinite(cur_r)
+            observed |= valid_ang & finite
+            agrees |= valid_ang & finite & (np.abs(cur_r - r) <= tol)
+
+    refresh = observed & ~agrees
+    stats["raw_prev_observed"] = int(observed.sum())
+    stats["raw_prev_refresh_points"] = int(refresh.sum())
+    stats["raw_prev_refresh_point_frac"] = float(refresh.mean())
+    if not refresh.any():
+        return mask, stats
+
+    u, v, dep = geom.project_velo_to_rect_img(p1[refresh, :3])
+    ok = (dep > 1.0) & (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
+    if ok.any():
+        mask = _latent_cells(u[ok], v[ok], img_w, img_h, lat_w, lat_h)
+        stats["raw_prev_refresh_mask_frac"] = float(mask.mean())
+    return mask, stats
+
+
 def associate_objects(
     points_prev,
     points_cur,
@@ -105,6 +217,7 @@ def associate_objects(
     Returns (objects, stats):
       objects: list of matched objects
         {cell_mask (lat_h,lat_w bool): latent cells the object occupies now,
+         prev_cell_mask (lat_h,lat_w bool): latent cells occupied previously,
          d_lat (2,): backward displacement in latent coords (src = pos - d_lat),
          d_velo (3,): 3D motion in the current velo frame,
          count, count_prev, depth}
@@ -118,9 +231,10 @@ def associate_objects(
     dist_cur, _ = tree_q.query(p2[:, :3], k=1)
     unexplained = dist_cur > explain_tol
     stats = {"unexplained_frac": float(unexplained.mean())}
+    plane_cur = transform_ground_plane(plane, T_velo_cur_prev)
 
     cur_pool = voxel_downsample(
-        p2[unexplained & above_ground_mask(p2, plane) & _in_fov(p2, geom, img_w, img_h)],
+        p2[unexplained & above_ground_mask(p2, plane_cur) & _in_fov(p2, geom, img_w, img_h)],
         cluster_voxel,
     )
     # Previous-side clusters cover ALL above-ground in-FOV returns: an object
@@ -142,7 +256,7 @@ def associate_objects(
     for cand in cur_objs:
         c_cur = cand["centroid"]
         c_in_prev = (T_inv[:3, :3] @ c_cur) + T_inv[:3, 3]
-        best, best_d = None, match_radius
+        best, best_k, best_d = None, None, match_radius
         for k, po in enumerate(prev_objs):
             if k in used_prev:
                 continue
@@ -150,10 +264,9 @@ def associate_objects(
             if d3 < best_d:
                 ratio = cand["count"] / max(po["count"], 1)
                 if size_ratio_gate[0] <= ratio <= size_ratio_gate[1]:
-                    best, best_d = po, d3
+                    best, best_k, best_d = po, k, d3
         if best is None:
             continue
-        used_prev.add(k)
         a_in_cur = (T_velo_cur_prev[:3, :3] @ best["centroid"]) + T_velo_cur_prev[:3, 3]
         d_velo = c_cur - a_in_cur
         if np.linalg.norm(d_velo) > motion_gate:
@@ -173,6 +286,7 @@ def associate_objects(
         )
         if ok_p.sum() < 3:
             continue
+        used_prev.add(best_k)
         cu_c, cv_c = u_c[ok_c].mean(), v_c[ok_c].mean()
         cu_p, cv_p = u_p[ok_p].mean(), v_p[ok_p].mean()
         d_lat = np.array(
@@ -185,6 +299,7 @@ def associate_objects(
         matched.append(
             {
                 "cell_mask": _latent_cells(u_c[ok_c], v_c[ok_c], img_w, img_h, lat_w, lat_h),
+                "prev_cell_mask": _latent_cells(u_p[ok_p], v_p[ok_p], img_w, img_h, lat_w, lat_h),
                 "d_lat": d_lat,
                 "d_velo": d_velo.astype(np.float32),
                 "count": int(ok_c.sum()),

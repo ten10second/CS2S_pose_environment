@@ -40,12 +40,13 @@ for p in (str(TOOLS_DIR), str(REPO_ROOT)):
         sys.path.insert(0, p)
 
 from dataloader.KITTI_raw_sat_lidar import SatLidarRawDataset  # noqa: E402
-from models.KITTI_geo_ldm_diffusion.ddim_KITTI import KITTI_DDIMSampler  # noqa: E402
+from models.KITTI_geo_ldm_diffusion.ddim_KITTI import KITTI_DDIMSampler, default_noise  # noqa: E402
 from utils.util import instantiate_from_config  # noqa: E402
 
 import pose_warp_utils as pwu  # noqa: E402
 import lidar_object_association as loa  # noqa: E402
 import temporal_evidence as te  # noqa: E402
+from ar_dyn_utils import compose_history, consecutive_rows, seed_step_noise  # noqa: E402
 
 from generate_kitti_raea_samples import (  # noqa: E402
     lidar_key_structure_stats,
@@ -74,8 +75,15 @@ def parse_args():
     parser.add_argument("--ddim-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--guidance-scale", type=float, default=7.5)
+    parser.add_argument(
+        "--uncond-cfg", type=float, default=0.0,
+        help="When >0, enable satellite-zero CFG at this scale; requires a "
+             "satellite condition-dropout checkpoint. LiDAR remains conditioned.",
+    )
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--ar-dyn-no-transport", action="store_true",
+                        help="AR-dyn control: refresh matched objects instead of carrying appearance")
     parser.add_argument(
         "--noise-mode",
         choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "ar_dyn", "temporal_net", "sat_temporal_net"],
@@ -238,7 +246,11 @@ def prepare_frame_inputs(model, batch):
 
 
 @torch.no_grad()
-def sample_frame(model, sampler, pack, x_T, timesteps, guidance_scale, temperature):
+def sample_frame(model, sampler, pack, x_T, timesteps, guidance_scale, temperature, uncond_cfg=0.0):
+    unconditional_conditioning = None
+    if uncond_cfg > 0:
+        guidance_scale = uncond_cfg
+        unconditional_conditioning = torch.zeros_like(pack["cond_label"])
     samples, _ = sampler.ddim_sampling(
         pack["cond_label"],
         None,
@@ -249,6 +261,7 @@ def sample_frame(model, sampler, pack, x_T, timesteps, guidance_scale, temperatu
         timesteps=timesteps,
         temperature=temperature,
         unconditional_guidance_scale=guidance_scale,
+        unconditional_conditioning=unconditional_conditioning,
         left_camera_k=pack["left_camera_k"],
         gt_shift_x=pack["gt_shift_x"],
         gt_shift_y=pack["gt_shift_y"],
@@ -351,6 +364,10 @@ def main():
     sampler = KITTI_DDIMSampler(model.DDPM, model.pre_AE_model, model.scale_factor)
     sampler.make_schedule(ddim_num_steps=args.ddim_steps, ddim_eta=args.eta, verbose=False)
 
+    # The DDIM implementation otherwise samples this bank at import time,
+    # before --seed is applied. Pin it for comparable independent runs.
+    seed_step_noise(default_noise, args.seed)
+
     torch.manual_seed(args.seed)
     shared_x_T = torch.randn((1, 4, 16, 64), device="cuda")
     shared_eps = torch.randn((1, 4, 16, 64), device="cuda")
@@ -376,6 +393,9 @@ def main():
     for idx, sample in enumerate(samples_list):
         sample_id = sample["sample_id"]
         row = manifest_rows[idx]
+        if args.noise_mode == "ar_dyn" and not consecutive_rows(prev_row, row):
+            prev_latent = None
+            prev_row = None
         batch = sample_to_batch(sample)
         pack = prepare_frame_inputs(model, batch)
         key_stats = lidar_key_structure_stats(model, pack["lidar_context"], max_tokens=args.key_stats_max_tokens)
@@ -424,9 +444,9 @@ def main():
             # (no homography warp — the camera moves little at 10 Hz and the
             # denoise steps re-anchor geometry via current conditions); this
             # is the appearance lock that pure AR proved (ratio 0.82).
-            # Vacated cells (prev returns gone) and unmatched current moving
-            # clusters get fresh noise so old content is repainted, killing
-            # the AR ghosting; matched objects carry their appearance by
+            # Observed previous-footprint changes and unmatched current moving
+            # clusters get fresh noise to reduce stale content. Unobserved
+            # regions remain uncertain; matched objects carry appearance by
             # their own displacement (colour follows the car).
             if prev_latent is None or prev_row is None:
                 torch.manual_seed(args.seed + idx)
@@ -434,67 +454,43 @@ def main():
                 timesteps = None
                 noise_info = {"mode": "ar_dyn", "frame": idx, "init": "fresh"}
             else:
-                geom = geoms.setdefault(
-                    row["calib_dir"],
-                    pwu.SequenceGeometry(resolve_calib_dir(row["calib_dir"])),
-                )
+                if row["calib_dir"] not in geoms:
+                    geoms[row["calib_dir"]] = pwu.SequenceGeometry(resolve_calib_dir(row["calib_dir"]))
+                geom = geoms[row["calib_dir"]]
                 p1 = pwu.load_velodyne(prev_row["velodyne_path"])
                 p2 = pwu.load_velodyne(row["velodyne_path"])
                 T_v = geom.relative_velo_pose(prev_row["oxts_path"], row["oxts_path"])
                 q = (T_v[:3, :3] @ p1.T).T + T_v[:3, 3]
                 img_w, img_h = geom.img_size
-                status = pwu.consistency_status(q, p2)
-                mask, mask_stats = build_dynamic_mask_latent(
-                    geom, p1, p2, q, img_w, img_h, 16, 64, "cuda"
-                )
                 n_v, d_v = pwu.fit_ground_plane_velo(p1)
                 plane = None if n_v is None else (-n_v[0] / n_v[2], -n_v[1] / n_v[2], d_v / n_v[2])
+                # Raw inheritance requires clearing PREVIOUS image coordinates,
+                # not the ego-warped current coordinates used by warp modes.
+                raw_refresh, mask_stats = loa.raw_previous_refresh_mask(
+                    p1, p2, T_v, geom, img_w, img_h, 16, 64, plane=plane
+                )
+                mask = torch.from_numpy(raw_refresh.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
                 matched, assoc_stats = loa.associate_objects(
                     p1, p2, T_v, geom, img_w, img_h, 16, 64, plane=plane
                 )
-                L = prev_latent
-                obj_cell_np = np.zeros((16, 64), bool)
                 obj_records = []
                 for obj in matched:
-                    obj_cell_np |= obj["cell_mask"]
                     obj_records.append({
                         "bbox": obj["bbox"],
+                        "d_lat": [float(v) for v in obj["d_lat"]],
                         "d_velo_norm": float(np.linalg.norm(obj["d_velo"])),
                         "depth": obj["depth"],
                     })
-                # object transport done cell-wise on a copy (grid_sample needs a full grid)
-                L = prev_latent.clone()
-                if matched:
-                    ys_np, xs_np = np.meshgrid(
-                        np.arange(16, dtype=np.float32) + 0.5,
-                        np.arange(64, dtype=np.float32) + 0.5,
-                        indexing="ij",
-                    )
-                    base = torch.stack([torch.from_numpy(xs_np), torch.from_numpy(ys_np)]).unsqueeze(0).to("cuda")
-                    src_list = base.clone()
-                    for obj in matched:
-                        m_t = torch.from_numpy(obj["cell_mask"].astype(np.float32)).to("cuda").unsqueeze(0)
-                        shift = torch.tensor(obj["d_lat"], device="cuda").view(1, 2, 1, 1)
-                        src_list = torch.where(m_t > 0.5, base - shift, src_list)
-                    gx = 2.0 * src_list[:, 0] / 64 - 1.0
-                    gy = 2.0 * src_list[:, 1] / 16 - 1.0
-                    grid_t = torch.stack([gx, gy], dim=-1).unsqueeze(2)  # (1,16,64,1,2)->squeeze
-                    grid_t = grid_t.squeeze(2)
-                    transported = torch.nn.functional.grid_sample(
-                        prev_latent, grid_t, mode="bilinear", padding_mode="zeros", align_corners=False
-                    )
-                    keep_obj = torch.from_numpy(obj_cell_np.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
-                    L = transported * keep_obj + prev_latent * (1.0 - keep_obj)
-                # current-frame unmatched moving clusters → repaint
-                repaint_np = obj_cell_np.copy()
-                if plane is not None:
-                    tree_q = None
+                # Gather current unexplained candidates. compose_history removes
+                # ONLY destinations with valid transported content from refresh.
+                repaint_np = np.zeros((16, 64), bool)
+                current_plane = loa.transform_ground_plane(plane, T_v)
+                if current_plane is not None:
                     from scipy.spatial import cKDTree as _KD
-                    _q1 = q
-                    _tree = _KD(_q1[:, :3])
+                    _tree = _KD(q[:, :3])
                     _d2, _ = _tree.query(p2[:, :3], k=1)
                     _unexpl = _d2 > 0.35
-                    _ag = loa.above_ground_mask(p2, plane) & loa._in_fov(p2, geom, img_w, img_h)
+                    _ag = loa.above_ground_mask(p2, current_plane) & loa._in_fov(p2, geom, img_w, img_h)
                     pool = loa.voxel_downsample(p2[_unexpl & _ag], 0.3)
                     for cand in loa.cluster_objects(pool):
                         if cand["count"] < 12:
@@ -505,21 +501,25 @@ def main():
                             continue
                         repaint_np |= loa._latent_cells(u_c[ok_c], v_c[ok_c], img_w, img_h, 64, 16)
                 repaint = torch.from_numpy(repaint_np.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
-                # vacated dynamic cells ∪ unmatched new clusters → fresh content
-                fill_mask = torch.clamp(mask + repaint, 0.0, 1.0)
-                garbage = torch.randn_like(L)
-                L = L * (1.0 - fill_mask) + garbage * fill_mask
+                # Use frame-local noise so differing match counts cannot change
+                # the noise stream in the transport-on/off comparison.
+                generator = torch.Generator(device="cpu").manual_seed(args.seed + 10000 + idx)
+                garbage = torch.randn(prev_latent.shape, generator=generator).to(prev_latent)
+                L, compose_stats = compose_history(
+                    prev_latent, matched, mask + repaint, garbage,
+                    transport=not args.ar_dyn_no_transport,
+                )
                 x_T = (ar_abar ** 0.5) * L + ((1.0 - ar_abar) ** 0.5) * shared_eps
                 timesteps = ar_steps_arg
                 noise_info = {
                     "mode": "ar_dyn", "frame": idx, "init": "ar_chained",
                     "steps": ar_keep, "ar_strength": args.ar_strength,
-                    "fill_frac": float(fill_mask.mean().item()),
-                    "vacated_frac": float(mask.mean().item()),
-                    "obj_transported": len(matched),
+                    "raw_prev_refresh_mask_frac": float(mask.mean().item()),
+                    "transport_enabled": not args.ar_dyn_no_transport,
                     "objects": obj_records,
                     **assoc_stats,
                     **mask_stats,
+                    **compose_stats,
                 }
         elif args.noise_mode in ("warp", "warp2", "instance"):
             if prev_latent is None or prev_row is None:
@@ -699,7 +699,10 @@ def main():
                     "ar_strength": args.ar_strength,
                 }
 
-        pred, latent = sample_frame(model, sampler, pack, x_T, timesteps, args.guidance_scale, args.temperature)
+        pred, latent = sample_frame(
+            model, sampler, pack, x_T, timesteps, args.guidance_scale,
+            args.temperature, uncond_cfg=args.uncond_cfg,
+        )
         if args.noise_mode == "temporal_net" and temporal_blocks is not None:
             confs = [float(b.ray_posterior_fusion.last_temporal_confidence) for b in temporal_blocks]
             noise_info["temporal_conf_mean"] = float(np.mean(confs))
@@ -754,6 +757,8 @@ def main():
         "noise_mode": args.noise_mode,
         "ar_strength": args.ar_strength,
         "seed": args.seed,
+        "uncond_cfg": args.uncond_cfg,
+        "args": vars(args),
     }
     (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary))
