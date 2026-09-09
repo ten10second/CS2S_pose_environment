@@ -38,7 +38,9 @@ class TestGeometryHistoryAttention(unittest.TestCase):
         self.grid = identity_grid()
         self.valid = torch.ones(1, 4, 4, dtype=torch.bool)
 
-    def test_zero_init_is_inert_with_valid_geometry(self):
+    def test_zero_init_attention_is_inert_when_skip_is_disabled(self):
+        with torch.no_grad():
+            self.attn.skip_gain.zero_()
         out = self.attn(
             self.x,
             self.cond,
@@ -50,6 +52,20 @@ class TestGeometryHistoryAttention(unittest.TestCase):
             history_hw=(4, 4),
         )
         self.assertEqual(float(out.abs().max()), 0.0)
+
+    def test_appearance_skip_is_nonzero_on_valid_cells_at_init(self):
+        out = self.attn(
+            self.x,
+            self.cond,
+            self.tokens,
+            has_history=True,
+            history_grid=self.grid,
+            history_valid=self.valid,
+            query_hw=(4, 4),
+            history_hw=(4, 4),
+        )
+        self.assertGreater(float(out.abs().max()), 0.0)
+        self.assertGreater(float(self.attn.last_skip_ratio), 0.0)
 
     def test_resize_identity_grid_preserves_query_cell_centers(self):
         grid = identity_grid(batch=1, height=16, width=64)
@@ -81,6 +97,7 @@ class TestGeometryHistoryAttention(unittest.TestCase):
     def test_invalid_geometry_is_exact_zero_after_training(self):
         with torch.no_grad():
             self.attn.to_out.weight.fill_(0.25)
+            self.attn.to_skip.weight.fill_(0.25)
         out = self.attn(
             self.x,
             self.cond,
@@ -130,6 +147,34 @@ class TestGeometryHistoryAttention(unittest.TestCase):
         self.assertEqual(none_grads, [])
         self.assertIsNotNone(self.tokens.grad)
         self.assertGreater(float(self.tokens.grad.abs().sum()), 0.0)
+
+    def test_appearance_skip_follows_projected_coordinates(self):
+        with torch.no_grad():
+            self.attn.skip_gain.fill_(1.0)
+            self.attn.to_out.weight.zero_()
+        out_a = self.attn(
+            self.x,
+            self.cond,
+            self.tokens,
+            has_history=True,
+            history_grid=self.grid,
+            history_valid=self.valid,
+            query_hw=(4, 4),
+            history_hw=(4, 4),
+        )
+        shifted = self.grid.clone()
+        shifted[..., 0] = (shifted[..., 0] + 0.5).clamp(-1.0, 1.0)
+        out_b = self.attn(
+            self.x,
+            self.cond,
+            self.tokens,
+            has_history=True,
+            history_grid=shifted,
+            history_valid=self.valid,
+            query_hw=(4, 4),
+            history_hw=(4, 4),
+        )
+        self.assertGreater(float((out_a - out_b).abs().max()), 1e-7)
 
     def test_coordinates_affect_local_readout(self):
         with torch.no_grad():
@@ -210,6 +255,7 @@ class TestGeometryHistoryAttention(unittest.TestCase):
     def test_invalid_nan_grid_is_exact_zero_after_training(self):
         with torch.no_grad():
             self.attn.to_out.weight.fill_(0.25)
+            self.attn.to_skip.weight.fill_(0.25)
         bad_grid = self.grid.clone()
         bad_grid[:] = float("nan")
         out = self.attn(

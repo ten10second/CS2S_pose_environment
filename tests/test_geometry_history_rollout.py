@@ -75,6 +75,29 @@ class TestSequenceBoundary(unittest.TestCase):
         self.assertFalse(gh.use_observed_initial_frame(1, True))
         self.assertFalse(gh.use_observed_initial_frame(0, False))
 
+    def test_diagnostic_sequence_rejects_gaps_and_truncation(self):
+        rows = [{'drive': 'a', 'frame_index': i} for i in range(32)]
+        gh.require_contiguous_sequence(rows, 32)
+        with self.assertRaises(ValueError):
+            gh.require_contiguous_sequence(rows[:31], 32)
+        rows[-1]['frame_index'] = 33
+        with self.assertRaises(ValueError):
+            gh.require_contiguous_sequence(rows, 32)
+
+    def test_future_rgb_can_only_change_target(self):
+        first = {'target': torch.ones(1), 'cond_label': torch.ones(2), 'range_img': None}
+        gh.assert_sampling_inputs_equal(first, dict(first, target=torch.zeros(1)))
+        with self.assertRaisesRegex(RuntimeError, 'cond_label'):
+            gh.assert_sampling_inputs_equal(first, dict(first, cond_label=torch.zeros(2)))
+
+    def test_noise_bank_and_bootstrap_are_reproducible(self):
+        from ar_dyn_utils import seed_step_noise
+        first = [torch.randn(1, 4, 2, 2) for _ in range(3)]
+        second = [torch.randn(1, 4, 2, 2) for _ in range(3)]
+        seed_step_noise(first, 42)
+        seed_step_noise(second, 42)
+        self.assertEqual(gh.tensor_sha256(torch.stack(first)), gh.tensor_sha256(torch.stack(second)))
+
 
 class TestGeometryPayload(unittest.TestCase):
     def test_cfg_payload_repeats_history_and_geometry_for_both_branches(self):

@@ -3,7 +3,8 @@
 The frozen CFG backbone and old temporal experiments are not modified. Each
 rank uses one frame pair; only encoder/selected history attention are trained.
 Geometry injection defaults to after-bottleneck decoder fusion so the history
-residual is not a depth-feature channel.
+residual is not a depth-feature channel. Appearance is transported by a
+non-zero bilinear skip at projected cells; invalid cells stay exact zero.
 """
 import argparse
 from contextlib import contextmanager
@@ -43,7 +44,7 @@ from temporal_history import (
 )
 from temporal_history_geometry import build_pair_geometry
 
-MODE = "geometry_history_v1"
+MODE = "geometry_history_v1_transport"
 
 
 def split_drive_pairs(rows, val_drives=None):
@@ -291,6 +292,7 @@ def main():
     metadata = {"mode": MODE, "args": vars(args), "world_size": world,
                 "start_step": start,
                 "block_indices": list(indices),
+                "appearance_skip": True,
                 "history_placement": AFTER_BOTTLENECK if index_spec == AFTER_BOTTLENECK else "explicit",
                 "history_dim": args.history_dim,
                 "train_pairs": len(train), "val_pairs": len(val), "val_drives": held,
@@ -332,9 +334,11 @@ def main():
                 probes.write(json.dumps(record) + "\n")
             if step == 0:
                 for t in timesteps:
-                    losses = [r["loss_total"] for r in results if r["t"] == t]
-                    if len(set(losses)) != 1:
-                        raise RuntimeError(f"zero-init baseline mismatch: {losses}")
+                    by_cond = {r["condition"]: r["loss_total"] for r in results if r["t"] == t}
+                    if by_cond.get("correct") == by_cond.get("disabled"):
+                        raise RuntimeError(
+                            f"appearance skip did not change the correct-history probe at t={t}: {by_cond}"
+                        )
             if rank == 0:
                 by_t = {t: {r["condition"]: r["loss_total"] for r in results if r["t"] == t}
                         for t in timesteps}
@@ -375,7 +379,8 @@ def main():
             raise RuntimeError(f"unused trainable parameters: {missing}")
         gradients = {"encoder_grad_l2": grad_l2(encoder.parameters()),
                      "cond_query_grad_l2": grad_l2(p for b in blocks for p in b.history_attn.to_q_cond.parameters()),
-                     "out_grad_l2": grad_l2(p for b in blocks for p in b.history_attn.to_out.parameters())}
+                     "out_grad_l2": grad_l2(p for b in blocks for p in b.history_attn.to_out.parameters()),
+                     "skip_grad_l2": grad_l2(p for b in blocks for p in list(b.history_attn.to_skip.parameters()) + [b.history_attn.skip_gain])}
         finite = torch.stack([torch.isfinite(p.grad).all() for p in trainable]).all().int()
         finite *= int(all(np.isfinite(v) for v in gradients.values()))
         if world > 1:
@@ -393,6 +398,8 @@ def main():
                   "history": history, "satellite_dropped": drop_sat,
                   "valid_fraction": float(geom["history_valid"].float().mean()),
                   "history_ratio": [b.history_attn.last_ratio for b in blocks],
+                  "history_skip_ratio": [b.history_attn.last_skip_ratio for b in blocks],
+                  "skip_gain": [float(b.history_attn.skip_gain.detach()) for b in blocks],
                   "data_wait_seconds": data_ready - step_start,
                   "compute_seconds": time.time() - data_ready,
                   "seconds": time.time() - tick}

@@ -123,11 +123,15 @@ class GeometryHistoryAttention(nn.Module):
     history_grid is expressed in grid_sample coordinates for the previous
     history feature map, align_corners=False. Invalid correspondences can only
     attend to the learned null key whose value is fixed zero.
+
+    Attention residual stays zero-initialised. Appearance transport is a
+    separate bilinear skip of history tokens at the projected cell: valid
+    cells can change the current features at init; invalid cells stay 0.
     """
 
     uses_geometry = True
 
-    def __init__(self, dim, history_dim=64, heads=4, dim_head=32, window=3):
+    def __init__(self, dim, history_dim=64, heads=4, dim_head=32, window=3, skip_gain=1.0):
         super().__init__()
         if window % 2 != 1:
             raise ValueError("GeometryHistoryAttention window must be odd")
@@ -147,9 +151,14 @@ class GeometryHistoryAttention(nn.Module):
         self.null_key = nn.Parameter(torch.randn(inner) * 0.02)
         self.register_buffer("null_value", torch.zeros(inner))
         self.to_out = zero_module(nn.Linear(inner, dim, bias=False))
+        self.norm_skip = nn.LayerNorm(history_dim)
+        self.to_skip = nn.Linear(history_dim, dim, bias=False)
+        nn.init.normal_(self.to_skip.weight, std=0.02)
+        self.skip_gain = nn.Parameter(torch.tensor(float(skip_gain)))
         self.last_null_frac = None
         self.last_valid_frac = None
         self.last_ratio = None
+        self.last_skip_ratio = None
 
     @staticmethod
     def _repeat_to_batch(tensor, batch, name):
@@ -201,7 +210,10 @@ class GeometryHistoryAttention(nn.Module):
         q = self.to_q(self.norm_q(x)) + self.to_q_cond(self.norm_cond(cond_summary))
         k = self.to_k(self.norm_hist(history_tokens))
         v = self.to_v(self.norm_hist(history_tokens))
-        zero_dep = (q.mean() + k.mean() + v.mean() + self.null_key.mean()) * 0.0
+        skip_dep = self.to_skip(self.norm_skip(history_tokens.mean(dim=1, keepdim=True))).mean()
+        zero_dep = (
+            q.mean() + k.mean() + v.mean() + self.null_key.mean() + skip_dep + self.skip_gain
+        ) * 0.0
         out = self.to_out(x.new_zeros((b, n, self.inner)) + zero_dep)
         if not has_history:
             out = out * torch.zeros((), device=out.device, dtype=out.dtype)
@@ -209,7 +221,35 @@ class GeometryHistoryAttention(nn.Module):
             self.last_null_frac = 1.0
             self.last_valid_frac = 0.0
             self.last_ratio = 0.0
+            self.last_skip_ratio = 0.0
         return out
+
+    def _appearance_skip(self, history_tokens, grid, valid, height, width):
+        batch, queries, _ = grid.shape[0], grid.shape[1] * grid.shape[2], history_tokens.shape[-1]
+        if history_tokens.shape[1] != height * width:
+            raise ValueError("history token count does not match history_hw")
+        hist_map = history_tokens.transpose(1, 2).reshape(batch, history_tokens.shape[-1], height, width)
+        center = grid.reshape(batch, queries, 1, 2)
+        finite = torch.isfinite(center).all(dim=-1)
+        in_bounds = (center[..., 0] >= -1.0) & (center[..., 0] <= 1.0)
+        in_bounds = in_bounds & (center[..., 1] >= -1.0) & (center[..., 1] <= 1.0)
+        center_valid = valid.reshape(batch, queries, 1) & finite & in_bounds
+        sampled_grid = torch.where(
+            center_valid[..., None],
+            center,
+            torch.zeros((), device=center.device, dtype=center.dtype),
+        )
+        sampled = F.grid_sample(
+            hist_map.to(sampled_grid.dtype),
+            sampled_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        sampled = sampled.permute(0, 2, 3, 1).reshape(batch, queries, history_tokens.shape[-1])
+        skip = self.skip_gain * self.to_skip(self.norm_skip(sampled.to(history_tokens.dtype)))
+        skip = skip * center_valid.to(dtype=skip.dtype)
+        return skip
 
     def forward(
         self,
@@ -311,6 +351,8 @@ class GeometryHistoryAttention(nn.Module):
         out = (attn.unsqueeze(-1) * vh).sum(dim=-2).permute(0, 2, 1, 3).reshape(b, n, self.inner)
         zero_dep = q.mean() * 0.0
         out = self.to_out((out + zero_dep).to(x.dtype))
+        skip = self._appearance_skip(history_tokens, grid, valid, hh, hw).to(dtype=out.dtype)
+        out = out + skip
 
         with torch.no_grad():
             self.last_null_frac = float(attn[..., -1].mean())
@@ -318,4 +360,5 @@ class GeometryHistoryAttention(nn.Module):
             denom = float(cond_summary.detach().float().norm(dim=-1).mean())
             num = float(out.detach().float().norm(dim=-1).mean())
             self.last_ratio = num / max(denom, 1e-6)
+            self.last_skip_ratio = float(skip.detach().float().norm(dim=-1).mean()) / max(denom, 1e-6)
         return out

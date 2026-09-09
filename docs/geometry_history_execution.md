@@ -231,3 +231,25 @@ Code change (do not resume 2,12 weights):
 Launch: `tools/run_geometry_history_post_bottleneck.sh`. Do not start it while
 GPUs 0–3 CFG training or a previous geometry job is using 4–7. This run answers
 whether encoder-side depth coupling caused on>off; it is not itself a rollout.
+
+## E: appearance transport through the correspondence gate
+
+Stage D left geometry lookup correct but on/off videos nearly identical: the
+zero-initialised attention residual was too weak to change pixels. Stage E
+does not refine the projection. It adds a bilinear appearance skip of history
+tokens at the projected cell, with a non-zero `to_skip` map. Invalid cells and
+`has_history=False` remain exact zero. Attention `to_out` stays zero-init.
+
+- Checkpoint mode: `geometry_history_v1_transport`. Do not resume Stage D
+  `geometry_history_v1` weights.
+- Placement remains `after_bottleneck`. Frozen backbone unchanged.
+- Step 0 is no longer all-conditions-identical: correct history must differ
+  from disabled. Disabled probes must stay bit-identical across steps.
+- Judge RGB `loss_eps_base` and whether generated on/off videos diverge on
+  corresponding surfaces. Depth must stay invariant across history conditions.
+- New run directory: `stage_e_appearance_transport`. Fresh adapter. Same
+  1000-step budget and the same eight fixed probes.
+
+Launch: `tools/run_geometry_history_appearance_transport.sh`. This answers
+whether transporting appearance along the already-open gate can change pixels;
+it is not a claim that temporal consistency is solved.

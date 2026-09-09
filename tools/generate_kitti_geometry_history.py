@@ -13,6 +13,7 @@ bit-identical to the frozen single-frame model when the history adapter is
 zero-initialized.
 """
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ for p in (str(TOOLS_DIR), str(REPO_ROOT)):
         sys.path.insert(0, p)
 
 
-HISTORY_MODE = "geometry_history_v1"
+HISTORY_MODE = "geometry_history_v1_transport"
 DEFAULT_GRID = (16, 64)
 
 
@@ -224,6 +225,30 @@ def use_observed_initial_frame(frame_offset, first_rgb):
     return bool(first_rgb) and int(frame_offset) == 0
 
 
+def require_contiguous_sequence(rows, expected_count):
+    if len(rows) != expected_count or not rows:
+        raise ValueError('requested complete sequence is not available')
+    if any(not consecutive_rows(a, b) for a, b in zip(rows, rows[1:])):
+        raise ValueError('diagnostic sequence must be consecutive within one drive')
+
+
+def tensor_sha256(tensor):
+    return hashlib.sha256(tensor.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+
+
+def assert_sampling_inputs_equal(first, second):
+    """GT may change the visualization target, never the denoiser conditions."""
+    if set(first) != set(second):
+        raise RuntimeError('sampling input keys changed when future RGB was replaced')
+    for key in first:
+        if key == 'target':
+            continue
+        a, b = first[key], second[key]
+        equal = torch.equal(a, b) if torch.is_tensor(a) and torch.is_tensor(b) else a is b
+        if not equal:
+            raise RuntimeError(f'future RGB changed sampling condition: {key}')
+
+
 @torch.no_grad()
 def encode_rgb_history_latent(model, target):
     """Encode an RGB tensor in [0,1] as a scaled latent for history bootstrap."""
@@ -283,6 +308,10 @@ def parse_args():
     )
     p.add_argument("--first-rgb", action="store_true",
                    help="bootstrap frame 1 from frame 0 RGB; later history is generated only")
+    p.add_argument("--disable-history", action="store_true",
+                   help="same loaded checkpoint, but bypass history for the paired baseline")
+    p.add_argument("--require-contiguous", action="store_true",
+                   help="reject truncated, nonconsecutive or cross-drive diagnostic clips")
     return p.parse_args()
 
 
@@ -290,7 +319,8 @@ def main():
     from omegaconf import OmegaConf
 
     from dataloader.KITTI_raw_sat_lidar import SatLidarRawDataset
-    from models.KITTI_geo_ldm_diffusion.ddim_KITTI import KITTI_DDIMSampler
+    from models.KITTI_geo_ldm_diffusion.ddim_KITTI import KITTI_DDIMSampler, default_noise
+    from ar_dyn_utils import seed_step_noise
     from utils.util import instantiate_from_config
 
     from generate_kitti_raea_samples import (
@@ -349,6 +379,8 @@ def main():
         rebase_manifest_row(row, args.kitti_root)
         for row in manifest_rows[start_index : start_index + len(samples_list)]
     ]
+    if args.require_contiguous:
+        require_contiguous_sequence(manifest_rows, int(args.num_samples))
 
     model = instantiate_from_config(cfg.model)
     load_checkpoint_into_model(model, args.ckpt)
@@ -364,24 +396,63 @@ def main():
 
     sampler = KITTI_DDIMSampler(model.DDPM, model.pre_AE_model, model.scale_factor)
     sampler.make_schedule(ddim_num_steps=args.ddim_steps, ddim_eta=args.eta, verbose=False)
+    # The sampler creates this bank at import time, before CLI seeding. Pin it
+    # explicitly for paired eta>0 runs in separate processes.
+    seed_step_noise(default_noise, args.seed)
+    step_noise_sha256 = tensor_sha256(torch.stack(default_noise))
+    torch.manual_seed(args.seed + start_index)
+
+    # Read-only runtime evidence that real CFG and history execute at each step.
+    step_trace = []
+    denoiser_batches = []
+    def observe_denoiser(_module, inputs):
+        denoiser_batches.append(int(inputs[0].shape[0]))
+    def history_observer(block_index):
+        def observe(attention, inputs, output):
+            with torch.no_grad():
+                denominator = float(inputs[0].detach().float().norm(dim=-1).mean())
+                numerator = float(output.detach().float().norm(dim=-1).mean())
+            step_trace.append(dict(block_index=block_index,
+                null_all=attention.last_null_frac,
+                valid_neighbor_fraction=attention.last_valid_frac,
+                residual_to_condition=attention.last_ratio,
+                skip_to_condition=attention.last_skip_ratio,
+                residual_to_x=numerator / max(denominator, 1e-6)))
+        return observe
+    hooks = [model.DDPM.denoise_model.register_forward_pre_hook(observe_denoiser)]
+    hooks.extend(b.history_attn.register_forward_hook(history_observer(b.history_block_index)) for b in blocks)
 
     records = []
     prev_latent = None
     prev_row = None
     prev_frame_index = None
+    future_rgb_condition_check_passed = None
     for offset, (sample, row) in enumerate(zip(samples_list, manifest_rows)):
         sample_id = sample["sample_id"]
         frame_index = row_frame_index(row, start_index + offset)
         batch = sample_to_batch(sample)
         pack = prepare_frame_inputs(model, batch)
+        if offset == 1 and args.first_rgb:
+            poisoned = dict(batch)
+            for key in ('grd_left_imgs', 'image_semantic_feat'):
+                if key in poisoned:
+                    poisoned[key] = torch.zeros_like(poisoned[key])
+            poisoned_pack = prepare_frame_inputs(model, poisoned)
+            assert_sampling_inputs_equal(pack, poisoned_pack)
+            future_rgb_condition_check_passed = True
+            del poisoned, poisoned_pack
 
         observed_initial = use_observed_initial_frame(offset, args.first_rgb)
         has_history = (
-            prev_latent is not None
+            not args.disable_history and prev_latent is not None
             and consecutive_rows(prev_row, row, prev_frame_index, frame_index)
         )
+        input_history_hash = tensor_sha256(prev_latent) if has_history else None
         geometry = None
-        if has_history:
+        if args.disable_history:
+            hub.clear()
+            valid_frac = 0.0
+        elif has_history:
             geometry = build_pair_geometry(prev_row, row, args.kitti_root, grid=DEFAULT_GRID)
             hub.set(
                 build_geometry_history_payload(
@@ -397,14 +468,19 @@ def main():
             )
             valid_frac = 0.0
 
+        step_trace.clear()
+        denoiser_batches.clear()
+        x_T_hash = None
         if observed_initial:
             pred = pack["target"].detach()
             latent = None
+            torch.manual_seed(args.seed + start_index)
             prev_latent = encode_rgb_history_latent(model, pack["target"]).detach()
             hub.clear()
         else:
             torch.manual_seed(args.seed + start_index + offset)
             x_T = torch.randn((1, 4, 16, 64), device="cuda")
+            x_T_hash = tensor_sha256(x_T)
             pred, latent = sample_frame(
                 model,
                 sampler,
@@ -417,6 +493,12 @@ def main():
             )
             hub.clear()
             prev_latent = latent.detach()
+            if not denoiser_batches or any(b != batch_factor for b in denoiser_batches):
+                raise RuntimeError('actual denoiser batch does not match requested CFG')
+            if args.disable_history and step_trace:
+                raise RuntimeError('disabled baseline unexpectedly read history')
+            if has_history and len(step_trace) != len(denoiser_batches) * len(blocks):
+                raise RuntimeError('history did not execute at every denoising step')
         source = next_history_latent_source(offset, args.first_rgb)
         prev_row = row
         prev_frame_index = frame_index
@@ -451,6 +533,12 @@ def main():
                 "frame_index": frame_index,
                 "sequence_id": row_sequence_id(row),
                 "has_history": bool(has_history),
+                "history_disabled": bool(args.disable_history),
+                "history_input_sha256": input_history_hash,
+                "history_output_sha256": tensor_sha256(prev_latent),
+                "initial_noise_sha256": x_T_hash,
+                "denoiser_batch_sizes": list(denoiser_batches),
+                "history_attention_steps": list(step_trace),
                 "is_observed_initial_frame": bool(observed_initial),
                 "history_valid_frac": valid_frac,
                 "history_source_for_next": source,
@@ -464,6 +552,8 @@ def main():
             f"hist={has_history} valid={valid_frac:.3f} next={source}",
             flush=True,
         )
+        # Keep completed-frame provenance even if a later frame fails.
+        (out_dir / "records.json").write_text(json.dumps(records, indent=2, sort_keys=True))
         if observed_initial:
             del batch, pack, pred
         else:
@@ -486,8 +576,13 @@ def main():
         "heads": args.heads,
         "dim_head": args.dim_head,
         "first_rgb": bool(args.first_rgb),
+        "history_disabled": bool(args.disable_history),
+        "step_noise_sha256": step_noise_sha256,
+        "future_rgb_condition_check_passed": future_rgb_condition_check_passed,
         "args": vars(args),
     }
+    for hook in hooks:
+        hook.remove()
     (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
     print(json.dumps(summary, sort_keys=True))
 
