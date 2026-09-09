@@ -46,7 +46,6 @@ from utils.util import instantiate_from_config  # noqa: E402
 import pose_warp_utils as pwu  # noqa: E402
 import lidar_object_association as loa  # noqa: E402
 import temporal_evidence as te  # noqa: E402
-from ar_dyn_utils import compose_history, consecutive_rows, seed_step_noise  # noqa: E402
 
 from generate_kitti_raea_samples import (  # noqa: E402
     lidar_key_structure_stats,
@@ -82,11 +81,9 @@ def parse_args():
     )
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--ar-dyn-no-transport", action="store_true",
-                        help="AR-dyn control: refresh matched objects instead of carrying appearance")
     parser.add_argument(
         "--noise-mode",
-        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "ar_dyn", "temporal_net", "sat_temporal_net"],
+        choices=["per_frame", "shared", "autoregressive", "warp", "warp2", "instance", "temporal_net", "sat_temporal_net"],
         default="shared",
     )
     parser.add_argument("--temporal-gates", default="",
@@ -393,13 +390,6 @@ def main():
     for idx, sample in enumerate(samples_list):
         sample_id = sample["sample_id"]
         row = manifest_rows[idx]
-        if args.noise_mode == "ar_dyn" and not consecutive_rows(prev_row, row):
-            prev_latent = None
-            prev_row = None
-        batch = sample_to_batch(sample)
-        pack = prepare_frame_inputs(model, batch)
-        key_stats = lidar_key_structure_stats(model, pack["lidar_context"], max_tokens=args.key_stats_max_tokens)
-
         if args.noise_mode == "temporal_net":
             # frame boundary: snapshot the previous frame's final posterior and
             # install this pair's transport payload; the whole DDIM trajectory
@@ -438,89 +428,6 @@ def main():
             x_T = shared_x_T.clone()
             timesteps = None
             noise_info = {"mode": "shared", "seed": args.seed}
-        elif args.noise_mode == "ar_dyn":
-            # Autoregressive appearance chaining with LiDAR-gated refresh.
-            # Static world and slow movers inherit the previous latent RAW
-            # (no homography warp — the camera moves little at 10 Hz and the
-            # denoise steps re-anchor geometry via current conditions); this
-            # is the appearance lock that pure AR proved (ratio 0.82).
-            # Observed previous-footprint changes and unmatched current moving
-            # clusters get fresh noise to reduce stale content. Unobserved
-            # regions remain uncertain; matched objects carry appearance by
-            # their own displacement (colour follows the car).
-            if prev_latent is None or prev_row is None:
-                torch.manual_seed(args.seed + idx)
-                x_T = torch.randn((1, 4, 16, 64), device="cuda")
-                timesteps = None
-                noise_info = {"mode": "ar_dyn", "frame": idx, "init": "fresh"}
-            else:
-                if row["calib_dir"] not in geoms:
-                    geoms[row["calib_dir"]] = pwu.SequenceGeometry(resolve_calib_dir(row["calib_dir"]))
-                geom = geoms[row["calib_dir"]]
-                p1 = pwu.load_velodyne(prev_row["velodyne_path"])
-                p2 = pwu.load_velodyne(row["velodyne_path"])
-                T_v = geom.relative_velo_pose(prev_row["oxts_path"], row["oxts_path"])
-                q = (T_v[:3, :3] @ p1.T).T + T_v[:3, 3]
-                img_w, img_h = geom.img_size
-                n_v, d_v = pwu.fit_ground_plane_velo(p1)
-                plane = None if n_v is None else (-n_v[0] / n_v[2], -n_v[1] / n_v[2], d_v / n_v[2])
-                # Raw inheritance requires clearing PREVIOUS image coordinates,
-                # not the ego-warped current coordinates used by warp modes.
-                raw_refresh, mask_stats = loa.raw_previous_refresh_mask(
-                    p1, p2, T_v, geom, img_w, img_h, 16, 64, plane=plane
-                )
-                mask = torch.from_numpy(raw_refresh.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
-                matched, assoc_stats = loa.associate_objects(
-                    p1, p2, T_v, geom, img_w, img_h, 16, 64, plane=plane
-                )
-                obj_records = []
-                for obj in matched:
-                    obj_records.append({
-                        "bbox": obj["bbox"],
-                        "d_lat": [float(v) for v in obj["d_lat"]],
-                        "d_velo_norm": float(np.linalg.norm(obj["d_velo"])),
-                        "depth": obj["depth"],
-                    })
-                # Gather current unexplained candidates. compose_history removes
-                # ONLY destinations with valid transported content from refresh.
-                repaint_np = np.zeros((16, 64), bool)
-                current_plane = loa.transform_ground_plane(plane, T_v)
-                if current_plane is not None:
-                    from scipy.spatial import cKDTree as _KD
-                    _tree = _KD(q[:, :3])
-                    _d2, _ = _tree.query(p2[:, :3], k=1)
-                    _unexpl = _d2 > 0.35
-                    _ag = loa.above_ground_mask(p2, current_plane) & loa._in_fov(p2, geom, img_w, img_h)
-                    pool = loa.voxel_downsample(p2[_unexpl & _ag], 0.3)
-                    for cand in loa.cluster_objects(pool):
-                        if cand["count"] < 12:
-                            continue
-                        u_c, v_c, dep_c = geom.project_velo_to_rect_img(pool[cand["idx"]][:, :3])
-                        ok_c = (dep_c > 1.0) & (u_c >= 0) & (u_c < img_w) & (v_c >= 0) & (v_c < img_h)
-                        if ok_c.sum() < 3:
-                            continue
-                        repaint_np |= loa._latent_cells(u_c[ok_c], v_c[ok_c], img_w, img_h, 64, 16)
-                repaint = torch.from_numpy(repaint_np.astype(np.float32)).to("cuda").reshape(1, 1, 16, 64)
-                # Use frame-local noise so differing match counts cannot change
-                # the noise stream in the transport-on/off comparison.
-                generator = torch.Generator(device="cpu").manual_seed(args.seed + 10000 + idx)
-                garbage = torch.randn(prev_latent.shape, generator=generator).to(prev_latent)
-                L, compose_stats = compose_history(
-                    prev_latent, matched, mask + repaint, garbage,
-                    transport=not args.ar_dyn_no_transport,
-                )
-                x_T = (ar_abar ** 0.5) * L + ((1.0 - ar_abar) ** 0.5) * shared_eps
-                timesteps = ar_steps_arg
-                noise_info = {
-                    "mode": "ar_dyn", "frame": idx, "init": "ar_chained",
-                    "steps": ar_keep, "ar_strength": args.ar_strength,
-                    "raw_prev_refresh_mask_frac": float(mask.mean().item()),
-                    "transport_enabled": not args.ar_dyn_no_transport,
-                    "objects": obj_records,
-                    **assoc_stats,
-                    **mask_stats,
-                    **compose_stats,
-                }
         elif args.noise_mode in ("warp", "warp2", "instance"):
             if prev_latent is None or prev_row is None:
                 x_T = shared_x_T.clone()
