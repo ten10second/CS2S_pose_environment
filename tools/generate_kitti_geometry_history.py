@@ -34,20 +34,16 @@ DEFAULT_GRID = (16, 64)
 def parse_block_indices(text):
     if text is None or str(text).strip() == "":
         raise ValueError("--block-indices is required for geometry-history rollout")
-    out = []
-    for part in str(text).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        value = int(part)
-        if value < 0:
-            raise ValueError(f"block index must be non-negative, got {value}")
-        out.append(value)
-    if not out:
+    from temporal_history import AFTER_BOTTLENECK, parse_history_block_indices
+
+    parsed = parse_history_block_indices(text)
+    if parsed == AFTER_BOTTLENECK:
+        return AFTER_BOTTLENECK
+    if not parsed:
         raise ValueError("--block-indices did not contain any indices")
-    if len(set(out)) != len(out):
-        raise ValueError(f"--block-indices contains duplicates: {text!r}")
-    return tuple(out)
+    if any(value < 0 for value in parsed):
+        raise ValueError(f"block index must be non-negative, got {parsed}")
+    return tuple(parsed)
 
 
 def cfg_batch_factor(uncond_cfg):
@@ -236,13 +232,14 @@ def encode_rgb_history_latent(model, target):
 
 
 def enable_geometry_history_attention(model, args):
-    from temporal_history import enable_history_attention
+    from temporal_history import AFTER_BOTTLENECK, enable_history_attention
 
     try:
-        return enable_history_attention(
+        hub, encoder, blocks = enable_history_attention(
             model,
             geometry=True,
-            block_indices=tuple(args.block_indices),
+            block_indices=args.block_indices,
+            allow_pre_bottleneck=args.block_indices != AFTER_BOTTLENECK,
             history_dim=args.history_dim,
             heads=args.heads,
             dim_head=args.dim_head,
@@ -252,6 +249,8 @@ def enable_geometry_history_attention(model, args):
             "temporal_history.enable_history_attention must support "
             "geometry=True and block_indices for geometry-history rollout"
         ) from exc
+    args.block_indices = tuple(block.history_block_index for block in blocks)
+    return hub, encoder, blocks
 
 
 def parse_args():
@@ -276,7 +275,12 @@ def parse_args():
     p.add_argument("--history-dim", type=int, default=64)
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--dim-head", type=int, default=32)
-    p.add_argument("--block-indices", type=parse_block_indices, required=True)
+    p.add_argument(
+        "--block-indices",
+        type=parse_block_indices,
+        required=True,
+        help="Fusion indices, or 'after_bottleneck' to match the post-depth decoder layer",
+    )
     p.add_argument("--first-rgb", action="store_true",
                    help="bootstrap frame 1 from frame 0 RGB; later history is generated only")
     return p.parse_args()

@@ -11,7 +11,14 @@ for p in (str(REPO), str(REPO / "tools")):
         sys.path.insert(0, p)
 
 from ldm.modules.temporal_history_attention import GeometryHistoryAttention  # noqa: E402
-from temporal_history import build_payload, enable_history_attention  # noqa: E402
+from temporal_history import (  # noqa: E402
+    AFTER_BOTTLENECK,
+    build_payload,
+    enable_history_attention,
+    fusion_block_stages,
+    parse_history_block_indices,
+    resolve_history_block_indices,
+)
 
 
 def identity_grid(batch=1, height=4, width=4, device="cpu", dtype=torch.float32):
@@ -250,6 +257,19 @@ class _TinyModel(torch.nn.Module):
         self.blocks = torch.nn.ModuleList([_FusionBlock(), _FusionBlock(), _FusionBlock()])
 
 
+class _FakeUNet(torch.nn.Module):
+    """Encoder 320/640, middle 1280, decoder 1280/640/320, with a bottleneck head."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_blocks = torch.nn.ModuleList([_FusionBlock(320), _FusionBlock(640)])
+        self.middle_block = _FusionBlock(1280)
+        self.output_blocks = torch.nn.ModuleList(
+            [_FusionBlock(1280), _FusionBlock(640), _FusionBlock(320)]
+        )
+        self.lidar_bottleneck_depth_head = torch.nn.Identity()
+
+
 class TestGeometryHistoryPlumbing(unittest.TestCase):
     def test_enable_geometry_selects_explicit_blocks(self):
         model = _TinyModel()
@@ -285,6 +305,41 @@ class TestGeometryHistoryPlumbing(unittest.TestCase):
         self.assertEqual(encoder.out_dim, 128)
         self.assertEqual(blocks[0].history_attn.heads, 8)
         self.assertEqual(blocks[0].history_attn.dim_head, 16)
+
+    def test_after_bottleneck_selects_finest_decoder_640(self):
+        model = _FakeUNet()
+        candidates, stages = fusion_block_stages(model)
+        self.assertEqual([block.ray_posterior_fusion.dim for block in candidates], [320, 640, 1280, 1280, 640, 320])
+        self.assertEqual(stages, ["encoder", "encoder", "middle", "decoder", "decoder", "decoder"])
+        _candidates, selected, _stages, spec = resolve_history_block_indices(
+            model, AFTER_BOTTLENECK, geometry=True
+        )
+        self.assertEqual(selected, [4])
+        self.assertEqual(spec, AFTER_BOTTLENECK)
+        hub, encoder, blocks = enable_history_attention(model, geometry=True)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].history_block_index, 4)
+        self.assertEqual(blocks[0].history_block_stage, "decoder")
+        self.assertEqual(blocks[0].ray_posterior_fusion.dim, 640)
+        self.assertIs(blocks[0], model.output_blocks[1])
+        self.assertEqual(encoder.out_dim, 64)
+
+    def test_geometry_refuses_encoder_injection_without_override(self):
+        with self.assertRaises(ValueError) as ctx:
+            enable_history_attention(_FakeUNet(), geometry=True, block_indices=(1,))
+        self.assertIn("pre-bottleneck", str(ctx.exception))
+        hub, _encoder, blocks = enable_history_attention(
+            _FakeUNet(), geometry=True, block_indices=(1,), allow_pre_bottleneck=True
+        )
+        self.assertEqual(blocks[0].history_block_index, 1)
+        self.assertEqual(blocks[0].history_block_stage, "encoder")
+        self.assertIsNotNone(hub)
+
+    def test_after_bottleneck_on_stub_without_decoder_fails(self):
+        with self.assertRaises(ValueError):
+            enable_history_attention(_TinyModel(), geometry=True)
+        self.assertEqual(parse_history_block_indices("after_bottleneck"), AFTER_BOTTLENECK)
+        self.assertEqual(parse_history_block_indices("2,12"), (2, 12))
 
     def test_payload_validates_geometry_fields(self):
         model = _TinyModel()

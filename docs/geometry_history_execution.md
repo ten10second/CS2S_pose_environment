@@ -204,3 +204,30 @@ parameter count is 608576; selected fusion indices 2 and 12 both have width 640.
 The pilot is running detached; its 100-step held-out evaluation and final
 temporal effectiveness results remain pending. Do not equate successful
 training startup with improved generated-video consistency.
+
+## D: post-bottleneck coupling control
+
+Stage C at `stage_c_pilot/geometry_history_step_1000.pt` did not pass the RGB
+effectiveness gate. Held-out RGB denoising stayed slightly worse than disabled
+history; depth improved; correct history beat wrong history/geometry on RGB.
+A later frozen-checkpoint gradient audit found encoder-local conflict at t=750
+and zero depth gradient at fusion index 12, which sits after bottleneck depth
+prediction in `openaimodel.py`. That audit is a snapshot: it does not prove
+that removing depth loss would pass RGB vs disabled.
+
+Code change (do not resume 2,12 weights):
+
+- Geometry history defaults to `after_bottleneck`: the finest 640-d decoder
+  fusion block, after `lidar_bottleneck_depth_head`.
+- Explicit encoder/middle indices raise unless
+  `--allow-pre-bottleneck-history` is set (2,12 control only).
+- Local 3x3 geometry attention, null token, and frozen backbone are unchanged.
+- New run directory: `stage_d_post_bottleneck`. Fresh adapter. Same 1000-step
+  budget and the same eight fixed probes.
+- Expected diagnostic if placement is correct: bottleneck depth metrics are
+  identical across disabled/correct/wrong history. Judge RGB `loss_eps_base`
+  only. Do not announce temporal success from total loss.
+
+Launch: `tools/run_geometry_history_post_bottleneck.sh`. Do not start it while
+GPUs 0–3 CFG training or a previous geometry job is using 4–7. This run answers
+whether encoder-side depth coupling caused on>off; it is not itself a rollout.

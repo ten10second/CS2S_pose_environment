@@ -36,6 +36,122 @@ def should_use_history(prev_state, cur_sequence_id, cur_frame_index):
     return int(cur_frame_index) == prev_state.frame_index + 1
 
 
+AFTER_BOTTLENECK = "after_bottleneck"
+
+
+def _is_ray_posterior_block(module):
+    return (
+        getattr(module, "ray_fusion_mode", None) == "ray_posterior"
+        and getattr(module, "ray_posterior_fusion", None) is not None
+    )
+
+
+def collect_ray_posterior_blocks(module):
+    return [item for item in module.modules() if _is_ray_posterior_block(item)]
+
+
+def find_unet_with_bottleneck(root):
+    for module in root.modules():
+        if (
+            hasattr(module, "input_blocks")
+            and hasattr(module, "middle_block")
+            and hasattr(module, "output_blocks")
+            and hasattr(module, "lidar_bottleneck_depth_head")
+        ):
+            return module
+    return None
+
+
+def fusion_block_stages(root):
+    """Ordered ray-posterior blocks plus encoder/middle/decoder/unknown stages.
+
+    Bottleneck depth is predicted from middle_block output. Encoder and middle
+    fusion therefore inject before that head; decoder fusion injects after it.
+    """
+    unet = find_unet_with_bottleneck(root)
+    all_blocks = collect_ray_posterior_blocks(root)
+    if unet is None:
+        return all_blocks, ["unknown"] * len(all_blocks)
+    encoder = collect_ray_posterior_blocks(unet.input_blocks)
+    middle = collect_ray_posterior_blocks(unet.middle_block)
+    decoder = collect_ray_posterior_blocks(unet.output_blocks)
+    partitioned = encoder + middle + decoder
+    if partitioned != all_blocks:
+        raise RuntimeError(
+            "ray-posterior fusion blocks are not confined to UNet "
+            "input_blocks/middle_block/output_blocks"
+        )
+    stages = (
+        ["encoder"] * len(encoder)
+        + ["middle"] * len(middle)
+        + ["decoder"] * len(decoder)
+    )
+    return all_blocks, stages
+
+
+def parse_history_block_indices(text):
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if raw in {AFTER_BOTTLENECK, "post_bottleneck"}:
+        return AFTER_BOTTLENECK
+    parts = [part for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise ValueError("history block_indices must not be empty")
+    selected = [int(part) for part in parts]
+    if len(set(selected)) != len(selected):
+        raise ValueError(f"history block_indices contain duplicates: {selected}")
+    return tuple(selected)
+
+
+def resolve_history_block_indices(
+    root,
+    block_indices=None,
+    geometry=False,
+    allow_pre_bottleneck=False,
+):
+    """Resolve fusion indices. Geometry defaults to the finest 640-d decoder block."""
+    candidates, stages = fusion_block_stages(root)
+    if not candidates:
+        raise RuntimeError("no ray_posterior fusion blocks found")
+    spec = block_indices
+    if spec is None:
+        spec = AFTER_BOTTLENECK if geometry else list(range(len(candidates)))
+    if spec == AFTER_BOTTLENECK:
+        decoder_ids = [index for index, stage in enumerate(stages) if stage == "decoder"]
+        if not decoder_ids:
+            raise ValueError(
+                "after_bottleneck history requires decoder ray-posterior fusion blocks"
+            )
+        dim640 = [
+            index
+            for index in decoder_ids
+            if int(candidates[index].ray_posterior_fusion.dim) == 640
+        ]
+        selected = [dim640[-1] if dim640 else decoder_ids[-1]]
+        return candidates, selected, stages, AFTER_BOTTLENECK
+    selected = [int(index) for index in spec]
+    if not selected:
+        raise ValueError("history block_indices must not be empty")
+    if len(set(selected)) != len(selected):
+        raise ValueError(f"history block_indices contain duplicates: {selected}")
+    bad = [index for index in selected if index < 0 or index >= len(candidates)]
+    if bad:
+        raise ValueError(
+            f"history block_indices out of range: {bad}; available 0..{len(candidates) - 1}"
+        )
+    if geometry and not allow_pre_bottleneck:
+        pre = [index for index in selected if stages[index] in {"encoder", "middle"}]
+        if pre:
+            raise ValueError(
+                "geometry history refuses pre-bottleneck fusion blocks "
+                f"{pre} (stages {[stages[index] for index in pre]}). These inject "
+                "before the bottleneck depth head. Use after_bottleneck, or pass "
+                "allow_pre_bottleneck=True only for the 2,12 control."
+            )
+    return candidates, selected, stages, tuple(selected)
+
+
 def enable_history_attention(
     model,
     heads=None,
@@ -43,10 +159,13 @@ def enable_history_attention(
     history_dim=None,
     geometry=False,
     block_indices=None,
+    allow_pre_bottleneck=False,
 ):
-    """Inject condition-aware history attention into every ray-posterior fusion
-    block. Deliberately does NOT touch the v1 temporal gate or the route-C
-    satellite attention (P3-02): those stay disabled/uninitialised.
+    """Inject condition-aware history attention into selected fusion blocks.
+
+    Deliberately does NOT touch the v1 temporal gate or the route-C satellite
+    attention (P3-02). Geometry history defaults to after-bottleneck decoder
+    fusion so the shared encoder is not a depth-feature channel.
 
     Returns (hub, encoder, blocks). Trainable params: encoder (incl. null
     token) + per-block attention; freezing the backbone is the caller's job.
@@ -68,28 +187,12 @@ def enable_history_attention(
         heads = 8 if heads is None else heads
         dim_head = 64 if dim_head is None else dim_head
     encoder = HistoryLatentEncoder(hidden=64 if geometry else 256, out_dim=history_dim)
-    candidates = []
-    for module in model.modules():
-        if (
-            getattr(module, "ray_fusion_mode", None) == "ray_posterior"
-            and getattr(module, "ray_posterior_fusion", None) is not None
-        ):
-            candidates.append(module)
-    if not candidates:
-        raise RuntimeError("no ray_posterior fusion blocks found")
-    if block_indices is None:
-        selected_indices = list(range(len(candidates)))
-    else:
-        selected_indices = [int(i) for i in block_indices]
-        if not selected_indices:
-            raise ValueError("history block_indices must not be empty")
-        if len(set(selected_indices)) != len(selected_indices):
-            raise ValueError(f"history block_indices contain duplicates: {selected_indices}")
-        bad = [i for i in selected_indices if i < 0 or i >= len(candidates)]
-        if bad:
-            raise ValueError(
-                f"history block_indices out of range: {bad}; available 0..{len(candidates) - 1}"
-            )
+    candidates, selected_indices, stages, _spec = resolve_history_block_indices(
+        model,
+        block_indices=block_indices,
+        geometry=geometry,
+        allow_pre_bottleneck=allow_pre_bottleneck,
+    )
 
     blocks = []
     for history_index, module_index in enumerate(selected_indices):
@@ -118,6 +221,7 @@ def enable_history_attention(
         module.temporal_hub = hub
         module.history_attn_index = history_index
         module.history_block_index = module_index
+        module.history_block_stage = stages[module_index]
         blocks.append(module)
     return hub, encoder, blocks
 

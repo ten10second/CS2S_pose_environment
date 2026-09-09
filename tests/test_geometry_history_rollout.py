@@ -38,6 +38,7 @@ class _Encoder(torch.nn.Module):
 class TestArgumentHelpers(unittest.TestCase):
     def test_block_indices_are_required_and_ordered(self):
         self.assertEqual(gh.parse_block_indices("2,5,9"), (2, 5, 9))
+        self.assertEqual(gh.parse_block_indices("after_bottleneck"), "after_bottleneck")
         with self.assertRaises(ValueError):
             gh.parse_block_indices("")
         with self.assertRaises(ValueError):

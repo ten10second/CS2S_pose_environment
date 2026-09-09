@@ -2,6 +2,8 @@
 
 The frozen CFG backbone and old temporal experiments are not modified. Each
 rank uses one frame pair; only encoder/selected history attention are trained.
+Geometry injection defaults to after-bottleneck decoder fusion so the history
+residual is not a depth-feature channel.
 """
 import argparse
 from contextlib import contextmanager
@@ -33,7 +35,12 @@ from generate_kitti_raea_samples import load_checkpoint_into_model
 from train_kitti_temporal import build_stream_plan, move_batch_to_device
 from train_kitti_temporal_v2 import grad_l2
 from train_kitti_raea import synchronized_loss_finite
-from temporal_history import enable_history_attention, history_trainable_parameters
+from temporal_history import (
+    AFTER_BOTTLENECK,
+    enable_history_attention,
+    history_trainable_parameters,
+    parse_history_block_indices,
+)
 from temporal_history_geometry import build_pair_geometry
 
 MODE = "geometry_history_v1"
@@ -182,7 +189,8 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--history-dim", type=int, default=64)
-    parser.add_argument("--block-indices", default="2,12")
+    parser.add_argument("--block-indices", default=AFTER_BOTTLENECK)
+    parser.add_argument("--allow-pre-bottleneck-history", action="store_true")
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260908)
     parser.add_argument("--probe-every", type=int, default=100)
@@ -198,7 +206,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    indices = tuple(int(x) for x in args.block_indices.split(","))
+    index_spec = parse_history_block_indices(args.block_indices)
     timesteps = [int(x) for x in args.timesteps.split(",")]
     if not 0 <= args.history_dropout < 1 or args.steps < 1:
         raise ValueError("invalid dropout or step budget")
@@ -230,8 +238,11 @@ def main():
                         pin_memory=True, persistent_workers=args.num_workers > 0)
     model = instantiate_from_config(cfg.model).cuda().eval()
     load_checkpoint_into_model(model, args.ckpt)
-    hub, encoder, blocks = enable_history_attention(model, geometry=True, block_indices=indices,
-                                                    history_dim=args.history_dim, heads=4, dim_head=32)
+    hub, encoder, blocks = enable_history_attention(
+        model, geometry=True, block_indices=index_spec,
+        allow_pre_bottleneck=args.allow_pre_bottleneck_history,
+        history_dim=args.history_dim, heads=4, dim_head=32)
+    indices = tuple(block.history_block_index for block in blocks)
     model.cuda().eval()
     encoder.cuda().train()
     for param in model.parameters():
@@ -251,6 +262,8 @@ def main():
         payload = torch.load(args.resume, map_location="cpu")
         if (payload.get("mode") != MODE or Path(payload["base_ckpt"]).resolve() != Path(args.ckpt).resolve()
                 or payload["args"]["block_indices"] != args.block_indices
+                or bool(payload["args"].get("allow_pre_bottleneck_history")) != bool(args.allow_pre_bottleneck_history)
+                or list(payload.get("block_indices", [])) != list(indices)
                 or payload["args"]["history_dim"] != args.history_dim):
             raise ValueError("resume architecture/base checkpoint mismatch")
         if set(payload["history_attn"]) != {str(i) for i in range(len(blocks))}:
@@ -277,14 +290,22 @@ def main():
         probe_items.append((split, item, latent))
     metadata = {"mode": MODE, "args": vars(args), "world_size": world,
                 "start_step": start,
-                "block_indices": list(indices), "history_dim": args.history_dim,
+                "block_indices": list(indices),
+                "history_placement": AFTER_BOTTLENECK if index_spec == AFTER_BOTTLENECK else "explicit",
+                "history_dim": args.history_dim,
                 "train_pairs": len(train), "val_pairs": len(val), "val_drives": held,
                 "base_ckpt": str(Path(args.ckpt).resolve()),
                 "base_ckpt_bytes": Path(args.ckpt).stat().st_size,
                 "manifest_sha256": hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest(),
                 "trainable_parameters": sum(p.numel() for p in trainable),
-                "selected_blocks": [{"index": i, "dim": b.ray_posterior_fusion.dim}
-                                    for i, b in zip(indices, blocks)]}
+                "selected_blocks": [
+                    {
+                        "index": block.history_block_index,
+                        "dim": block.ray_posterior_fusion.dim,
+                        "stage": getattr(block, "history_block_stage", "unknown"),
+                    }
+                    for block in blocks
+                ]}
     if rank == 0:
         (out / "run.json").write_text(json.dumps(metadata, indent=2))
         print(json.dumps(metadata), flush=True)
