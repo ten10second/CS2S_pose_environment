@@ -34,6 +34,13 @@ HISTORY_MODES = {
     "geometry_history_v1_transport",
     "geometry_history_v1_generator",
 }
+
+
+def archive_history_mode(payload):
+    mode = payload.get("mode")
+    if mode not in HISTORY_MODES:
+        raise ValueError(f"unexpected history checkpoint mode: {mode!r}")
+    return mode
 DEFAULT_GRID = (16, 64)
 
 
@@ -589,7 +596,7 @@ def main():
     summary = {
         "out_dir": str(out_dir),
         "num_samples": len(records),
-        "mode": HISTORY_MODE,
+        "mode": archive_history_mode(hist_payload),
         "seed": args.seed,
         "cfg_batch_factor": batch_factor,
         "uncond_cfg": args.uncond_cfg,

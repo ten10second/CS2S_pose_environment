@@ -166,6 +166,18 @@ class TestStrictCheckpoint(unittest.TestCase):
             "history_dim": 64,
         }
 
+    def test_archive_mode_follows_checkpoint_not_constant(self):
+        self.assertEqual(
+            gh.archive_history_mode({"mode": "geometry_history_v1_generator"}),
+            "geometry_history_v1_generator",
+        )
+        self.assertEqual(
+            gh.archive_history_mode({"mode": gh.HISTORY_MODE}),
+            gh.HISTORY_MODE,
+        )
+        with self.assertRaises(ValueError):
+            gh.archive_history_mode({"mode": "temporal_v2_history_phaseA"})
+
     def test_matching_payload_loads(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "hist.pt"
