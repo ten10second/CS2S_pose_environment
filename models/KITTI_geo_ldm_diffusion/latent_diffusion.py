@@ -13,6 +13,56 @@ from inspect import isfunction
 
 from utils.util import instantiate_from_config
 import torch.nn.functional as F
+
+
+LIDAR_DEPTH_RESAMPLE_MODES = {"legacy_nearest", "masked_area"}
+
+
+def _as_nchw_depth_tensor(tensor):
+    if tensor is None:
+        return None
+    if tensor.ndim == 3:
+        tensor = tensor[:, None]
+    if tensor.ndim != 4:
+        raise ValueError(f"Expected a 3D or 4D depth tensor, got shape {tuple(tensor.shape)}")
+    return tensor
+
+
+def resize_masked_lidar_depth(depth, mask, size, mode="masked_area"):
+    """Resize normalized LiDAR depth while keeping depth and hit support paired.
+
+    legacy_nearest reproduces the old behavior: nearest-neighbor depth target
+    resizing, with the mask prepared separately by the caller.
+
+    masked_area computes area_pool(depth * hit) / area_pool(hit) at the target
+    size. Its returned mask is the same hit support used for the target; empty
+    cells get zero mask and are excluded from the depth loss.
+    """
+    mode = str(mode or "masked_area")
+    if mode not in LIDAR_DEPTH_RESAMPLE_MODES:
+        raise ValueError(
+            "lidar_depth_resample_mode must be one of "
+            f"{sorted(LIDAR_DEPTH_RESAMPLE_MODES)}, got {mode!r}"
+        )
+    depth = _as_nchw_depth_tensor(depth).float()
+    mask = _as_nchw_depth_tensor(mask).float().clamp(0.0, 1.0)
+    if mode == "legacy_nearest":
+        resized_depth = depth
+        if depth.shape[-2:] != tuple(size):
+            resized_depth = F.interpolate(depth, size=size, mode="nearest")
+        return resized_depth.clamp(0.0, 1.0), None
+
+    weighted_depth = depth.clamp(0.0, 1.0) * mask
+    if depth.shape[-2:] == tuple(size):
+        hit_avg = mask
+        depth_avg = weighted_depth
+    else:
+        hit_avg = F.interpolate(mask, size=size, mode="area")
+        depth_avg = F.interpolate(weighted_depth, size=size, mode="area")
+    target = depth_avg / hit_avg.clamp_min(1e-6)
+    return (target * (hit_avg > 0.0).to(target.dtype)).clamp(0.0, 1.0), hit_avg
+
+
 def default(val, d):
     if val is not None:
         return val
@@ -131,9 +181,9 @@ class DDPM(pl.LightningModule):
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
 
-    def t_losses(self, x_start, cond_init_grd=None, cond_sat=None, cond_txt = None, lidar_context=None, lidar_evidence=None, noise=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, range_img=None, range_mask=None, camera_to_lidar=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, foreground_loss_mask=None, foreground_loss_weight=0.0, foreground_x0_loss_weight=0.0, foreground_image_loss_weight=0.0, foreground_lpips_loss_weight=0.0, foreground_image_loss_mask=None, foreground_lpips_padding=8, foreground_lpips_size=96, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0, static_teacher_loss_mask=None, static_teacher_consistency_weight=0.0, lidar_depth_target=None, lidar_depth_mask=None, lidar_depth_loss_weight=0.0, lidar_depth_output_scale=1.0, lidar_depth_bottleneck_scale=1.0, lidar_depth_log_eps=1e-3, return_outputs=False):
+    def t_losses(self, x_start, cond_init_grd=None, cond_sat=None, cond_txt = None, lidar_context=None, lidar_evidence=None, noise=None, left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, range_img=None, range_mask=None, camera_to_lidar=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, foreground_loss_mask=None, foreground_loss_weight=0.0, foreground_x0_loss_weight=0.0, foreground_image_loss_weight=0.0, foreground_lpips_loss_weight=0.0, foreground_image_loss_mask=None, foreground_lpips_padding=8, foreground_lpips_size=96, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0, static_teacher_loss_mask=None, static_teacher_consistency_weight=0.0, lidar_depth_target=None, lidar_depth_mask=None, lidar_depth_resample_mode="masked_area", lidar_depth_loss_weight=0.0, lidar_depth_output_scale=1.0, lidar_depth_bottleneck_scale=1.0, lidar_depth_log_eps=1e-3, return_outputs=False):
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],), device=x_start.device).long()
-        return self.p_losses(x_start, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat, cond_txt = cond_txt, lidar_context=lidar_context, lidar_evidence=lidar_evidence,  left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar, loss_mask=loss_mask, loss_mask_weight=loss_mask_weight, x0_loss_weight=x0_loss_weight, extra_loss_mask=extra_loss_mask, extra_loss_mask_weight=extra_loss_mask_weight, extra_x0_loss_weight=extra_x0_loss_weight, foreground_loss_mask=foreground_loss_mask, foreground_loss_weight=foreground_loss_weight, foreground_x0_loss_weight=foreground_x0_loss_weight, foreground_image_loss_weight=foreground_image_loss_weight, foreground_lpips_loss_weight=foreground_lpips_loss_weight, foreground_image_loss_mask=foreground_image_loss_mask, foreground_lpips_padding=foreground_lpips_padding, foreground_lpips_size=foreground_lpips_size, image_x0_loss_weight=image_x0_loss_weight, crop_image_x0_loss_weight=crop_image_x0_loss_weight, point_image_x0_loss_weight=point_image_x0_loss_weight, object_lpips_loss_weight=object_lpips_loss_weight, x0_image_target=x0_image_target, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=object_lpips_model, object_lpips_padding=object_lpips_padding, object_lpips_size=object_lpips_size, object_lpips_max_boxes=object_lpips_max_boxes, image_decoder=image_decoder, latent_scale_factor=latent_scale_factor, static_teacher_loss_mask=static_teacher_loss_mask, static_teacher_consistency_weight=static_teacher_consistency_weight, lidar_depth_target=lidar_depth_target, lidar_depth_mask=lidar_depth_mask, lidar_depth_loss_weight=lidar_depth_loss_weight, lidar_depth_output_scale=lidar_depth_output_scale, lidar_depth_bottleneck_scale=lidar_depth_bottleneck_scale, lidar_depth_log_eps=lidar_depth_log_eps, return_outputs=return_outputs)
+        return self.p_losses(x_start, t, cond_init_grd = cond_init_grd, cond_sat = cond_sat, cond_txt = cond_txt, lidar_context=lidar_context, lidar_evidence=lidar_evidence,  left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, range_img=range_img, range_mask=range_mask, camera_to_lidar=camera_to_lidar, loss_mask=loss_mask, loss_mask_weight=loss_mask_weight, x0_loss_weight=x0_loss_weight, extra_loss_mask=extra_loss_mask, extra_loss_mask_weight=extra_loss_mask_weight, extra_x0_loss_weight=extra_x0_loss_weight, foreground_loss_mask=foreground_loss_mask, foreground_loss_weight=foreground_loss_weight, foreground_x0_loss_weight=foreground_x0_loss_weight, foreground_image_loss_weight=foreground_image_loss_weight, foreground_lpips_loss_weight=foreground_lpips_loss_weight, foreground_image_loss_mask=foreground_image_loss_mask, foreground_lpips_padding=foreground_lpips_padding, foreground_lpips_size=foreground_lpips_size, image_x0_loss_weight=image_x0_loss_weight, crop_image_x0_loss_weight=crop_image_x0_loss_weight, point_image_x0_loss_weight=point_image_x0_loss_weight, object_lpips_loss_weight=object_lpips_loss_weight, x0_image_target=x0_image_target, image_loss_mask=image_loss_mask, crop_image_loss_mask=crop_image_loss_mask, point_image_loss_mask=point_image_loss_mask, object_boxes=object_boxes, object_box_valid=object_box_valid, object_lpips_model=object_lpips_model, object_lpips_padding=object_lpips_padding, object_lpips_size=object_lpips_size, object_lpips_max_boxes=object_lpips_max_boxes, image_decoder=image_decoder, latent_scale_factor=latent_scale_factor, static_teacher_loss_mask=static_teacher_loss_mask, static_teacher_consistency_weight=static_teacher_consistency_weight, lidar_depth_target=lidar_depth_target, lidar_depth_mask=lidar_depth_mask, lidar_depth_resample_mode=lidar_depth_resample_mode, lidar_depth_loss_weight=lidar_depth_loss_weight, lidar_depth_output_scale=lidar_depth_output_scale, lidar_depth_bottleneck_scale=lidar_depth_bottleneck_scale, lidar_depth_log_eps=lidar_depth_log_eps, return_outputs=return_outputs)
 
     def _prepare_loss_mask(self, loss_mask, loss_raw):
         if loss_mask is None:
@@ -213,7 +263,7 @@ class DDPM(pl.LightningModule):
             return pred_image.new_tensor(0.0)
         return torch.stack(losses).mean()
 
-    def p_losses(self, x_start, t, cond_init_grd = None, cond_sat = None, cond_txt = None, lidar_context=None, lidar_evidence=None, noise=None,  left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, range_img=None, range_mask=None, camera_to_lidar=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, foreground_loss_mask=None, foreground_loss_weight=0.0, foreground_x0_loss_weight=0.0, foreground_image_loss_weight=0.0, foreground_lpips_loss_weight=0.0, foreground_image_loss_mask=None, foreground_lpips_padding=8, foreground_lpips_size=96, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0, static_teacher_loss_mask=None, static_teacher_consistency_weight=0.0, lidar_depth_target=None, lidar_depth_mask=None, lidar_depth_loss_weight=0.0, lidar_depth_output_scale=1.0, lidar_depth_bottleneck_scale=1.0, lidar_depth_log_eps=1e-3, return_outputs=False):
+    def p_losses(self, x_start, t, cond_init_grd = None, cond_sat = None, cond_txt = None, lidar_context=None, lidar_evidence=None, noise=None,  left_camera_k=None, gt_shift_x=None, gt_shift_y=None, theta=None, range_img=None, range_mask=None, camera_to_lidar=None, loss_mask=None, loss_mask_weight=0.0, x0_loss_weight=0.0, extra_loss_mask=None, extra_loss_mask_weight=0.0, extra_x0_loss_weight=0.0, foreground_loss_mask=None, foreground_loss_weight=0.0, foreground_x0_loss_weight=0.0, foreground_image_loss_weight=0.0, foreground_lpips_loss_weight=0.0, foreground_image_loss_mask=None, foreground_lpips_padding=8, foreground_lpips_size=96, image_x0_loss_weight=0.0, crop_image_x0_loss_weight=0.0, point_image_x0_loss_weight=0.0, object_lpips_loss_weight=0.0, x0_image_target=None, image_loss_mask=None, crop_image_loss_mask=None, point_image_loss_mask=None, object_boxes=None, object_box_valid=None, object_lpips_model=None, object_lpips_padding=4, object_lpips_size=64, object_lpips_max_boxes=4, image_decoder=None, latent_scale_factor=1.0, static_teacher_loss_mask=None, static_teacher_consistency_weight=0.0, lidar_depth_target=None, lidar_depth_mask=None, lidar_depth_resample_mode="masked_area", lidar_depth_loss_weight=0.0, lidar_depth_output_scale=1.0, lidar_depth_bottleneck_scale=1.0, lidar_depth_log_eps=1e-3, return_outputs=False):
         loss_metrics = {}
 
         def record_loss(name, value):
@@ -339,13 +389,17 @@ class DDPM(pl.LightningModule):
             record_loss("loss_foreground_x0_contrib", float(foreground_x0_loss_weight) * foreground_x0_loss)
         def add_lidar_depth_loss(depth_pred, prefix, weight_scale=1.0):
             depth_pred = depth_pred.float().clamp(1e-6, 1.0)
-            depth_target = lidar_depth_target.float()
-            if depth_target.ndim == 3:
-                depth_target = depth_target[:, None]
-            if depth_target.shape[-2:] != depth_pred.shape[-2:]:
-                depth_target = F.interpolate(depth_target, size=depth_pred.shape[-2:], mode="nearest")
+            depth_target, target_support = resize_masked_lidar_depth(
+                lidar_depth_target,
+                lidar_depth_mask,
+                depth_pred.shape[-2:],
+                mode=lidar_depth_resample_mode,
+            )
             depth_target = depth_target.to(device=depth_pred.device, dtype=depth_pred.dtype).clamp(1e-6, 1.0)
             depth_mask = self._prepare_loss_mask(lidar_depth_mask, depth_pred)
+            if target_support is not None:
+                target_support = target_support.to(device=depth_pred.device, dtype=depth_pred.dtype)
+                depth_mask = depth_mask * (target_support > 0.0).to(depth_mask.dtype)
             eps = max(float(lidar_depth_log_eps), 1e-6)
             depth_loss_raw = (
                 torch.log(depth_pred.clamp_min(eps)) - torch.log(depth_target.clamp_min(eps))
@@ -361,12 +415,14 @@ class DDPM(pl.LightningModule):
             coverage_name = f"lidar_{prefix}_depth_mask_coverage" if prefix else "lidar_depth_mask_coverage"
             pred_mean_name = f"lidar_{prefix}_depth_pred_mean" if prefix else "lidar_depth_pred_mean"
             target_mean_name = f"lidar_{prefix}_depth_target_mean" if prefix else "lidar_depth_target_mean"
+            mode_name = f"lidar_{prefix}_depth_resample_mode" if prefix else "lidar_depth_resample_mode"
             depth_weight = float(lidar_depth_loss_weight) * float(weight_scale)
             record_loss(loss_name, lidar_depth_loss)
             record_loss(contrib_name, depth_weight * lidar_depth_loss)
             record_loss(coverage_name, depth_mask.mean())
             record_loss(pred_mean_name, (depth_pred * depth_mask).sum() / denom)
             record_loss(target_mean_name, (depth_target * depth_mask).sum() / denom)
+            record_loss(mode_name, 1.0 if str(lidar_depth_resample_mode or "masked_area") == "masked_area" else 0.0)
             return depth_weight * lidar_depth_loss
 
         if (

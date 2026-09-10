@@ -76,6 +76,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                 lidar_depth_output_scale=1.0,
                 lidar_depth_bottleneck_scale=1.0,
                 lidar_depth_log_eps=1e-3,
+                lidar_depth_resample_mode="masked_area",
                 lidar_semantic_alignment_weight=0.0,
                 lidar_semantic_alignment_key="image_semantic_feat",
                 lidar_semantic_alignment_mask_mode="all",
@@ -155,6 +156,12 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.lidar_depth_output_scale = float(lidar_depth_output_scale)
         self.lidar_depth_bottleneck_scale = float(lidar_depth_bottleneck_scale)
         self.lidar_depth_log_eps = float(lidar_depth_log_eps)
+        self.lidar_depth_resample_mode = str(lidar_depth_resample_mode or "masked_area")
+        if self.lidar_depth_resample_mode not in {"legacy_nearest", "masked_area"}:
+            raise ValueError(
+                "lidar_depth_resample_mode must be either "
+                f"'legacy_nearest' or 'masked_area', got {self.lidar_depth_resample_mode!r}"
+            )
         self.lidar_semantic_alignment_weight = float(lidar_semantic_alignment_weight)
         self.lidar_semantic_alignment_key = str(lidar_semantic_alignment_key or "image_semantic_feat")
         self.lidar_semantic_alignment_mask_mode = str(lidar_semantic_alignment_mask_mode or "all")
@@ -1283,6 +1290,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             "lidar_depth_output_scale": self.lidar_depth_output_scale,
             "lidar_depth_bottleneck_scale": self.lidar_depth_bottleneck_scale,
             "lidar_depth_log_eps": self.lidar_depth_log_eps,
+            "lidar_depth_resample_mode": self.lidar_depth_resample_mode,
         }
         self.last_lidar_counterfactual_metrics = {}
         if (
