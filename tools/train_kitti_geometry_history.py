@@ -5,6 +5,8 @@ rank uses one frame pair; only encoder/selected history attention are trained.
 Geometry injection defaults to after-bottleneck decoder fusion so the history
 residual is not a depth-feature channel. Appearance is transported by a
 non-zero bilinear skip at projected cells; invalid cells stay exact zero.
+Generator mode additionally reads previous RGB latent as temporal K/V, unfreezes
+the host feed-forward tail, and adds a masked x0 appearance loss.
 """
 import argparse
 from contextlib import contextmanager
@@ -39,12 +41,14 @@ from train_kitti_raea import synchronized_loss_finite
 from temporal_history import (
     AFTER_BOTTLENECK,
     enable_history_attention,
+    history_host_state_dict,
     history_trainable_parameters,
+    load_history_host_state_dict,
     parse_history_block_indices,
 )
 from temporal_history_geometry import build_pair_geometry
 
-MODE = "geometry_history_v1_transport"
+MODE_GENERATOR = "geometry_history_v1_generator"
 
 
 def split_drive_pairs(rows, val_drives=None):
@@ -84,9 +88,10 @@ class GeometryPairs(Dataset):
 
 
 class GeometryTrainingStep(torch.nn.Module):
-    def __init__(self, model, encoder, hub):
+    def __init__(self, model, encoder, hub, appearance_x0_weight=0.0):
         super().__init__()
         self.model, self.history_encoder, self.hub = model, encoder, hub
+        self.appearance_x0_weight = float(appearance_x0_weight)
 
     def forward(self, batch, latent, geometry, has_history=True, drop_satellite=False):
         # Full encoder path even when history is absent: no DDP-unused params.
@@ -105,10 +110,20 @@ class GeometryTrainingStep(torch.nn.Module):
         self.model.apply_satellite_condition_dropout = (
             lambda cond: torch.zeros_like(cond) if drop_satellite else cond
         )
+        valid = geometry["history_valid"].float()
+        if valid.dim() == 3:
+            valid = valid[:, None]
+        ddpm = self.model.DDPM
+        previous_appearance = getattr(ddpm, "_history_appearance_x0", None)
+        if self.appearance_x0_weight > 0:
+            ddpm._history_appearance_x0 = (valid, self.appearance_x0_weight)
+        else:
+            ddpm._history_appearance_x0 = None
         try:
             return self.model.training_step(batch, 0)
         finally:
             self.model.apply_satellite_condition_dropout = original
+            ddpm._history_appearance_x0 = previous_appearance
             self.hub.clear()
 
 
@@ -191,7 +206,10 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--history-dim", type=int, default=64)
     parser.add_argument("--block-indices", default=AFTER_BOTTLENECK)
-    parser.add_argument("--allow-pre-bottleneck-history", action="store_true")
+    parser.add_argument("--unfreeze-host", action="store_true",
+                        help="Train the feed-forward tail of injected decoder blocks")
+    parser.add_argument("--appearance-x0-weight", type=float, default=0.0,
+                        help="Masked x0 appearance loss on correspondence cells")
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260908)
     parser.add_argument("--probe-every", type=int, default=100)
@@ -207,6 +225,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    MODE = MODE_GENERATOR
     index_spec = parse_history_block_indices(args.block_indices)
     timesteps = [int(x) for x in args.timesteps.split(",")]
     if not 0 <= args.history_dropout < 1 or args.steps < 1:
@@ -241,19 +260,25 @@ def main():
     load_checkpoint_into_model(model, args.ckpt)
     hub, encoder, blocks = enable_history_attention(
         model, geometry=True, block_indices=index_spec,
-        allow_pre_bottleneck=args.allow_pre_bottleneck_history,
         history_dim=args.history_dim, heads=4, dim_head=32)
     indices = tuple(block.history_block_index for block in blocks)
     model.cuda().eval()
     encoder.cuda().train()
     for param in model.parameters():
         param.requires_grad_(False)
-    trainable = history_trainable_parameters(encoder, blocks)
+    trainable = history_trainable_parameters(encoder, blocks, unfreeze_host=args.unfreeze_host)
     for param in trainable:
         param.requires_grad_(True)
     for block in blocks:
         block.history_attn.train()
-    module = GeometryTrainingStep(model, encoder, hub)
+        if args.unfreeze_host:
+            if hasattr(block, "ff"):
+                block.ff.train()
+            if hasattr(block, "norm3"):
+                block.norm3.train()
+    module = GeometryTrainingStep(
+        model, encoder, hub, appearance_x0_weight=args.appearance_x0_weight
+    )
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=.01)
     # A 65536 initial scale can overflow upstream frozen-UNet derivatives even
     # on a zero-output/no-history branch (inf * 0 becomes NaN). Start modestly.
@@ -263,9 +288,9 @@ def main():
         payload = torch.load(args.resume, map_location="cpu")
         if (payload.get("mode") != MODE or Path(payload["base_ckpt"]).resolve() != Path(args.ckpt).resolve()
                 or payload["args"]["block_indices"] != args.block_indices
-                or bool(payload["args"].get("allow_pre_bottleneck_history")) != bool(args.allow_pre_bottleneck_history)
                 or list(payload.get("block_indices", [])) != list(indices)
-                or payload["args"]["history_dim"] != args.history_dim):
+                or payload["args"]["history_dim"] != args.history_dim
+                or bool(payload["args"].get("unfreeze_host")) != bool(args.unfreeze_host)):
             raise ValueError("resume architecture/base checkpoint mismatch")
         if set(payload["history_attn"]) != {str(i) for i in range(len(blocks))}:
             raise ValueError("resume attention module set mismatch")
@@ -274,6 +299,8 @@ def main():
         encoder.load_state_dict(payload["history_encoder"], strict=True)
         for i, block in enumerate(blocks):
             block.history_attn.load_state_dict(payload["history_attn"][str(i)], strict=True)
+        if args.unfreeze_host:
+            load_history_host_state_dict(blocks, payload.get("history_host"))
         optimizer.load_state_dict(payload["optimizer"])
         scaler.load_state_dict(payload["scaler"])
         start = int(payload["step"])
@@ -292,7 +319,8 @@ def main():
     metadata = {"mode": MODE, "args": vars(args), "world_size": world,
                 "start_step": start,
                 "block_indices": list(indices),
-                "appearance_skip": True,
+                "appearance_memory": True,
+                "unfreeze_host": bool(args.unfreeze_host),
                 "history_placement": AFTER_BOTTLENECK if index_spec == AFTER_BOTTLENECK else "explicit",
                 "history_dim": args.history_dim,
                 "train_pairs": len(train), "val_pairs": len(val), "val_drives": held,
@@ -324,7 +352,7 @@ def main():
             for result in results:
                 if not np.isfinite(result["loss_total"]):
                     raise FloatingPointError("non-finite fixed probe")
-                if result["condition"] == "disabled":
+                if result["condition"] == "disabled" and not args.unfreeze_host:
                     key = (split, result["t"])
                     baseline = disabled_baselines.setdefault(key, result["loss_total"])
                     if result["loss_total"] != baseline:
@@ -379,8 +407,7 @@ def main():
             raise RuntimeError(f"unused trainable parameters: {missing}")
         gradients = {"encoder_grad_l2": grad_l2(encoder.parameters()),
                      "cond_query_grad_l2": grad_l2(p for b in blocks for p in b.history_attn.to_q_cond.parameters()),
-                     "out_grad_l2": grad_l2(p for b in blocks for p in b.history_attn.to_out.parameters()),
-                     "skip_grad_l2": grad_l2(p for b in blocks for p in list(b.history_attn.to_skip.parameters()) + [b.history_attn.skip_gain])}
+                     "out_grad_l2": grad_l2(p for b in blocks for p in b.history_attn.to_out.parameters())}
         finite = torch.stack([torch.isfinite(p.grad).all() for p in trainable]).all().int()
         finite *= int(all(np.isfinite(v) for v in gradients.values()))
         if world > 1:
@@ -398,8 +425,7 @@ def main():
                   "history": history, "satellite_dropped": drop_sat,
                   "valid_fraction": float(geom["history_valid"].float().mean()),
                   "history_ratio": [b.history_attn.last_ratio for b in blocks],
-                  "history_skip_ratio": [b.history_attn.last_skip_ratio for b in blocks],
-                  "skip_gain": [float(b.history_attn.skip_gain.detach()) for b in blocks],
+                  "history_memory_ratio": [b.history_attn.last_memory_ratio for b in blocks],
                   "data_wait_seconds": data_ready - step_start,
                   "compute_seconds": time.time() - data_ready,
                   "seconds": time.time() - tick}
@@ -413,6 +439,7 @@ def main():
             if rank == 0:
                 payload = {**metadata, "step": step, "history_encoder": encoder.state_dict(),
                            "history_attn": {str(i): b.history_attn.state_dict() for i, b in enumerate(blocks)},
+                           "history_host": history_host_state_dict(blocks) if args.unfreeze_host else {},
                            "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict()}
                 temporary = out / f"geometry_history_step_{step}.pt.tmp"
                 torch.save(payload, temporary)

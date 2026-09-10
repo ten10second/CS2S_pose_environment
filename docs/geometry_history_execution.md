@@ -219,18 +219,17 @@ Code change (do not resume 2,12 weights):
 
 - Geometry history defaults to `after_bottleneck`: the finest 640-d decoder
   fusion block, after `lidar_bottleneck_depth_head`.
-- Explicit encoder/middle indices raise unless
-  `--allow-pre-bottleneck-history` is set (2,12 control only).
-- Local 3x3 geometry attention, null token, and frozen backbone are unchanged.
+- Encoder/middle fusion indices are rejected.
+- Failed local 3x3 copy and bilinear skip paths were removed; history is now
+  previous-RGB-latent memory gated by correspondence.
 - New run directory: `stage_d_post_bottleneck`. Fresh adapter. Same 1000-step
   budget and the same eight fixed probes.
 - Expected diagnostic if placement is correct: bottleneck depth metrics are
   identical across disabled/correct/wrong history. Judge RGB `loss_eps_base`
   only. Do not announce temporal success from total loss.
 
-Launch: `tools/run_geometry_history_post_bottleneck.sh`. Do not start it while
-GPUs 0–3 CFG training or a previous geometry job is using 4–7. This run answers
-whether encoder-side depth coupling caused on>off; it is not itself a rollout.
+This run answered whether encoder-side depth coupling caused on>off. The
+launcher was removed after the result was archived.
 
 ## E: appearance transport through the correspondence gate
 
@@ -250,6 +249,30 @@ tokens at the projected cell, with a non-zero `to_skip` map. Invalid cells and
 - New run directory: `stage_e_appearance_transport`. Fresh adapter. Same
   1000-step budget and the same eight fixed probes.
 
-Launch: `tools/run_geometry_history_appearance_transport.sh`. This answers
-whether transporting appearance along the already-open gate can change pixels;
-it is not a claim that temporal consistency is solved.
+The bilinear skip did not produce generalizable appearance inheritance on the
+failure clip. That path was removed; do not resume Stage E weights.
+
+## F: generator participates in appearance memory
+
+GT-history probes and skip transport still failed to inherit appearance on the
+failure clip: correct geometry beat scrambled geometry, but correct history did
+not beat disabled history. Frozen single-frame denoising plus epsilon MSE does
+not train the generator to paint retrieved color.
+
+Stage F keeps current satellite and LiDAR as the geometric condition. History
+attention is previous-RGB-latent K/V memory, gated by correspondence. The
+feed-forward tail after history injection is unfrozen. This is still single-step
+training, not an unrolled sampler.
+
+The masked x0 term is `MSE(x_start, pred_x0)` on correspondence cells: current
+GT latent reconstruction, not a previous-frame color identity loss. Probes must
+use the same loss terms for every condition; compare `loss_eps_base` and the
+appearance x0 term separately, not a mix of "with x0" vs "without x0". Sampling
+must restore `history_host` (`ff`/`norm3`) whenever `unfreeze_host` is set.
+
+First acceptance gate: `--history-source gt` with full DDIM sampling, previous
+GT RGB as history every frame. Only if corresponding-surface color error beats
+disabled history should generated-history rollout be treated as a temporal test.
+
+Launch: `tools/run_geometry_history_generator.sh`. Do not resume Stage D/E
+weights. Scheduled sampling is not in this phase.

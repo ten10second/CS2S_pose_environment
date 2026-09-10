@@ -306,10 +306,14 @@ class DDPM(pl.LightningModule):
                 "loss_static_teacher_eps_contrib",
                 float(static_teacher_consistency_weight) * static_teacher_loss,
             )
+        appearance_x0 = getattr(self, "_history_appearance_x0", None)
+        appearance_x0_mask = appearance_x0[0] if appearance_x0 is not None else None
+        appearance_x0_weight = float(appearance_x0[1]) if appearance_x0 is not None else 0.0
         needs_pred_x0 = (
             (loss_mask is not None and x0_loss_weight > 0.0)
             or (extra_loss_mask is not None and extra_x0_loss_weight > 0.0)
             or (foreground_loss_mask is not None and foreground_x0_loss_weight > 0.0)
+            or (appearance_x0_mask is not None and appearance_x0_weight > 0.0)
             or (image_x0_loss_weight > 0.0 and x0_image_target is not None and image_loss_mask is not None and image_decoder is not None)
             or (crop_image_x0_loss_weight > 0.0 and x0_image_target is not None and crop_image_loss_mask is not None and image_decoder is not None)
             or (point_image_x0_loss_weight > 0.0 and x0_image_target is not None and point_image_loss_mask is not None and image_decoder is not None)
@@ -337,6 +341,12 @@ class DDPM(pl.LightningModule):
             loss = loss + float(foreground_x0_loss_weight) * foreground_x0_loss
             record_loss("loss_foreground_x0", foreground_x0_loss)
             record_loss("loss_foreground_x0_contrib", float(foreground_x0_loss_weight) * foreground_x0_loss)
+        if appearance_x0_mask is not None and appearance_x0_weight > 0.0 and pred_x0 is not None:
+            appearance_raw = F.mse_loss(x_start, pred_x0, reduction="none")
+            appearance_x0_loss = self._masked_loss_mean(appearance_raw, appearance_x0_mask)
+            loss = loss + appearance_x0_weight * appearance_x0_loss
+            record_loss("loss_history_appearance_x0", appearance_x0_loss)
+            record_loss("loss_history_appearance_x0_contrib", appearance_x0_weight * appearance_x0_loss)
         def add_lidar_depth_loss(depth_pred, prefix, weight_scale=1.0):
             depth_pred = depth_pred.float().clamp(1e-6, 1.0)
             depth_target = lidar_depth_target.float()

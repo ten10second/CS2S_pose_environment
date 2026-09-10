@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Appearance transport along the Stage D correspondence gate.
-# Does not resume 2,12 or Stage D checkpoints. Fresh adapter. GPUs 4-7 only.
+# Generator-participating appearance memory. Fresh adapter. GPUs 4-7 only.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 experiment_root=/mnt/shizhm/DATA/KITTI/CS2S_results/geometry_history_20260908
 experiment_python=/home/shizhm/miniconda3/envs/ControlS2S/bin/python
-out_dir="$experiment_root/stage_e_appearance_transport"
+out_dir="$experiment_root/stage_f_generator"
 
 exec 9>"$experiment_root/pilot.lock"
 flock -n 9
@@ -21,7 +20,7 @@ for key in ('pilot_gate_valid_coverage_pass', 'pilot_gate_non_ground_proxy_all_p
     if geometry.get(key) is not True:
         raise RuntimeError('Stage A gate failed: ' + key)
 if out.exists():
-    raise FileExistsError('appearance-transport output already exists; inspect it before resubmitting')
+    raise FileExistsError('generator output already exists; inspect it before resubmitting')
 output = subprocess.check_output(['nvidia-smi', '--query-gpu=index,memory.used',
                                   '--format=csv,noheader,nounits'], text=True)
 usage = dict(tuple(map(int, line.split(','))) for line in output.strip().splitlines())
@@ -41,4 +40,5 @@ exec env CUDA_VISIBLE_DEVICES=4,5,6,7 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 M
     --lidar-ray-feature-cache-root /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/utonia_ray_depth_all_fp16 \
     --image-semantic-cache-root /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/dino_vits14_8x32_all_fp16 \
     --block-indices after_bottleneck \
+    --unfreeze-host --appearance-x0-weight 1.0 \
     --steps 1000 --probe-every 100 --save-every 100 --log-every 20

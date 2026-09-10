@@ -29,6 +29,11 @@ for p in (str(TOOLS_DIR), str(REPO_ROOT)):
 
 
 HISTORY_MODE = "geometry_history_v1_transport"
+HISTORY_MODES = {
+    "geometry_history_v1",
+    "geometry_history_v1_transport",
+    "geometry_history_v1_generator",
+}
 DEFAULT_GRID = (16, 64)
 
 
@@ -84,7 +89,7 @@ def require_geometry_history_payload(payload, args, blocks):
     missing = sorted(required.difference(payload))
     if missing:
         raise KeyError(f"history checkpoint missing required keys: {missing}")
-    if payload["mode"] != HISTORY_MODE:
+    if payload["mode"] not in HISTORY_MODES:
         raise ValueError(f"unexpected history checkpoint mode: {payload['mode']!r}")
     if not same_base_checkpoint(payload["base_ckpt"], args.ckpt):
         raise ValueError(
@@ -109,11 +114,15 @@ def require_geometry_history_payload(payload, args, blocks):
 
 
 def load_geometry_history_checkpoint(path, args, encoder, blocks, map_location="cpu"):
+    from temporal_history import load_history_host_state_dict
+
     payload = torch.load(path, map_location=map_location)
     require_geometry_history_payload(payload, args, blocks)
     encoder.load_state_dict(payload["history_encoder"], strict=True)
     for i, block in enumerate(blocks):
         block.history_attn.load_state_dict(payload["history_attn"][str(i)], strict=True)
+    if payload.get("unfreeze_host"):
+        load_history_host_state_dict(blocks, payload.get("history_host"))
     return payload
 
 
@@ -217,8 +226,15 @@ def build_geometry_history_payload(encoder, history_latent, geometry, has_histor
     return payload
 
 
-def next_history_latent_source(frame_offset, first_rgb):
-    return "first_rgb" if bool(first_rgb) and int(frame_offset) == 0 else "generated"
+def next_history_latent_source(frame_offset, first_rgb, history_source="generated"):
+    source = str(history_source or "generated")
+    if source not in {"generated", "gt"}:
+        raise ValueError(f"unsupported history_source: {history_source!r}")
+    if bool(first_rgb) and int(frame_offset) == 0:
+        return "first_rgb"
+    if source == "gt":
+        return "gt_rgb"
+    return "generated"
 
 
 def use_observed_initial_frame(frame_offset, first_rgb):
@@ -256,7 +272,7 @@ def encode_rgb_history_latent(model, target):
     return z * model.scale_factor
 
 
-def enable_geometry_history_attention(model, args):
+def enable_geometry_history_attention(model, args, payload=None):
     from temporal_history import AFTER_BOTTLENECK, enable_history_attention
 
     try:
@@ -264,7 +280,6 @@ def enable_geometry_history_attention(model, args):
             model,
             geometry=True,
             block_indices=args.block_indices,
-            allow_pre_bottleneck=args.block_indices != AFTER_BOTTLENECK,
             history_dim=args.history_dim,
             heads=args.heads,
             dim_head=args.dim_head,
@@ -308,6 +323,12 @@ def parse_args():
     )
     p.add_argument("--first-rgb", action="store_true",
                    help="bootstrap frame 1 from frame 0 RGB; later history is generated only")
+    p.add_argument(
+        "--history-source",
+        choices=("generated", "gt"),
+        default="generated",
+        help="generated: closed-loop latents; gt: encode each previous GT RGB as history",
+    )
     p.add_argument("--disable-history", action="store_true",
                    help="same loaded checkpoint, but bypass history for the paired baseline")
     p.add_argument("--require-contiguous", action="store_true",
@@ -384,7 +405,8 @@ def main():
 
     model = instantiate_from_config(cfg.model)
     load_checkpoint_into_model(model, args.ckpt)
-    hub, encoder, blocks = enable_geometry_history_attention(model, args)
+    hist_payload = torch.load(args.hist_ckpt, map_location="cpu")
+    hub, encoder, blocks = enable_geometry_history_attention(model, args, hist_payload)
     model = model.cuda().eval()
     encoder = encoder.cuda().eval()
 
@@ -416,7 +438,7 @@ def main():
                 null_all=attention.last_null_frac,
                 valid_neighbor_fraction=attention.last_valid_frac,
                 residual_to_condition=attention.last_ratio,
-                skip_to_condition=attention.last_skip_ratio,
+                memory_to_condition=attention.last_memory_ratio,
                 residual_to_x=numerator / max(denominator, 1e-6)))
         return observe
     hooks = [model.DDPM.denoise_model.register_forward_pre_hook(observe_denoiser)]
@@ -471,6 +493,7 @@ def main():
         step_trace.clear()
         denoiser_batches.clear()
         x_T_hash = None
+        source = next_history_latent_source(offset, args.first_rgb, args.history_source)
         if observed_initial:
             pred = pack["target"].detach()
             latent = None
@@ -492,14 +515,16 @@ def main():
                 uncond_cfg=args.uncond_cfg,
             )
             hub.clear()
-            prev_latent = latent.detach()
+            if source == "gt_rgb":
+                prev_latent = encode_rgb_history_latent(model, pack["target"]).detach()
+            else:
+                prev_latent = latent.detach()
             if not denoiser_batches or any(b != batch_factor for b in denoiser_batches):
                 raise RuntimeError('actual denoiser batch does not match requested CFG')
             if args.disable_history and step_trace:
                 raise RuntimeError('disabled baseline unexpectedly read history')
             if has_history and len(step_trace) != len(denoiser_batches) * len(blocks):
                 raise RuntimeError('history did not execute at every denoising step')
-        source = next_history_latent_source(offset, args.first_rgb)
         prev_row = row
         prev_frame_index = frame_index
 
@@ -576,6 +601,7 @@ def main():
         "heads": args.heads,
         "dim_head": args.dim_head,
         "first_rgb": bool(args.first_rgb),
+        "history_source": args.history_source,
         "history_disabled": bool(args.disable_history),
         "step_noise_sha256": step_noise_sha256,
         "future_rgb_condition_check_passed": future_rgb_condition_check_passed,

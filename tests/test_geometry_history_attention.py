@@ -38,22 +38,7 @@ class TestGeometryHistoryAttention(unittest.TestCase):
         self.grid = identity_grid()
         self.valid = torch.ones(1, 4, 4, dtype=torch.bool)
 
-    def test_zero_init_attention_is_inert_when_skip_is_disabled(self):
-        with torch.no_grad():
-            self.attn.skip_gain.zero_()
-        out = self.attn(
-            self.x,
-            self.cond,
-            self.tokens,
-            has_history=True,
-            history_grid=self.grid,
-            history_valid=self.valid,
-            query_hw=(4, 4),
-            history_hw=(4, 4),
-        )
-        self.assertEqual(float(out.abs().max()), 0.0)
-
-    def test_appearance_skip_is_nonzero_on_valid_cells_at_init(self):
+    def test_memory_is_nonzero_on_valid_cells_at_init(self):
         out = self.attn(
             self.x,
             self.cond,
@@ -65,7 +50,7 @@ class TestGeometryHistoryAttention(unittest.TestCase):
             history_hw=(4, 4),
         )
         self.assertGreater(float(out.abs().max()), 0.0)
-        self.assertGreater(float(self.attn.last_skip_ratio), 0.0)
+        self.assertGreater(float(self.attn.last_memory_ratio), 0.0)
 
     def test_resize_identity_grid_preserves_query_cell_centers(self):
         grid = identity_grid(batch=1, height=16, width=64)
@@ -95,9 +80,6 @@ class TestGeometryHistoryAttention(unittest.TestCase):
             )
 
     def test_invalid_geometry_is_exact_zero_after_training(self):
-        with torch.no_grad():
-            self.attn.to_out.weight.fill_(0.25)
-            self.attn.to_skip.weight.fill_(0.25)
         out = self.attn(
             self.x,
             self.cond,
@@ -112,8 +94,6 @@ class TestGeometryHistoryAttention(unittest.TestCase):
         self.assertEqual(self.attn.last_valid_frac, 0.0)
 
     def test_no_history_keeps_all_parameters_in_graph(self):
-        with torch.no_grad():
-            self.attn.to_out.weight.normal_(std=0.02)
         out = self.attn(
             self.x,
             self.cond,
@@ -130,8 +110,6 @@ class TestGeometryHistoryAttention(unittest.TestCase):
         self.assertEqual(float(out.abs().max()), 0.0)
 
     def test_gradients_flow_with_valid_geometry(self):
-        with torch.no_grad():
-            self.attn.to_out.weight.normal_(std=0.02)
         out = self.attn(
             self.x,
             self.cond,
@@ -148,10 +126,7 @@ class TestGeometryHistoryAttention(unittest.TestCase):
         self.assertIsNotNone(self.tokens.grad)
         self.assertGreater(float(self.tokens.grad.abs().sum()), 0.0)
 
-    def test_appearance_skip_follows_projected_coordinates(self):
-        with torch.no_grad():
-            self.attn.skip_gain.fill_(1.0)
-            self.attn.to_out.weight.zero_()
+    def test_memory_follows_projected_coordinates(self):
         out_a = self.attn(
             self.x,
             self.cond,
@@ -175,50 +150,8 @@ class TestGeometryHistoryAttention(unittest.TestCase):
             history_hw=(4, 4),
         )
         self.assertGreater(float((out_a - out_b).abs().max()), 1e-7)
-
-    def test_coordinates_affect_local_readout(self):
-        with torch.no_grad():
-            self.attn.to_out.weight.normal_(std=0.02)
-        out_a = self.attn(
-            self.x,
-            self.cond,
-            self.tokens,
-            has_history=True,
-            history_grid=self.grid,
-            history_valid=self.valid,
-            query_hw=(4, 4),
-            history_hw=(4, 4),
-        )
-        shifted = self.grid.clone()
-        shifted[..., 0] = (shifted[..., 0] + 0.5).clamp(-1.0, 1.0)
-        out_b = self.attn(
-            self.x,
-            self.cond,
-            self.tokens,
-            has_history=True,
-            history_grid=shifted,
-            history_valid=self.valid,
-            query_hw=(4, 4),
-            history_hw=(4, 4),
-        )
-        self.assertGreater(float((out_a - out_b).abs().max()), 1e-7)
-
-    def test_cfg_batch_repetition(self):
-        out = self.attn(
-            self.x.repeat(2, 1, 1),
-            self.cond.repeat(2, 1, 1),
-            self.tokens,
-            has_history=True,
-            history_grid=self.grid,
-            history_valid=self.valid,
-            query_hw=(4, 4),
-            history_hw=(4, 4),
-        )
-        self.assertEqual(tuple(out.shape), (2, 16, 32))
 
     def test_cfg_repeats_base_batch_order(self):
-        with torch.no_grad():
-            self.attn.to_out.weight.normal_(std=0.02)
         x = torch.zeros(2, 16, 32)
         cond = torch.zeros(2, 16, 32)
         base = torch.arange(16 * 16, dtype=torch.float32).reshape(16, 16) / 31.0
@@ -253,9 +186,6 @@ class TestGeometryHistoryAttention(unittest.TestCase):
             )
 
     def test_invalid_nan_grid_is_exact_zero_after_training(self):
-        with torch.no_grad():
-            self.attn.to_out.weight.fill_(0.25)
-            self.attn.to_skip.weight.fill_(0.25)
         bad_grid = self.grid.clone()
         bad_grid[:] = float("nan")
         out = self.attn(
@@ -270,6 +200,18 @@ class TestGeometryHistoryAttention(unittest.TestCase):
         )
         self.assertFalse(torch.isnan(out).any())
         self.assertEqual(float(out.abs().max()), 0.0)
+        all_invalid = self.attn(
+            self.x,
+            self.cond,
+            self.tokens,
+            has_history=True,
+            history_grid=bad_grid,
+            history_valid=torch.zeros_like(self.valid),
+            query_hw=(4, 4),
+            history_hw=(4, 4),
+        )
+        self.assertFalse(torch.isnan(all_invalid).any())
+        self.assertEqual(float(all_invalid.abs().max()), 0.0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA autocast check requires GPU")
     def test_cuda_autocast_forward(self):
@@ -370,16 +312,10 @@ class TestGeometryHistoryPlumbing(unittest.TestCase):
         self.assertIs(blocks[0], model.output_blocks[1])
         self.assertEqual(encoder.out_dim, 64)
 
-    def test_geometry_refuses_encoder_injection_without_override(self):
+    def test_geometry_refuses_encoder_injection(self):
         with self.assertRaises(ValueError) as ctx:
             enable_history_attention(_FakeUNet(), geometry=True, block_indices=(1,))
         self.assertIn("pre-bottleneck", str(ctx.exception))
-        hub, _encoder, blocks = enable_history_attention(
-            _FakeUNet(), geometry=True, block_indices=(1,), allow_pre_bottleneck=True
-        )
-        self.assertEqual(blocks[0].history_block_index, 1)
-        self.assertEqual(blocks[0].history_block_stage, "encoder")
-        self.assertIsNotNone(hub)
 
     def test_after_bottleneck_on_stub_without_decoder_fails(self):
         with self.assertRaises(ValueError):

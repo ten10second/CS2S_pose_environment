@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
 from train_kitti_geometry_history import (GeometryPairs, GeometryTrainingStep, pinned_denoising,
                                          split_drive_pairs, fixed_probe)
+from temporal_history import history_host_parameters, history_trainable_parameters
 from ldm.modules.temporal_history_attention import HistoryLatentEncoder
 
 
@@ -121,6 +122,42 @@ class TrainingContracts(unittest.TestCase):
         self.assertEqual(first, second)
         for t in (250, 750):
             self.assertEqual(len({r["loss_total"] for r in first if r["t"] == t}), 1)
+
+    def test_appearance_x0_applies_to_disabled_history(self):
+        hub = Hub()
+        model = DummyModel(hub).eval()
+        encoder = HistoryLatentEncoder(hidden=8, out_dim=8, grid=(2, 2))
+        module = GeometryTrainingStep(model, encoder, hub, appearance_x0_weight=1.0)
+        seen = {}
+        original = model.training_step
+
+        def wrapped(batch, idx):
+            seen["pair"] = model.DDPM._history_appearance_x0
+            return original(batch, idx)
+
+        model.training_step = wrapped
+        batch = {"grd_left_imgs": torch.ones(1, 3, 2, 2)}
+        geom = {"history_grid": torch.zeros(1, 2, 2, 2),
+                "history_valid": torch.ones(1, 2, 2, dtype=torch.bool)}
+        module(batch, None, geom, False, False)
+        self.assertIsNotNone(seen["pair"])
+        self.assertEqual(seen["pair"][1], 1.0)
+
+    def test_unfreeze_host_adds_feedforward_parameters(self):
+        encoder = HistoryLatentEncoder(hidden=8, out_dim=8, grid=(2, 2))
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.history_attn = torch.nn.Linear(2, 2, bias=False)
+                self.ff = torch.nn.Linear(4, 4, bias=False)
+                self.norm3 = torch.nn.LayerNorm(4)
+
+        block = Block()
+        frozen = history_trainable_parameters(encoder, [block], unfreeze_host=False)
+        thawed = history_trainable_parameters(encoder, [block], unfreeze_host=True)
+        self.assertGreater(sum(p.numel() for p in thawed), sum(p.numel() for p in frozen))
+        self.assertTrue(history_host_parameters([block]))
 
 
 if __name__ == "__main__":

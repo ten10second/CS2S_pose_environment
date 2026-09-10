@@ -108,7 +108,6 @@ def resolve_history_block_indices(
     root,
     block_indices=None,
     geometry=False,
-    allow_pre_bottleneck=False,
 ):
     """Resolve fusion indices. Geometry defaults to the finest 640-d decoder block."""
     candidates, stages = fusion_block_stages(root)
@@ -140,14 +139,13 @@ def resolve_history_block_indices(
         raise ValueError(
             f"history block_indices out of range: {bad}; available 0..{len(candidates) - 1}"
         )
-    if geometry and not allow_pre_bottleneck:
+    if geometry:
         pre = [index for index in selected if stages[index] in {"encoder", "middle"}]
         if pre:
             raise ValueError(
                 "geometry history refuses pre-bottleneck fusion blocks "
                 f"{pre} (stages {[stages[index] for index in pre]}). These inject "
-                "before the bottleneck depth head. Use after_bottleneck, or pass "
-                "allow_pre_bottleneck=True only for the 2,12 control."
+                "before the bottleneck depth head."
             )
     return candidates, selected, stages, tuple(selected)
 
@@ -159,7 +157,6 @@ def enable_history_attention(
     history_dim=None,
     geometry=False,
     block_indices=None,
-    allow_pre_bottleneck=False,
 ):
     """Inject condition-aware history attention into selected fusion blocks.
 
@@ -191,7 +188,6 @@ def enable_history_attention(
         model,
         block_indices=block_indices,
         geometry=geometry,
-        allow_pre_bottleneck=allow_pre_bottleneck,
     )
 
     blocks = []
@@ -226,11 +222,60 @@ def enable_history_attention(
     return hub, encoder, blocks
 
 
-def history_trainable_parameters(encoder, blocks):
+def history_host_parameters(blocks):
+    """Unfreeze the feed-forward tail after history is added so generation can use it."""
+    params = []
+    for block in blocks:
+        if hasattr(block, "ff"):
+            params.extend(block.ff.parameters())
+        if hasattr(block, "norm3"):
+            params.extend(block.norm3.parameters())
+    return params
+
+
+def history_trainable_parameters(encoder, blocks, unfreeze_host=False):
     params = list(encoder.parameters())
     for block in blocks:
         params.extend(block.history_attn.parameters())
+    if unfreeze_host:
+        params.extend(history_host_parameters(blocks))
     return params
+
+
+def history_host_state_dict(blocks):
+    payload = {}
+    for index, block in enumerate(blocks):
+        if not hasattr(block, "ff") or not hasattr(block, "norm3"):
+            raise AttributeError(
+                f"history host block {index} is missing ff/norm3; "
+                "refusing to save an incomplete generator tail"
+            )
+        payload[str(index)] = {
+            "ff": {key: value.detach().clone() for key, value in block.ff.state_dict().items()},
+            "norm3": {key: value.detach().clone() for key, value in block.norm3.state_dict().items()},
+        }
+    return payload
+
+
+def load_history_host_state_dict(blocks, host):
+    if not host:
+        raise KeyError("history checkpoint missing history_host")
+    expected = {str(index) for index in range(len(blocks))}
+    actual = set(host)
+    if actual != expected:
+        raise ValueError(
+            f"history_host keys mismatch: expected {sorted(expected)}, got {sorted(actual)}"
+        )
+    for index, block in enumerate(blocks):
+        state = host[str(index)]
+        if "ff" not in state or "norm3" not in state:
+            raise KeyError(f"history_host[{index}] missing ff or norm3")
+        if not hasattr(block, "ff") or not hasattr(block, "norm3"):
+            raise AttributeError(
+                f"history host block {index} is missing ff/norm3; cannot restore generator tail"
+            )
+        block.ff.load_state_dict(state["ff"], strict=True)
+        block.norm3.load_state_dict(state["norm3"], strict=True)
 
 
 @torch.no_grad()

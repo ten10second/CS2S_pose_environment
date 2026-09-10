@@ -69,6 +69,9 @@ class TestSequenceBoundary(unittest.TestCase):
         self.assertEqual(gh.next_history_latent_source(0, True), "first_rgb")
         self.assertEqual(gh.next_history_latent_source(1, True), "generated")
         self.assertEqual(gh.next_history_latent_source(0, False), "generated")
+        self.assertEqual(gh.next_history_latent_source(0, True, "gt"), "first_rgb")
+        self.assertEqual(gh.next_history_latent_source(1, True, "gt"), "gt_rgb")
+        self.assertEqual(gh.next_history_latent_source(0, False, "gt"), "gt_rgb")
 
     def test_first_rgb_observed_frame_selection(self):
         self.assertTrue(gh.use_observed_initial_frame(0, True))
@@ -184,6 +187,34 @@ class TestStrictCheckpoint(unittest.TestCase):
         bad = dict(self.payload, history_attn={"0": self.blocks[0].history_attn.state_dict()})
         with self.assertRaises(ValueError):
             gh.require_geometry_history_payload(bad, self.args, self.blocks)
+
+    def test_unfreeze_host_is_required_and_restored(self):
+        class HostBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.history_attn = torch.nn.Linear(1, 1, bias=False)
+                self.ff = torch.nn.Linear(2, 2, bias=False)
+                self.norm3 = torch.nn.LayerNorm(2)
+
+        blocks = [HostBlock(), HostBlock()]
+        payload = dict(self.payload)
+        payload["history_attn"] = {str(i): b.history_attn.state_dict() for i, b in enumerate(blocks)}
+        payload["unfreeze_host"] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hist.pt"
+            torch.save(payload, path)
+            with self.assertRaises(KeyError):
+                gh.load_geometry_history_checkpoint(path, self.args, self.encoder, blocks)
+        from temporal_history import history_host_state_dict
+
+        payload["history_host"] = history_host_state_dict(blocks)
+        saved = float(blocks[0].ff.weight[0, 0].detach())
+        blocks[0].ff.weight.data.fill_(3.0 if saved != 3.0 else 4.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hist.pt"
+            torch.save(payload, path)
+            gh.load_geometry_history_checkpoint(path, self.args, self.encoder, blocks)
+        self.assertEqual(float(blocks[0].ff.weight[0, 0].detach()), saved)
 
 
 if __name__ == "__main__":

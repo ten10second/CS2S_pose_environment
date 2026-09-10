@@ -260,7 +260,7 @@ def summarize_run(run_dir: str | Path) -> dict:
     status = "complete" if ranks and len(complete_ranks) == len(ranks) and ckpt_path and ckpt_path.exists() else "incomplete"
 
     probe_summary, _probe_means = aggregate_probe_records(probes_by_rank)
-    appearance_skip = bool(metadata.get("appearance_skip"))
+    appearance_skip = bool(metadata.get("appearance_skip") or metadata.get("appearance_memory"))
     if appearance_skip:
         step0 = {
             "status": "not_applicable",
@@ -271,7 +271,16 @@ def summarize_run(run_dir: str | Path) -> dict:
         }
     else:
         step0 = check_step0_identical(probes_by_rank, start_step)
-    disabled = check_disabled_constant(probes_by_rank)
+    if metadata.get("unfreeze_host"):
+        disabled = {
+            "status": "not_applicable",
+            "pass": None,
+            "checked_groups": 0,
+            "failures": [],
+            "reason": "unfrozen_host_updates_no_history_path",
+        }
+    else:
+        disabled = check_disabled_constant(probes_by_rank)
     final_enabled_steps = sum(
         train_status[str(rank)]["enabled_history_rows_after_step5"]
         for rank in ranks if str(rank) in train_status
