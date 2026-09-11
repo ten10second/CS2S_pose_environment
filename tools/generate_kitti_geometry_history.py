@@ -11,6 +11,11 @@ Frame history is always the previous GENERATED latent, except for the optional
 real first RGB observation. Gaps and drive changes clear history and should be
 bit-identical to the frozen single-frame model when the history adapter is
 zero-initialized.
+
+History on/off has exactly ONE implementation here (``resolve_history_switch``).
+``--disable-history`` does not bypass the history modules: it forces the same
+``has_history=False`` payload the training probe's ``disabled`` condition runs,
+so the paired baseline and the trained no-history condition share one code path.
 """
 import argparse
 import hashlib
@@ -248,6 +253,36 @@ def use_observed_initial_frame(frame_offset, first_rgb):
     return bool(first_rgb) and int(frame_offset) == 0
 
 
+def resolve_history_switch(disable_history, prev_latent, prev_row, cur_row,
+                           prev_frame_index=None, cur_frame_index=None):
+    """The only history on/off decision in the rollout.
+
+    History is read only for strictly consecutive frames of one drive that have
+    a previous latent. ``--disable-history`` forces the decision to False
+    without clearing the hub, so the disabled baseline runs the identical
+    no-history payload path the training probe's ``disabled`` condition runs.
+    """
+    if bool(disable_history) or prev_latent is None:
+        return False
+    return consecutive_rows(prev_row, cur_row, prev_frame_index, cur_frame_index)
+
+
+def no_history_trace_violations(step_trace):
+    """Trace entries where a no-history frame did not stay exactly inert.
+
+    The no-history payload routes the learned null token through the attention
+    and multiplies the residual by an exact zero, so a correct no-history frame
+    executes at every denoising step yet must report perfect null attendance and
+    zero residual.
+    """
+    return [
+        entry for entry in step_trace
+        if entry.get("null_all") != 1.0
+        or entry.get("valid_neighbor_fraction") != 0.0
+        or entry.get("residual_to_x") != 0.0
+    ]
+
+
 def require_contiguous_sequence(rows, expected_count):
     if len(rows) != expected_count or not rows:
         raise ValueError('requested complete sequence is not available')
@@ -330,7 +365,8 @@ def parse_args():
         help="generated: closed-loop latents; gt: encode each previous GT RGB as history",
     )
     p.add_argument("--disable-history", action="store_true",
-                   help="same loaded checkpoint, but bypass history for the paired baseline")
+                   help="same loaded checkpoint, but force the no-history payload "
+                        "used by the training probe's disabled condition")
     p.add_argument("--require-contiguous", action="store_true",
                    help="reject truncated, nonconsecutive or cross-drive diagnostic clips")
     return p.parse_args()
@@ -466,16 +502,12 @@ def main():
             del poisoned, poisoned_pack
 
         observed_initial = use_observed_initial_frame(offset, args.first_rgb)
-        has_history = (
-            not args.disable_history and prev_latent is not None
-            and consecutive_rows(prev_row, row, prev_frame_index, frame_index)
+        has_history = resolve_history_switch(
+            args.disable_history, prev_latent, prev_row, row, prev_frame_index, frame_index
         )
         input_history_hash = tensor_sha256(prev_latent) if has_history else None
         geometry = None
-        if args.disable_history:
-            hub.clear()
-            valid_frac = 0.0
-        elif has_history:
+        if has_history:
             geometry = build_pair_geometry(prev_row, row, args.kitti_root, grid=DEFAULT_GRID)
             hub.set(
                 build_geometry_history_payload(
@@ -484,6 +516,9 @@ def main():
             )
             valid_frac = float(np.asarray(_geometry_value(geometry, "history_valid")).mean())
         else:
+            # --disable-history, sequence starts and drive gaps all take this
+            # single no-history path (never hub.clear()): the history attention
+            # still executes and is required to contribute exact zero.
             hub.set(
                 build_geometry_history_payload(
                     encoder, None, None, False, batch_factor=batch_factor
@@ -522,10 +557,17 @@ def main():
                 prev_latent = latent.detach()
             if not denoiser_batches or any(b != batch_factor for b in denoiser_batches):
                 raise RuntimeError('actual denoiser batch does not match requested CFG')
-            if args.disable_history and step_trace:
-                raise RuntimeError('disabled baseline unexpectedly read history')
-            if has_history and len(step_trace) != len(denoiser_batches) * len(blocks):
-                raise RuntimeError('history did not execute at every denoising step')
+            # Both modes run the same stream: history attention must execute at
+            # every denoising step, and must be exactly inert without history.
+            if len(step_trace) != len(denoiser_batches) * len(blocks):
+                raise RuntimeError('history attention did not execute at every denoising step')
+            if not has_history:
+                violations = no_history_trace_violations(step_trace)
+                if violations:
+                    raise RuntimeError(
+                        'no-history frame read history: '
+                        f'disabled={bool(args.disable_history)} {violations[:2]}'
+                    )
         prev_row = row
         prev_frame_index = frame_index
 

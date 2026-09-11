@@ -102,6 +102,35 @@ class TestSequenceBoundary(unittest.TestCase):
         self.assertEqual(gh.tensor_sha256(torch.stack(first)), gh.tensor_sha256(torch.stack(second)))
 
 
+class TestHistorySwitch(unittest.TestCase):
+    """One decision point for history on/off, shared by baseline and training."""
+
+    def test_disable_history_wins_over_a_valid_consecutive_pair(self):
+        prev = {"drive": "d1", "frame_index": 10}
+        cur = {"drive": "d1", "frame_index": 11}
+        latent = torch.zeros(1, 4, 16, 64)
+        self.assertTrue(gh.resolve_history_switch(False, latent, prev, cur, 10, 11))
+        self.assertFalse(gh.resolve_history_switch(True, latent, prev, cur, 10, 11))
+
+    def test_missing_latent_gap_and_drive_change_disable_history(self):
+        prev = {"drive": "d1", "frame_index": 10}
+        latent = torch.zeros(1, 4, 16, 64)
+        self.assertFalse(gh.resolve_history_switch(False, None, prev, prev, 10, 11))
+        self.assertFalse(
+            gh.resolve_history_switch(False, latent, prev, {"drive": "d1", "frame_index": 12}, 10, 12)
+        )
+        self.assertFalse(
+            gh.resolve_history_switch(False, latent, prev, {"drive": "d2", "frame_index": 11}, 10, 11)
+        )
+
+    def test_no_history_trace_must_be_exactly_inert(self):
+        inert = {"null_all": 1.0, "valid_neighbor_fraction": 0.0, "residual_to_x": 0.0}
+        self.assertEqual(gh.no_history_trace_violations([inert, dict(inert)]), [])
+        self.assertEqual(len(gh.no_history_trace_violations([dict(inert, residual_to_x=1e-9)])), 1)
+        self.assertEqual(len(gh.no_history_trace_violations([dict(inert, null_all=0.999)])), 1)
+        self.assertEqual(len(gh.no_history_trace_violations([dict(inert, valid_neighbor_fraction=0.1)])), 1)
+
+
 class TestGeometryPayload(unittest.TestCase):
     def test_cfg_payload_repeats_history_and_geometry_for_both_branches(self):
         enc = _Encoder()
