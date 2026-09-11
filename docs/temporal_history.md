@@ -1,9 +1,38 @@
 # 时序实验历史与实测记录（归档）
 
-这份文档记录**已经删除的时序方案**和 v3 几何 history 的全部实测结果。
-其中 v0 / v1 / v2 的代码已于 2026-09-11 删除（见 git `5ddc47c` 及更早），
-这份文档是它们唯一的设计与结果记录。当前 live 设计见
-`docs/temporal_design_map.md`。
+这份文档记录已退役的 v0 / v1 / v2 / v3 时序方案及实测结果。
+v0 / v1 / v2 的代码见 git `5ddc47c` 及更早；v3 / Stage F adapter 也已删除，
+清理前提交为 `c85d021`。下文的阶段状态、脚本路径与命令均为历史记录，
+不表示当前 checkout 支持执行。独立几何工具仍保留。
+当前代码状态见 `docs/temporal_design_map.md`。
+
+## 2026-09-11 判决实验补记与退役
+
+服务器输出目录：
+`/mnt/shizhm/DATA/KITTI/CS2S_results/geometry_history_20260908/probe_necessity_20260911/`。
+共 5 对帧（0、1、2、-1、-2），固定 t=250/750，在卫星 on / zeroed 两臂比较
+disabled、correct、wrong_geometry、wrong_history。
+
+底座为 `base/cfg_step_250000.pt`；实际 adapter 为
+`stage_f_static_appearance_20260910/appearance/history_adapter.pt`（step 1064，
+`geometry_history_v1_transport`），不是示例中的 step 1000 generator 路径。
+复现使用 `/mnt/shizhm/CS2S_pose_environment_stagef_probe_20260911` 隔离 worktree，
+并恢复 `3c1d766` 的 attention 实现以匹配 transport 权重。
+
+| 卫星条件 | t | 平均 benefit（disabled − correct，总损失） | benefit > 0 |
+| --- | ---: | ---: | ---: |
+| on | 250 | 0.002014 | 2/5 |
+| on | 750 | 0.002026 | 3/5 |
+| zeroed | 250 | 0.001864 | 2/5 |
+| zeroed | 750 | 0.001541 | 2/5 |
+
+注入层有效覆盖率均值 0.1695（0.1094–0.2109）；残差相对条件幅度均值
+0.571（0.428–0.671）。四个实验格中 correct 均在 5/5 对帧上优于 wrong_history。
+这些结果不支持“掩码全部塌缩”或“残差压到零”，但 correct 没有稳定优于 disabled。
+目标或训练机制不足是后续要检验的方向；仅凭这些结果不能证明唯一根因，
+也不能把卫星置零臂无稳定收益当作读出失效的充分证据。
+
+旧 adapter 路径据此退役；新主干内时序方法尚未实现。
 
 结论速览：
 

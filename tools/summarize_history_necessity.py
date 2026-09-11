@@ -1,4 +1,8 @@
-"""Turn history-necessity probe output into a verdict.
+"""Summarize archived history-necessity probe output.
+
+The adapter and probe runners were retired on 2026-09-11. This standalone
+JSON reader is retained for existing experiment artifacts; it loads no model.
+See docs/temporal_history.md for the evaluated checkpoint and recovery refs.
 
 Reads the JSON files written by tools/probe_history_necessity.py (or by
 tools/run_history_necessity_probe.sh, which loops over pairs) and prints:

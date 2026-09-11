@@ -897,34 +897,6 @@ class RayAlignedEvidenceAttention(nn.Module):
         return sat_null_ref + mask * lidar_correction
 
 
-class HistoryEvidenceHub:
-    """Carries the per-frame history payload to the history attention modules.
-
-    Payload fields:
-      history_tokens     — previous-frame latent features, (b, T, C_h)
-      history_hw         — previous history feature map size (H, W)
-      has_history        — False routes the learned null token instead, and the
-                           attention residual is multiplied by an exact zero
-      history_grid       — current query anchors in the previous history map,
-                           grid_sample coords, align_corners=False
-      history_valid      — valid geometry correspondences for those anchors
-
-    Modules hold a reference to the hub, so no UNet forward signature changes.
-    """
-
-    def __init__(self):
-        self.payload = None
-
-    def set(self, payload):
-        self.payload = payload
-
-    def clear(self):
-        self.payload = None
-
-    def active(self):
-        return self.payload is not None
-
-
 class RayPosteriorEvidenceFusion(nn.Module):
     """Preserve the posterior satellite path and add LiDAR as independent evidence."""
 
@@ -1007,9 +979,6 @@ class BasicTransformerBlock(nn.Module):
         super().__init__()
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.history_hub = None
-        self.history_attn = None
-        self.history_ratio = None
         self.attn2 = CrossAttention(
             query_dim=dim,
             context_dim=context_dim,
@@ -1057,31 +1026,11 @@ class BasicTransformerBlock(nn.Module):
                 )
                 self.ray_posterior_fusion = None
 
-    def _build_history_pack(self):
-        """History payload fetch. Called outside gradient checkpointing so the
-        recompute pass sees identical tensors; no cross-step caching, the
-        payload is rebuilt once per frame boundary."""
-        payload = self.history_hub.payload if self.history_hub is not None else None
-        if payload is None or self.history_attn is None or "history_tokens" not in payload:
-            return None
-        pack = {
-            "history_tokens": payload["history_tokens"],
-            "history_hw": payload.get("history_hw"),
-            "has_history": bool(payload.get("has_history", True)),
-        }
-        if "history_grid" in payload or "history_valid" in payload:
-            if "history_grid" not in payload or "history_valid" not in payload:
-                raise ValueError("history_grid and history_valid must both be in history payload")
-            pack["history_grid"] = payload["history_grid"]
-            pack["history_valid"] = payload["history_valid"]
-        return pack
-
     def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
-            hist_pack = self._build_history_pack()
             return checkpoint(
                 self._forward,
-                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, hist_pack),
+                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta),
                 self.parameters(),
                 self.checkpoint,
             )
@@ -1098,7 +1047,7 @@ class BasicTransformerBlock(nn.Module):
         x = self.ff(self.norm3(x)) + x
         return x
 
-    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, hist_pack=None):
+    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         x = self.attn1(self.norm1(x)) + x
         x_base = x
         sat_delta = self.attn2(
@@ -1127,30 +1076,7 @@ class BasicTransformerBlock(nn.Module):
                 query_hw=latent_hw,
                 lidar_geometry_mask=lidar_geometry_mask,
             )
-        # History readout: the query sees the current conditions' fused summary
-        # (detached — routing signal only) and the residual is added on top of
-        # the fused delta. Without history the module returns an exact zero.
-        hist_delta = None
-        if hist_pack is not None and self.history_attn is not None:
-            hist_delta = self.history_attn(
-                x_base,
-                fused_delta.detach(),
-                hist_pack["history_tokens"],
-                has_history=hist_pack["has_history"],
-                history_grid=hist_pack.get("history_grid"),
-                history_valid=hist_pack.get("history_valid"),
-                query_hw=latent_hw,
-                history_hw=hist_pack.get("history_hw"),
-            )
-        if hist_delta is not None:
-            with torch.no_grad():
-                denom = float(fused_delta.detach().float().norm(dim=-1).mean())
-                self.history_ratio = (
-                    float(hist_delta.detach().float().norm(dim=-1).mean()) / max(denom, 1e-6)
-                )
-            x = x_base + fused_delta + hist_delta
-        else:
-            x = x_base + fused_delta
+        x = x_base + fused_delta
         x = self.ff(self.norm3(x)) + x
         return x
 

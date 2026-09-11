@@ -34,10 +34,11 @@
 
 Consecutive-frame consistency work lives on the `temporal-model` branch:
 
-- `docs/temporal_design_map.md` — the design that is live now, its call chain,
-  the history on/off contract and the open on/off question.
-- `docs/temporal_history.md` — measured results of every temporal design tried
-  so far. The v0/v1/v2 code was deleted on 2026-09-11; this file is their record.
+- [Current code status](docs/temporal_design_map.md) — the old history adapter
+  and its training/inference switches have been removed. The single-frame path
+  remains; the proposed integrated temporal model is not implemented yet.
+- [Experiment archive](docs/temporal_history.md) — measured results of the
+  retired v0/v1/v2/v3 designs, retained with recovery references.
 
 
 ## :one: Dependencies and installation
