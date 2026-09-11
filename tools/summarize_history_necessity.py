@@ -23,6 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 
 MASK_COLLAPSE_RATIO = 0.2  # read@block below this fraction of the raw mask
+RESIDUAL_FLOOR = 0.1      # ||history delta|| / ||condition delta|| below this is inert
 
 
 def parse_args():
@@ -54,46 +55,130 @@ def collect(payloads):
     return rows, coverage
 
 
+def values_of(entries, key):
+    return [e[key] for e in entries if e.get(key) is not None]
+
+
 def mean_of(entries, key):
-    values = [e[key] for e in entries if e.get(key) is not None]
+    values = values_of(entries, key)
     return statistics.mean(values) if values else None
 
 
+def median_of(entries, key):
+    values = values_of(entries, key)
+    return statistics.median(values) if values else None
+
+
+def sign_split(entries, key):
+    """(positive, negative) counts. With a handful of pairs the mean hides a
+    split sign, so the verdict needs the counts as well."""
+    values = values_of(entries, key)
+    return sum(1 for v in values if v > 0), sum(1 for v in values if v < 0)
+
+
+def arm_stats(entries):
+    benefit_key = "benefit_disabled_minus_correct"
+    positive, negative = sign_split(entries, benefit_key)
+    return {
+        "median": median_of(entries, benefit_key),
+        "mean": mean_of(entries, benefit_key),
+        "eps_median": median_of(entries, "benefit_disabled_minus_correct_eps"),
+        "positive": positive,
+        "total": positive + negative,
+    }
+
+
+def helps(stats, min_benefit):
+    """A consistent, non-trivial benefit. The median carries the decision so one
+    outlier pair cannot flip it; the positive count is reported next to it."""
+    return stats["median"] >= min_benefit and stats["positive"] == stats["total"]
+
+
 def verdict(rows, coverage, min_benefit):
+    """Name the cause: (a) redundant condition, (b) collapsed mask, (c) inert
+    readout, or (d) neutral residual (a large, content-sensitive correction that
+    the objective never asked to be useful).
+
+    Satellite redundancy can only be claimed by comparing the two arms: if
+    zeroing the satellite does not unlock a benefit, the satellite is not what
+    was standing in history's way.
+    """
+    on = [e for (t, is_blind), entries in rows.items() if not is_blind for e in entries]
     blind = [e for (t, is_blind), entries in rows.items() if is_blind for e in entries]
     if not blind:
         return ["no satellite-zeroed arm in the input; nothing to judge"], None
-    benefit = mean_of(blind, "benefit_disabled_minus_correct")
-    benefit_eps = mean_of(blind, "benefit_disabled_minus_correct_eps")
-    lines = []
-    if benefit is None:
+    blind_stats, on_stats = arm_stats(blind), arm_stats(on) if on else None
+    if blind_stats["median"] is None:
         return ["satellite-zeroed arm has no paired cells"], None
-    lines.append(f"satellite-zeroed benefit (disabled - correct) = {benefit:+.4f}"
-                 + (f"  [eps-only {benefit_eps:+.4f}]" if benefit_eps is not None else ""))
-    if benefit >= min_benefit:
-        lines.append(f"  >= min-benefit {min_benefit:+.4f}  ->  (a) REDUNDANT CONDITION")
-        lines.append("  History carries usable appearance; the satellite condition makes it")
-        lines.append("  unnecessary, so nothing in the objective requires reading it.")
-        lines.append("  Next: mechanism M1 (training-free, reuse the backbone's own K/V) or M3.")
-        return lines, "a"
+
     ratios = [c["effective_fraction_at_block"] / max(c["raw_fraction_16x64"], 1e-9)
               for _, c in coverage]
     read = statistics.mean(c["effective_fraction_at_block"] for _, c in coverage)
     raw = statistics.mean(c["raw_fraction_16x64"] for _, c in coverage)
-    lines.append(f"  <  min-benefit {min_benefit:+.4f}")
-    lines.append(f"  coverage: raw 16x64 {raw:.3f} -> read at the injection block {read:.3f}"
-                 f" (ratio {statistics.mean(ratios):.3f})")
-    if statistics.mean(ratios) < MASK_COLLAPSE_RATIO:
-        lines.append(f"  ->  (b) MASK COLLAPSE: the block reads under "
-                     f"{MASK_COLLAPSE_RATIO:.0%} of the correspondence mask.")
-        lines.append("  Fix the geometry before touching the mechanism: build the correspondence")
-        lines.append("  at the injection resolution (grid=(8,32) matching the block's query")
-        lines.append("  grid), which removes the all-four-children-valid rule. The adapter must")
-        lines.append("  be retrained on the new grid.")
-        return lines, "b"
-    lines.append("  ->  (c) INERT READOUT: coverage is fine, the stream runs, but it changes")
-    lines.append("  nothing measurable. Replace the readout rather than enlarging it (M1).")
-    return lines, "c"
+    residual = statistics.median(c["residual_to_condition"] for _, c in coverage)
+    collapsed = statistics.mean(ratios) < MASK_COLLAPSE_RATIO
+
+    def arm_line(name, stats):
+        if stats is None:
+            return f"  {name:<7} (absent)"
+        return (f"  {name:<7} median {stats['median']:+.4f}  mean {stats['mean']:+.4f}  "
+                f"eps {stats['eps_median']:+.4f}  positive {stats['positive']}/{stats['total']}")
+
+    lines = [
+        arm_line("on", on_stats),
+        arm_line("zeroed", blind_stats),
+        f"  coverage: raw 16x64 {raw:.3f} -> read at the injection block {read:.3f}"
+        f" (ratio {statistics.mean(ratios):.3f}); residual/condition {residual:.3f}",
+    ]
+
+    blind_helps = helps(blind_stats, min_benefit)
+    on_helps = bool(on_stats and helps(on_stats, min_benefit))
+    if blind_helps and not on_helps:
+        lines += [
+            "  ->  (a) REDUNDANT CONDITION: history helps only once the satellite is",
+            "  zeroed, so the satellite is what made it unnecessary. Nothing in the",
+            "  objective requires reading history while the conditions can answer.",
+            "  Next: mechanism M1 (training-free, reuse the backbone's own K/V) or M3.",
+        ]
+        return lines, "a"
+    if blind_helps and on_helps:
+        return lines + [
+            "  ->  history helps in both arms, so the on==off result is not reproduced",
+            "  on this pair set. Check that these are the pairs and the checkpoint that",
+            "  produced it before acting.",
+        ], "none"
+    if not blind_helps:
+        for stats, name in ((blind_stats, "satellite-zeroed"), (on_stats, "satellite-on")):
+            if stats and 0 < stats["positive"] < stats["total"]:
+                lines.append(f"  note: the {name} sign is split "
+                             f"({stats['positive']}/{stats['total']} pairs positive), so the "
+                             "honest reading is \"no consistent benefit\", not a small win.")
+        if collapsed:
+            lines += [
+                f"  ->  (b) MASK COLLAPSE: the block reads under "
+                f"{MASK_COLLAPSE_RATIO:.0%} of the correspondence mask.",
+                "  Build the correspondence at the injection resolution (grid=(8,32)",
+                "  matching the block's query grid) and retrain the adapter on it.",
+            ]
+            return lines, "b"
+        if residual < RESIDUAL_FLOOR:
+            lines += [
+                f"  ->  (c) INERT READOUT: coverage is fine but the residual is under",
+                f"  {RESIDUAL_FLOOR:.2f} of the condition magnitude, so it cannot move",
+                "  anything. Replace the readout rather than enlarging it (M1).",
+            ]
+            return lines, "c"
+        lines += [
+            "  ->  (d) NEUTRAL RESIDUAL: the block reads a large, content- and",
+            "  geometry-sensitive correction (see the wrong-history / wrong-geometry",
+            "  columns) that does not lower the loss. The objective never asked it to",
+            "  be useful, and with the host tail unfrozen the adapter and the tail can",
+            "  co-adapt to a loss-neutral perturbation.",
+            "  This is an objective problem, not a geometry problem. Next: M3, but a",
+            "  term the conditional mean cannot satisfy; Stage F's masked x0 already",
+            "  was a consistency term and did not create the pressure.",
+        ]
+        return lines, "d"
 
 
 def main():
@@ -118,16 +203,18 @@ def main():
               f"read@block={cov['effective_fraction_at_block']:.3f} ratio={ratio:.3f} "
               f"residual/condition={cov['residual_to_condition']}")
 
-    print(f"\n{'t':>5} {'satellite':>10} {'benefit':>10} {'eps only':>10} "
-          f"{'vs wrongGeom':>13} {'vs wrongHist':>13} {'n':>3}")
+    print(f"\n{'t':>5} {'satellite':>10} {'mean':>10} {'median':>10} {'+/-':>7} "
+          f"{'eps only':>10} {'vs wrongGeom':>13} {'vs wrongHist':>13}")
     for (t, is_blind), entries in sorted(rows.items()):
+        positive, negative = sign_split(entries, "benefit_disabled_minus_correct")
         cells = [
             f"{t:>5} {'zeroed' if is_blind else 'on':>10}",
             f"{mean_of(entries, 'benefit_disabled_minus_correct'):>+10.4f}",
+            f"{median_of(entries, 'benefit_disabled_minus_correct'):>+10.4f}",
+            f"{f'{positive}/{positive + negative}':>7}",
             f"{mean_of(entries, 'benefit_disabled_minus_correct_eps'):>+10.4f}",
             f"{mean_of(entries, 'benefit_disabled_minus_wrong_geometry'):>+13.4f}",
             f"{mean_of(entries, 'benefit_wrong_history_minus_correct'):>+13.4f}",
-            f"{len(entries):>3}",
         ]
         print(" ".join(cells))
 
