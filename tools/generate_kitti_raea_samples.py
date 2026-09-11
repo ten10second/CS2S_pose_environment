@@ -99,6 +99,26 @@ def load_checkpoint_into_model(model, ckpt_path):
     gc.collect()
 
 
+def lidar_depth_colormap(depth):
+    """Map normalized LiDAR depth to RGB: near red, far blue."""
+    depth = depth.detach().cpu().float().clamp(0.0, 1.0)
+    palette = depth.new_tensor(
+        [
+            [0.95, 0.10, 0.05],
+            [1.00, 0.85, 0.05],
+            [0.05, 0.80, 0.20],
+            [0.05, 0.80, 1.00],
+            [0.10, 0.20, 1.00],
+        ]
+    )
+    scaled = depth * float(palette.shape[0] - 1)
+    lower = scaled.floor().long().clamp(0, palette.shape[0] - 1)
+    upper = (lower + 1).clamp(0, palette.shape[0] - 1)
+    weight = (scaled - lower.float()).unsqueeze(-1)
+    rgb = palette[lower] * (1.0 - weight) + palette[upper] * weight
+    return rgb.permute(2, 0, 1).contiguous()
+
+
 def make_lidar_overlay(gt, lidar_cond):
     base = transforms.functional.to_pil_image(gt.detach().cpu().clamp(0, 1)).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -106,22 +126,21 @@ def make_lidar_overlay(gt, lidar_cond):
     cond = lidar_cond.detach().cpu()
     point = cond[1] > 0.5 if cond.shape[0] > 1 else torch.zeros(cond.shape[-2:], dtype=torch.bool)
     depth = cond[2].clamp(0, 1) if cond.shape[0] > 2 else torch.zeros_like(point, dtype=torch.float32)
+    colors = (lidar_depth_colormap(depth) * 255.0).round().to(torch.uint8)
     width, height = base.size
     for y in range(height):
         for x in range(width):
             if bool(point[y, x]):
-                d = int(255 * float(depth[y, x]))
-                draw.point((x, y), fill=(32, 240, max(64, d), 230))
+                red, green, blue = (int(value) for value in colors[:, y, x])
+                draw.point((x, y), fill=(red, green, blue, 230))
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
 def make_condition_rgb(lidar_cond):
     cond = lidar_cond.detach().cpu().clamp(0, 1)
-    if cond.shape[0] >= 10:
-        return torch.cat([cond[8:9], cond[1:2], cond[2:3]], dim=0)
-    if cond.shape[0] < 3:
-        cond = torch.nn.functional.pad(cond, (0, 0, 0, 0, 0, 3 - cond.shape[0]))
-    return torch.cat([cond[1:2], cond[2:3], cond[0:1]], dim=0)
+    point = cond[1] if cond.shape[0] > 1 else torch.zeros(cond.shape[-2:], dtype=cond.dtype)
+    depth = cond[2] if cond.shape[0] > 2 else torch.zeros_like(point)
+    return lidar_depth_colormap(depth) * (point > 0.5).to(depth.dtype).unsqueeze(0)
 
 
 def make_lidar_geometry_mask_for_sampling(model, lidar_evidence):
@@ -635,8 +654,8 @@ def main():
 
         image_paths = {
             "Satellite input": sat_path,
-            "LiDAR condition": cond_path,
-            "LiDAR input (on GT)": overlay_path,
+            "LiDAR depth (near red, far blue)": cond_path,
+            "LiDAR depth on GT": overlay_path,
             "GT": gt_path,
         }
         image_paths_by_id[sample_id] = image_paths

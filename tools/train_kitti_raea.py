@@ -759,7 +759,7 @@ def run_inline_samples(model, sample_dataset, args, out_dir, step):
             make_lidar_overlay(target[0], sample["lidar_cond"]).save(overlay_path)
             save_tensor_image(make_condition_rgb(sample["lidar_cond"]), cond_path)
 
-            image_paths = {"GT": gt_path, "LiDAR overlay": overlay_path}
+            image_paths = {"GT": gt_path, "LiDAR depth (near red, far blue)": overlay_path}
             attention_by_probe = {}
             batch = sample_to_batch(sample)
             try:
