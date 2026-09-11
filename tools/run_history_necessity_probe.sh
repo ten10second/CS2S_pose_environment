@@ -14,6 +14,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 experiment_root="${EXPERIMENT_ROOT:-/mnt/shizhm/DATA/KITTI/CS2S_results/geometry_history_20260908}"
 experiment_python="${EXPERIMENT_PYTHON:-/home/shizhm/miniconda3/envs/ControlS2S/bin/python}"
 hist_ckpt="${HIST_CKPT:-$experiment_root/stage_f_generator/geometry_history_step_1000.pt}"
+base_ckpt="${BASE_CKPT:-$experiment_root/base/cfg_step_250000.pt}"
 split="${SPLIT:-train}"
 pairs="${PAIRS:-0 1 2 -1}"
 gpu="${GPU:-4}"
@@ -21,8 +22,9 @@ out_root="${OUT_ROOT:-$experiment_root/probe_necessity}"
 timesteps="${TIMESTEPS:-250,750}"
 
 test -f "$hist_ckpt" || { echo "missing history checkpoint: $hist_ckpt" >&2; exit 1; }
-test -f "$experiment_root/base/cfg_step_250000.pt" || {
-    echo "missing frozen backbone: $experiment_root/base/cfg_step_250000.pt" >&2; exit 1; }
+# The adapter checkpoint records its base, and the loader refuses a mismatch,
+# so BASE_CKPT must be the backbone the adapter was trained against.
+test -f "$base_ckpt" || { echo "missing frozen backbone: $base_ckpt" >&2; exit 1; }
 
 # Refuse to start on a GPU that is already doing something.
 usage=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
@@ -41,7 +43,7 @@ for index in $pairs; do
     CUDA_VISIBLE_DEVICES="$gpu" "$experiment_python" tools/probe_history_necessity.py \
         --config "$experiment_root/base/cfg_run_config.yaml" \
         --sd-base-ckpt /mnt/shizhm/BasicModel/checkpoints/sd-v1-4.ckpt \
-        --ckpt "$experiment_root/base/cfg_step_250000.pt" \
+        --ckpt "$base_ckpt" \
         --hist-ckpt "$hist_ckpt" \
         --manifest dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/train_manifest.jsonl \
         --kitti-root /mnt/shizhm/DATA/KITTI/KITTI_RAW \
