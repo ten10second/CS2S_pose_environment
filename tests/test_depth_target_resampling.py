@@ -114,9 +114,9 @@ def test_masked_area_supports_different_head_sizes():
     for size in [(1, 1), (2, 8), (3, 5)]:
         depth = torch.rand(2, 1, 16, 64)
         mask = (torch.rand(2, 1, 16, 64) > 0.7).float()
-    
+
         target, support = resize_masked_lidar_depth(depth, mask, size=size, mode="masked_area")
-    
+
         assert target.shape[-2:] == size
         assert support.shape[-2:] == size
         assert torch.isfinite(target).all()
