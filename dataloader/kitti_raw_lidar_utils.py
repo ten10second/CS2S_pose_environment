@@ -650,6 +650,35 @@ def project_dynamic_boxes(
     return projected, valid_mask
 
 
+def zbuffer_visible_point_indices(
+    uv: np.ndarray,
+    depth: np.ndarray,
+    valid: np.ndarray,
+    output_size: Tuple[int, int],
+) -> np.ndarray:
+    """Return one front-most point index for every occupied image pixel."""
+    out_h, out_w = output_size
+    valid = np.asarray(valid, dtype=bool)
+    finite = np.isfinite(uv).all(axis=1) & np.isfinite(depth) & (depth > 0.0)
+    valid_indices = np.nonzero(valid & finite)[0]
+    if valid_indices.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    x = np.rint(uv[valid_indices, 0]).astype(np.int64)
+    y = np.rint(uv[valid_indices, 1]).astype(np.int64)
+    x = np.clip(x, 0, out_w - 1)
+    y = np.clip(y, 0, out_h - 1)
+    pixel_index = y * out_w + x
+
+    # Sort by pixel, then depth, then source index. Keeping the first entry per
+    # pixel matches the rasterizer's nearest-depth rule and makes ties stable.
+    order = np.lexsort((valid_indices, depth[valid_indices], pixel_index))
+    ordered_pixels = pixel_index[order]
+    keep = np.ones(order.shape[0], dtype=bool)
+    keep[1:] = ordered_pixels[1:] != ordered_pixels[:-1]
+    return np.sort(valid_indices[order[keep]]).astype(np.int64, copy=False)
+
+
 def _rasterize_points(
     uv: np.ndarray,
     depth: np.ndarray,
@@ -660,17 +689,14 @@ def _rasterize_points(
     out_h, out_w = output_size
     point_mask = np.zeros((out_h, out_w), dtype=np.float32)
     depth_map = np.zeros((out_h, out_w), dtype=np.float32)
-    nearest = np.full((out_h, out_w), np.inf, dtype=np.float32)
-
     valid_indices = np.nonzero(valid)[0]
-    for idx in valid_indices:
+    visible_indices = zbuffer_visible_point_indices(uv, depth, valid, output_size)
+    for idx in visible_indices:
         x = int(np.clip(round(float(uv[idx, 0])), 0, out_w - 1))
         y = int(np.clip(round(float(uv[idx, 1])), 0, out_h - 1))
         d = float(depth[idx])
-        if d < nearest[y, x]:
-            nearest[y, x] = d
-            point_mask[y, x] = 1.0
-            depth_map[y, x] = min(d, max_depth) / max_depth
+        point_mask[y, x] = 1.0
+        depth_map[y, x] = min(d, max_depth) / max_depth
     return point_mask, depth_map, int(valid_indices.size)
 
 
@@ -689,20 +715,16 @@ def _rasterize_pointmap(
     pointmap = np.zeros((3, out_h, out_w), dtype=np.float32)
     dynamic_point_mask = np.zeros((out_h, out_w), dtype=np.float32)
     dynamic_depth_map = np.zeros((out_h, out_w), dtype=np.float32)
-    nearest = np.full((out_h, out_w), np.inf, dtype=np.float32)
-
     if dynamic_flags is None:
         dynamic_flags = np.zeros((uv.shape[0],), dtype=bool)
     dynamic_flags = dynamic_flags.astype(bool, copy=False)
 
     valid_indices = np.nonzero(valid)[0]
-    for idx in valid_indices:
+    visible_indices = zbuffer_visible_point_indices(uv, depth, valid, output_size)
+    for idx in visible_indices:
         x = int(np.clip(round(float(uv[idx, 0])), 0, out_w - 1))
         y = int(np.clip(round(float(uv[idx, 1])), 0, out_h - 1))
         d = float(depth[idx])
-        if d >= nearest[y, x]:
-            continue
-        nearest[y, x] = d
         depth_norm = min(d, max_depth) / max_depth
         xyz = camera_xyz[idx]
         point_mask[y, x] = 1.0

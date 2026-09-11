@@ -17,12 +17,13 @@ from dataloader.kitti_raw_lidar_utils import (  # noqa: E402
     load_velodyne_points,
     project_velo_to_image,
     read_jsonl,
+    zbuffer_visible_point_indices,
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build full-scan Utonia features pooled into KITTI camera ray-depth bins."
+        description="Build z-buffer-visible Utonia features pooled into KITTI camera patches."
     )
     parser.add_argument("--manifest", default="dataset/kitti_raw_sat_lidar/train_manifest.jsonl")
     parser.add_argument("--out-root", required=True)
@@ -37,7 +38,6 @@ def parse_args():
     parser.add_argument("--max-depth", type=float, default=80.0)
     parser.add_argument("--image-height", type=int, default=128)
     parser.add_argument("--image-width", type=int, default=512)
-    parser.add_argument("--ray-depth-bins", type=int, default=4)
     parser.add_argument("--ray-height", type=int, default=8)
     parser.add_argument("--ray-width", type=int, default=32)
     parser.add_argument("--device", default="cuda")
@@ -124,8 +124,7 @@ def upsample_point_features(point):
     return point.feat[point.inverse]
 
 
-def pool_ray_depth_features(features, uv, depth, args):
-    bins = int(args.ray_depth_bins)
+def pool_visible_ray_features(features, uv, args):
     ray_h = int(args.ray_height)
     ray_w = int(args.ray_width)
     feat_dim = int(features.shape[1])
@@ -133,18 +132,15 @@ def pool_ray_depth_features(features, uv, depth, args):
     col = np.floor(uv[:, 0] / float(args.image_width) * ray_w).astype(np.int64)
     row = np.clip(row, 0, ray_h - 1)
     col = np.clip(col, 0, ray_w - 1)
-    depth_coord = np.log1p(depth) / np.log1p(float(args.max_depth))
-    depth_bin = np.floor(depth_coord * bins).astype(np.int64)
-    depth_bin = np.clip(depth_bin, 0, bins - 1)
-    flat_index = depth_bin * ray_h * ray_w + row * ray_w + col
+    flat_index = row * ray_w + col
 
-    sums = np.zeros((bins * ray_h * ray_w, feat_dim), dtype=np.float32)
-    counts = np.zeros((bins * ray_h * ray_w,), dtype=np.float32)
+    sums = np.zeros((ray_h * ray_w, feat_dim), dtype=np.float32)
+    counts = np.zeros((ray_h * ray_w,), dtype=np.float32)
     np.add.at(sums, flat_index, features.astype(np.float32, copy=False))
     np.add.at(counts, flat_index, 1.0)
     pooled = sums / np.maximum(counts[:, None], 1.0)
-    pooled = pooled.reshape(bins, ray_h, ray_w, feat_dim).transpose(3, 0, 1, 2)
-    mask = (counts.reshape(bins, ray_h, ray_w) > 0.0)[None]
+    pooled = pooled.reshape(ray_h, ray_w, feat_dim).transpose(2, 0, 1)[:, None]
+    mask = (counts.reshape(ray_h, ray_w) > 0.0)[None, None]
     return pooled.astype(np.float16), mask.astype(np.uint8), counts
 
 
@@ -164,14 +160,22 @@ def process_record(record, model, transform, device, args):
     encoder_indices = np.nonzero(encoder_mask)[0]
     encoder_xyz = xyz[encoder_indices]
 
-    uv, depth, visible = project_velo_to_image(
+    uv, depth, projected = project_velo_to_image(
         encoder_xyz,
         calib,
         (int(args.image_height), int(args.image_width)),
     )
-    visible = visible & np.isfinite(depth) & (depth > 0.0) & (depth <= float(args.max_depth))
-    if not np.any(visible):
+    projected = projected & np.isfinite(depth) & (depth > 0.0) & (depth <= float(args.max_depth))
+    if not np.any(projected):
         raise ValueError("no LiDAR points project into image_02")
+    zbuffer_indices = zbuffer_visible_point_indices(
+        uv,
+        depth,
+        projected,
+        (int(args.image_height), int(args.image_width)),
+    )
+    if zbuffer_indices.size == 0:
+        raise ValueError("no z-buffer-visible LiDAR points remain in image_02")
 
     point = {
         "coord": encoder_xyz,
@@ -190,13 +194,18 @@ def process_record(record, model, transform, device, args):
             f"Utonia output point count {features.shape[0]} != encoder input {encoder_xyz.shape[0]}"
         )
 
-    pooled, mask, counts = pool_ray_depth_features(features[visible], uv[visible], depth[visible], args)
+    pooled, mask, counts = pool_visible_ray_features(
+        features[zbuffer_indices],
+        uv[zbuffer_indices],
+        args,
+    )
     return {
         "utonia_ray_feat": pooled,
         "utonia_ray_mask": mask,
         "encoder_point_count": np.asarray(encoder_xyz.shape[0], dtype=np.int32),
-        "front_visible_point_count": np.asarray(int(visible.sum()), dtype=np.int32),
-        "occupied_ray_depth_bins": np.asarray(int((counts > 0.0).sum()), dtype=np.int32),
+        "projected_point_count": np.asarray(int(projected.sum()), dtype=np.int32),
+        "zbuffer_visible_point_count": np.asarray(int(zbuffer_indices.size), dtype=np.int32),
+        "occupied_ray_cells": np.asarray(int((counts > 0.0).sum()), dtype=np.int32),
         "feature_dim": np.asarray(features.shape[1], dtype=np.int32),
     }
 
@@ -236,8 +245,9 @@ def main():
                             "index": index,
                             "sample_id": sample_id,
                             "encoder_points": int(payload["encoder_point_count"]),
-                            "front_visible_points": int(payload["front_visible_point_count"]),
-                            "occupied_bins": int(payload["occupied_ray_depth_bins"]),
+                            "projected_points": int(payload["projected_point_count"]),
+                            "zbuffer_visible_points": int(payload["zbuffer_visible_point_count"]),
+                            "occupied_ray_cells": int(payload["occupied_ray_cells"]),
                         },
                         sort_keys=True,
                     ),

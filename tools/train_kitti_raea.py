@@ -36,10 +36,10 @@ from utils.util import instantiate_from_config  # noqa: E402
 
 CONDITION_MODE = "raw_lidar_pointmap"
 LIDAR_GEOM_MODE = "ray_depth_inv"
-LIDAR_CONTEXT_BACKBONE = "utonia_ray_depth"
+LIDAR_CONTEXT_BACKBONE = "utonia_zbuffer_visible_ray"
 LIDAR_POINT_IN_CHANNELS = 10
 LIDAR_POINT_FEATURE_DIM = 576
-LIDAR_RAY_DEPTH_BINS = 4
+LIDAR_RAY_CACHE_PLANES = 1
 IMAGE_SEMANTIC_DIM = 384
 IMAGE_SEMANTIC_SIZE = (8, 32)
 LIDAR_TOKEN_DIM = 768
@@ -152,7 +152,7 @@ def parse_args():
     parser.add_argument(
         "--lidar-ray-feature-cache-root",
         default="",
-        help="Required float16 cache containing pooled Utonia [576,K,8,32] ray-depth features.",
+        help="Required float16 cache containing z-buffer-visible Utonia [576,1,8,32] features.",
     )
     parser.add_argument(
         "--image-semantic-cache-root",
@@ -185,7 +185,7 @@ def parse_args():
     parser.add_argument(
         "--lidar-depth-loss-weight",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Auxiliary log-depth L1 weight on latent-resolution LiDAR hit cells.",
     )
     parser.add_argument(
@@ -457,6 +457,7 @@ def configure_cfg(cfg, args):
     cfg.model.params.dynamic_point_loss_weight = float(args.lidar_support_loss_weight)
     cfg.model.params.dynamic_point_dilation = int(args.lidar_support_dilation)
     cfg.model.params.lidar_depth_loss_weight = float(args.lidar_depth_loss_weight)
+    cfg.model.params.lidar_depth_resample_mode = "masked_area"
     cfg.model.params.lidar_depth_output_scale = 0.0
     cfg.model.params.lidar_depth_bottleneck_scale = 1.0
     cfg.model.params.lidar_depth_log_eps = float(args.lidar_depth_log_eps)
@@ -477,7 +478,7 @@ def configure_cfg(cfg, args):
     unet.lidar_posterior_strength = 2.0
     unet.lidar_message_gate_bias = -2.0
     cfg.model.params.Lidar_context_config = {
-        "target": "models.KITTI_geo_ldm.lidar_condition_model.LidarRayDepthSemanticTokenEncoder",
+        "target": "models.KITTI_geo_ldm.lidar_condition_model.LidarVisibleRaySemanticTokenEncoder",
         "params": {
             "point_in_channels": LIDAR_POINT_IN_CHANNELS,
             "front_in_channels": 5,
@@ -497,7 +498,6 @@ def configure_cfg(cfg, args):
             "point_pretrained_ckpt": "",
             "point_feature_dim": LIDAR_POINT_FEATURE_DIM,
             "semantic_feature_dim": IMAGE_SEMANTIC_DIM,
-            "ray_depth_bins": LIDAR_RAY_DEPTH_BINS,
         },
     }
 
@@ -508,7 +508,7 @@ def configure_cfg(cfg, args):
         params.manifest = manifest
         params.kitti_root = args.kitti_root
         params.condition_mode = CONDITION_MODE
-        # The ray-depth encoder consumes lidar_cond plus the offline Utonia cache and
+        # The visible-ray encoder consumes lidar_cond plus the offline Utonia cache and
         # explicitly discards range_img. Avoid building and transferring it per sample.
         params.include_range_image = False
         params.include_raw_lidar_points = False
@@ -517,7 +517,7 @@ def configure_cfg(cfg, args):
         params.lidar_ray_feature_cache_root = args.lidar_ray_feature_cache_root
         params.lidar_ray_feature_cache_suffix = ".npz"
         params.lidar_ray_feature_dim = LIDAR_POINT_FEATURE_DIM
-        params.lidar_ray_depth_bins = LIDAR_RAY_DEPTH_BINS
+        params.lidar_ray_depth_bins = LIDAR_RAY_CACHE_PLANES
         params.lidar_ray_height = LIDAR_TOKEN_GRID[0]
         params.lidar_ray_width = LIDAR_TOKEN_GRID[1]
         params.image_semantic_cache_root = args.image_semantic_cache_root
@@ -711,7 +711,7 @@ def build_inline_sample_dataset(args):
         lidar_ray_feature_cache_root=args.lidar_ray_feature_cache_root,
         lidar_ray_feature_cache_suffix=".npz",
         lidar_ray_feature_dim=LIDAR_POINT_FEATURE_DIM,
-        lidar_ray_depth_bins=LIDAR_RAY_DEPTH_BINS,
+        lidar_ray_depth_bins=LIDAR_RAY_CACHE_PLANES,
         lidar_ray_height=LIDAR_TOKEN_GRID[0],
         lidar_ray_width=LIDAR_TOKEN_GRID[1],
         image_semantic_cache_root=args.image_semantic_cache_root,
@@ -1174,8 +1174,8 @@ def run_training(args, dist_info):
         validate_memmap_cache(
             args.lidar_ray_feature_cache_root,
             "ray",
-            (LIDAR_POINT_FEATURE_DIM, LIDAR_RAY_DEPTH_BINS, *LIDAR_TOKEN_GRID),
-            (1, LIDAR_RAY_DEPTH_BINS, *LIDAR_TOKEN_GRID),
+            (LIDAR_POINT_FEATURE_DIM, LIDAR_RAY_CACHE_PLANES, *LIDAR_TOKEN_GRID),
+            (1, LIDAR_RAY_CACHE_PLANES, *LIDAR_TOKEN_GRID),
             cache_manifests,
         )
     )
@@ -1263,7 +1263,7 @@ def run_training(args, dist_info):
     iterator = iter(loader)
 
     metadata = {
-        "architecture": "satellite_lidar_ray_posterior",
+        "architecture": "satellite_lidar_zbuffer_visible_ray_posterior",
         "sd_base_ckpt": args.sd_base_ckpt,
         "resume_ckpt": args.resume_ckpt,
         "start_step": int(start_step),
@@ -1311,11 +1311,12 @@ def run_training(args, dist_info):
         "lidar_support_loss_weight": float(args.lidar_support_loss_weight),
         "lidar_support_dilation": int(args.lidar_support_dilation),
         "lidar_depth_loss_weight": float(args.lidar_depth_loss_weight),
+        "lidar_depth_resample_mode": "masked_area",
         "lidar_depth_output_scale": 0.0,
         "lidar_depth_bottleneck_scale": 1.0,
         "lidar_depth_log_eps": float(args.lidar_depth_log_eps),
         "lidar_ray_feature_cache_root": args.lidar_ray_feature_cache_root,
-        "lidar_ray_depth_bins": LIDAR_RAY_DEPTH_BINS,
+        "lidar_ray_cache_planes": LIDAR_RAY_CACHE_PLANES,
         "image_semantic_cache_root": args.image_semantic_cache_root,
         "lidar_semantic_alignment_weight": float(args.lidar_semantic_alignment_weight),
         "lidar_semantic_alignment_mask_mode": LIDAR_SEMANTIC_MASK_MODE,

@@ -721,14 +721,19 @@ class Lidar3DPointRayTokenEncoder(nn.Module):
 class LidarRayDepthSemanticTokenEncoder(Lidar3DPointRayTokenEncoder):
     """Compress offline full-scan 3D features into ray-depth semantic tokens."""
 
-    def __init__(self, ray_depth_bins: int = 4, **kwargs):
+    def __init__(self, ray_depth_bins: int = 4, use_depth_bin_embedding: bool = True, **kwargs):
         super().__init__(**kwargs)
         if self.point_feature_dim <= 0:
             raise ValueError("point_feature_dim must be positive for ray-depth semantic caches")
         self.ray_depth_bins = int(ray_depth_bins)
         hidden_channels = self.point_encoder[-1].out_features
-        self.depth_bin_embed = nn.Parameter(torch.zeros(1, self.ray_depth_bins, 1, 1, hidden_channels))
-        nn.init.normal_(self.depth_bin_embed, std=0.02)
+        if use_depth_bin_embedding:
+            self.depth_bin_embed = nn.Parameter(
+                torch.zeros(1, self.ray_depth_bins, 1, 1, hidden_channels)
+            )
+            nn.init.normal_(self.depth_bin_embed, std=0.02)
+        else:
+            self.register_parameter("depth_bin_embed", None)
 
     def forward(
         self,
@@ -792,7 +797,11 @@ class LidarRayDepthSemanticTokenEncoder(Lidar3DPointRayTokenEncoder):
             encoded = self.point_feature_encoder(
                 features.permute(0, 2, 3, 4, 1).reshape(-1, c)
             ).reshape(b, k, h, w, hidden_channels)
-            encoded = encoded + self.depth_bin_embed[:, :k].to(device=encoded.device, dtype=encoded.dtype)
+            if self.depth_bin_embed is not None:
+                encoded = encoded + self.depth_bin_embed[:, :k].to(
+                    device=encoded.device,
+                    dtype=encoded.dtype,
+                )
             mask_bkhw = feature_mask[:, 0].unsqueeze(-1)
             encoded = (encoded * mask_bkhw).sum(dim=1) / mask_bkhw.sum(dim=1).clamp_min(1.0)
             point_map = encoded.permute(0, 3, 1, 2).contiguous()
@@ -841,6 +850,23 @@ class LidarRayDepthSemanticTokenEncoder(Lidar3DPointRayTokenEncoder):
             output_tokens
             + self.pos_embed.to(device=output_tokens.device, dtype=output_tokens.dtype)
             + float(self.fixed_coord_pos_scale) * fixed_pos
+        )
+
+
+class LidarVisibleRaySemanticTokenEncoder(LidarRayDepthSemanticTokenEncoder):
+    """Encode z-buffer-visible Utonia features pooled on the camera patch grid."""
+
+    def __init__(self, **kwargs):
+        cache_planes = int(kwargs.pop("ray_depth_bins", 1))
+        if cache_planes != 1:
+            raise ValueError(
+                "LidarVisibleRaySemanticTokenEncoder requires one singleton cache plane, "
+                f"got {cache_planes}"
+            )
+        super().__init__(
+            ray_depth_bins=1,
+            use_depth_bin_embedding=False,
+            **kwargs,
         )
 
 

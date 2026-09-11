@@ -26,7 +26,12 @@ def parse_args():
     parser.add_argument("--image-channels", type=int, default=384)
     parser.add_argument("--image-height", type=int, default=8)
     parser.add_argument("--image-width", type=int, default=32)
-    parser.add_argument("--ray-depth-bins", type=int, default=4)
+    parser.add_argument(
+        "--ray-depth-bins",
+        type=int,
+        default=1,
+        help="Number of cache planes. V2 visible-ray caches use one; pass 4 for V1 caches.",
+    )
     parser.add_argument("--ray-height", type=int, default=8)
     parser.add_argument("--ray-width", type=int, default=32)
     parser.add_argument("--limit", type=int, default=0)
