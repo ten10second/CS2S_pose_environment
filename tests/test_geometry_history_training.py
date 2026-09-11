@@ -123,6 +123,30 @@ class TrainingContracts(unittest.TestCase):
         for t in (250, 750):
             self.assertEqual(len({r["loss_total"] for r in first if r["t"] == t}), 1)
 
+    def test_fixed_probe_satellite_axis_is_labelled_and_paired(self):
+        hub = Hub()
+        model = DummyModel(hub).eval()
+        encoder = HistoryLatentEncoder(hidden=8, out_dim=8, grid=(2, 2))
+        module = GeometryTrainingStep(model, encoder, hub)
+        batch = {"grd_left_imgs": torch.ones(1, 3, 2, 2)}
+        geom = {"history_grid": torch.zeros(1, 2, 2, 2),
+                "history_valid": torch.ones(1, 2, 2, dtype=torch.bool)}
+        latent = torch.randn(1, 4, 2, 2)
+        both = fixed_probe(module, batch, latent, geom, latent + 1, [250], 7, False,
+                           satellite_arms=(False, True))
+        self.assertEqual(len(both), 8)
+        self.assertEqual({r["satellite_blind"] for r in both}, {False, True})
+        for blind in (False, True):
+            cells = [r for r in both if r["satellite_blind"] is blind]
+            self.assertEqual(len(cells), 4)
+            self.assertEqual({r["condition"] for r in cells},
+                             {"disabled", "correct", "wrong_geometry", "wrong_history"})
+        # Adding the satellite-blind arm must not disturb the conditioned arm.
+        single = fixed_probe(module, batch, latent, geom, latent + 1, [250], 7, False)
+        self.assertTrue(all(r["satellite_blind"] is False for r in single))
+        self.assertEqual([r["loss_total"] for r in single],
+                         [r["loss_total"] for r in both if r["satellite_blind"] is False])
+
     def test_appearance_x0_applies_to_disabled_history(self):
         hub = Hub()
         model = DummyModel(hub).eval()

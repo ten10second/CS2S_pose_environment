@@ -214,7 +214,15 @@ def pinned_denoising(ddpm, timestep, seed):
         ddpm.p_losses = original
 
 
-def fixed_probe(module, batch, latent, geom, wrong_latent, timesteps, seed, amp):
+def fixed_probe(module, batch, latent, geom, wrong_latent, timesteps, seed, amp,
+                satellite_arms=(False,)):
+    """Paired history conditions at pinned timesteps and pinned diffusion noise.
+
+    ``satellite_arms`` adds the condition-necessity axis: with the satellite
+    conditioning zeroed, appearance is no longer available from the current
+    conditions, so history becomes the only colour source. Training keeps the
+    default single arm (satellite conditioned); the necessity probe runs both.
+    """
     records = []
     shuffled = dict(geom)
     # Preserve target validity and the set of valid source coordinates exactly.
@@ -228,15 +236,18 @@ def fixed_probe(module, batch, latent, geom, wrong_latent, timesteps, seed, amp)
                   ("wrong_history", wrong_latent, geom, True))
     devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
     for t in timesteps:
-        for name, history, geometry, enabled in conditions:
-            # Pins current VAE sampling as well as preserving the training RNG.
-            with torch.random.fork_rng(devices=devices):
-                torch.manual_seed(seed)
-                with torch.no_grad(), autocast(enabled=amp), pinned_denoising(module.model.DDPM, t, seed + 1):
-                    loss = module(batch, history, geometry, enabled, False)
-            metrics = {k: float(v) for k, v in module.model.DDPM.last_loss_metrics.items()
-                       if isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1)}
-            records.append({**metrics, "t": t, "condition": name, "loss_total": float(loss)})
+        for satellite_blind in satellite_arms:
+            for name, history, geometry, enabled in conditions:
+                # Pins current VAE sampling as well as preserving the training RNG.
+                with torch.random.fork_rng(devices=devices):
+                    torch.manual_seed(seed)
+                    with torch.no_grad(), autocast(enabled=amp), pinned_denoising(module.model.DDPM, t, seed + 1):
+                        loss = module(batch, history, geometry, enabled, bool(satellite_blind))
+                metrics = {k: float(v) for k, v in module.model.DDPM.last_loss_metrics.items()
+                           if isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1)}
+                records.append({**metrics, "t": t, "condition": name,
+                                "satellite_blind": bool(satellite_blind),
+                                "loss_total": float(loss)})
     return records
 
 
