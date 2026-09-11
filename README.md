@@ -25,9 +25,20 @@
   - [:four: Test and visualization](#four-test-and-visualization)
   - [:five: Train](#five-train)
   - [:six: Evaluate](#six-evaluate)
+- [:movie_camera: Temporal experiments](#movie_camera-temporal-experiments)
 - [:fire: Citation](#fire-citation)
 - [:sparkles: Acknowledgement](#sparkles-acknowledgement)
 - [:heart: Contact](#heart-contact)
+
+## :movie_camera: Temporal experiments
+
+Consecutive-frame consistency work lives on the `temporal-model` branch:
+
+- `docs/temporal_design_map.md` — the design that is live now, its call chain,
+  the history on/off contract and the open on/off question.
+- `docs/temporal_history.md` — measured results of every temporal design tried
+  so far. The v0/v1/v2 code was deleted on 2026-09-11; this file is their record.
+
 
 ## :one: Dependencies and installation
 ```bash
