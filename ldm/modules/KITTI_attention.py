@@ -897,23 +897,17 @@ class RayAlignedEvidenceAttention(nn.Module):
         return sat_null_ref + mask * lidar_correction
 
 
-class TemporalEvidenceHub:
-    """Carries per-step temporal payloads to fusion/attention modules.
+class HistoryEvidenceHub:
+    """Carries the per-frame history payload to the history attention modules.
 
-    Payload fields (any may be absent):
-      transport          — v1 latent homography transport (callable)
-      strength           — v1 feature multiplier
-      sat_tokens_prev    — route-C: previous frame's satellite patch tokens
-                           (b, 196, ctx), class/dynamic tokens excluded
-      sat_shift_xy       — route-C: (b, 2) ego-motion shift of this frame's
-                           satellite crop center inside the previous crop,
-                           normalized crop coords
-      sat_token_grid     — route-C: (14, 14)
-      history_tokens     — v2/v3: previous-frame latent features
-      history_grid       — v3: current query anchors in previous history map
+    Payload fields:
+      history_tokens     — previous-frame latent features, (b, T, C_h)
+      history_hw         — previous history feature map size (H, W)
+      has_history        — False routes the learned null token instead, and the
+                           attention residual is multiplied by an exact zero
+      history_grid       — current query anchors in the previous history map,
                            grid_sample coords, align_corners=False
-      history_valid      — v3: valid geometry correspondences for anchors
-      history_hw         — v2/v3: previous history feature map size
+      history_valid      — valid geometry correspondences for those anchors
 
     Modules hold a reference to the hub, so no UNet forward signature changes.
     """
@@ -931,92 +925,6 @@ class TemporalEvidenceHub:
         return self.payload is not None
 
 
-class SatTemporalReferenceAttention(nn.Module):
-    """Spatiotemporally-local reference attention over the previous frame's
-    satellite patch tokens.
-
-    Every frame's satellite condition is a camera-centered, heading-aligned
-    crop of one georeferenced map, so consecutive crops overlap almost fully
-    and differ by a known ego-motion shift. Each latent query attends to the
-    previous frame's satellite tokens in a small window around the
-    geometrically corresponding patch — a spatiotemporal generalization of
-    LocalReferenceCrossAttention. The out projection is zero-initialised:
-    the stream is exactly inert at the start and grows only where gradients
-    ask for it.
-    """
-
-    def __init__(self, query_dim, context_dim, heads, dim_head, dropout=0.0, reference_window=3):
-        super().__init__()
-        inner = heads * dim_head
-        self.heads = heads
-        self.dim_head = dim_head
-        self.scale = dim_head ** -0.5
-        self.norm_q = nn.LayerNorm(query_dim)
-        self.norm_kv = nn.LayerNorm(context_dim)
-        self.to_q = nn.Linear(query_dim, inner, bias=False)
-        self.to_k = nn.Linear(context_dim, inner, bias=False)
-        self.to_v = nn.Linear(context_dim, inner, bias=False)
-        self.to_out = zero_module(nn.Linear(inner, query_dim))
-        self.reference_window = max(1, int(reference_window))
-        self.last_conf_mean = None
-
-    def _window_grid(self, query_hw, token_hw, device, dtype):
-        qh, qw = int(query_hw[0]), int(query_hw[1])
-        th, tw = int(token_hw[0]), int(token_hw[1])
-        qx = torch.linspace(-1.0, 1.0, qw, device=device, dtype=dtype).view(1, qw).expand(qh, qw)
-        qy = torch.linspace(-1.0, 1.0, qh, device=device, dtype=dtype).view(qh, 1).expand(qh, qw)
-        radius = self.reference_window // 2
-        step_x = 2.0 / max(tw - 1, 1)
-        step_y = 2.0 / max(th - 1, 1)
-        offsets = [
-            (ox * step_x, oy * step_y)
-            for oy in range(-radius, radius + 1)
-            for ox in range(-radius, radius + 1)
-        ]
-        base = torch.stack([qx.reshape(-1), qy.reshape(-1)], dim=-1).unsqueeze(1)  # (N,1,2)
-        off = torch.tensor(offsets, device=device, dtype=dtype).view(1, len(offsets), 2)
-        return base + off  # (N, K, 2); clamped after the per-sample shift
-
-    def forward(self, x, sat_tokens_prev, shift_xy, token_grid=(14, 14), query_hw=None):
-        """x: (b, N, c) latent queries. sat_tokens_prev: (b, T, ctx) previous
-        frame's satellite patch tokens WITHOUT class/dynamic tokens.
-        shift_xy: (b, 2) ego-motion shift of this frame's crop center inside
-        the previous crop, in normalized crop coordinates (+x right, +y down).
-        Returns (b, N, c) or None when no previous tokens exist.
-        """
-        if sat_tokens_prev is None:
-            return None
-        b, n, c = x.shape
-        th, tw = int(token_grid[0]), int(token_grid[1])
-        qh, qw = (int(query_hw[0]), int(query_hw[1])) if query_hw is not None else (th, tw)
-        grid = self._window_grid((qh, qw), (th, tw), x.device, x.dtype)  # (N, K, 2)
-        grid = grid.unsqueeze(0).expand(b, -1, -1, -1) + shift_xy.to(grid.dtype).view(b, 1, 1, 2)
-        grid = grid.clamp(-1.0, 1.0)
-
-        kt = self.to_k(self.norm_kv(sat_tokens_prev)).transpose(1, 2).reshape(b, -1, th, tw).to(grid.dtype)
-        vt = self.to_v(self.norm_kv(sat_tokens_prev)).transpose(1, 2).reshape(b, -1, th, tw).to(grid.dtype)
-        ks = torch.nn.functional.grid_sample(kt, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        vs = torch.nn.functional.grid_sample(vt, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        win = self.reference_window ** 2  # KxK window around the query patch
-        # grid_sample output: (b, inner, N, win). Group inner into heads:
-        # (b, heads, dh, N, win) -> per-head window attention.
-        K = ks.reshape(b, self.heads, self.dim_head, qh * qw, win)
-        V = vs.reshape(b, self.heads, self.dim_head, qh * qw, win)
-
-        q = self.to_q(self.norm_q(x)).to(K.dtype)  # (b, N, inner)
-        q = q.view(b, qh * qw, self.heads, self.dim_head).permute(0, 2, 1, 3)  # (b, heads, N, dh)
-        q = q.reshape(b * self.heads, qh * qw, 1, self.dim_head)
-        Kw = K.permute(0, 1, 3, 4, 2).reshape(b * self.heads, qh * qw, win, self.dim_head)
-        Vw = V.permute(0, 1, 3, 4, 2).reshape(b * self.heads, qh * qw, win, self.dim_head)
-        attn = torch.softmax(q @ Kw.transpose(-1, -2) * self.scale, dim=-1)  # (b*heads, N, 1, win)
-        out = (attn @ Vw).reshape(b, self.heads, qh * qw, self.dim_head)
-        out = out.permute(0, 2, 1, 3).reshape(b, qh * qw, -1)
-        out = self.to_out(out.to(x.dtype))
-        with torch.no_grad():
-            self.last_conf_mean = float(attn.detach().float().max(dim=-1).values.mean())
-        return out
-
-
 class RayPosteriorEvidenceFusion(nn.Module):
     """Preserve the posterior satellite path and add LiDAR as independent evidence."""
 
@@ -1026,19 +934,9 @@ class RayPosteriorEvidenceFusion(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.lidar_gate = zero_module(nn.Linear(dim, 1))
         nn.init.constant_(self.lidar_gate.bias, float(lidar_gate_bias))
-        self.temporal_gate = None
         self.register_buffer("last_lidar_confidence", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_lidar_mask_mean", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_lidar_message_ratio", torch.tensor(0.0), persistent=False)
-
-    def enable_temporal(self, gate_bias=-6.0):
-        """Add the third (temporal) evidence stream. Zero-initialised weights
-        and a strongly negative bias keep the stream inert at the start, so
-        enabling is a no-op on the frozen single-frame behaviour."""
-        if self.temporal_gate is None:
-            self.temporal_gate = zero_module(nn.Linear(self.dim, 1))
-            nn.init.constant_(self.temporal_gate.bias, float(gate_bias))
-            self.register_buffer("last_temporal_confidence", torch.tensor(0.0), persistent=False)
 
     @staticmethod
     def _prepare_mask(mask, x, query_hw=None):
@@ -1062,7 +960,7 @@ class RayPosteriorEvidenceFusion(nn.Module):
             return x.new_zeros((x.shape[0], x.shape[1], 1))
         return mask.to(device=x.device, dtype=x.dtype).clamp(0.0, 1.0)
 
-    def forward(self, x, sat_ref, lidar_ref, query_hw=None, lidar_geometry_mask=None, temporal_ref=None, temporal_validity=None, sat_temporal_ref=None):
+    def forward(self, x, sat_ref, lidar_ref, query_hw=None, lidar_geometry_mask=None):
         if sat_ref is None:
             sat_ref = torch.zeros_like(x)
         if lidar_ref is None:
@@ -1071,12 +969,6 @@ class RayPosteriorEvidenceFusion(nn.Module):
         learned_confidence = torch.sigmoid(self.lidar_gate(self.norm(x + sat_ref + lidar_ref)))
         lidar_confidence = geometry_confidence * learned_confidence
         lidar_message = lidar_confidence * lidar_ref
-
-        temporal_message = None
-        if self.temporal_gate is not None and temporal_ref is not None:
-            temporal_validity = self._prepare_mask(temporal_validity, x, query_hw=query_hw)
-            temporal_confidence = torch.sigmoid(self.temporal_gate(self.norm(x + sat_ref + temporal_ref)))
-            temporal_message = temporal_validity * temporal_confidence * temporal_ref
 
         with torch.no_grad():
             self.last_lidar_confidence.copy_(
@@ -1087,21 +979,7 @@ class RayPosteriorEvidenceFusion(nn.Module):
             )
             ratio = lidar_message.float().norm(dim=-1).mean() / sat_ref.float().norm(dim=-1).mean().clamp_min(1e-6)
             self.last_lidar_message_ratio.copy_(ratio.to(self.last_lidar_message_ratio.device))
-            if temporal_message is not None:
-                self.last_temporal_confidence.copy_(
-                    (temporal_validity * temporal_confidence).float().mean().to(self.last_temporal_confidence.device)
-                )
-        if sat_temporal_ref is not None:
-            # Route-C stream: the attention's out projection is zero-initialised,
-            # so an additive merge is exactly inert at the start — no gate to
-            # slowly open (the v1 lesson), the gradient scales the weights.
-            out = sat_ref + lidar_message
-            if temporal_message is not None:
-                out = out + temporal_message
-            return out + sat_temporal_ref
-        if temporal_message is None:
-            return sat_ref + lidar_message
-        return sat_ref + lidar_message + temporal_message
+        return sat_ref + lidar_message
 
 
 class BasicTransformerBlock(nn.Module):
@@ -1129,11 +1007,7 @@ class BasicTransformerBlock(nn.Module):
         super().__init__()
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.temporal_hub = None
-        self.last_fused_delta = None
-        self.frozen_fused_delta = None
-        self.sat_temporal_attn = None
-        self._sat_payload_cache = None
+        self.history_hub = None
         self.history_attn = None
         self.history_ratio = None
         self.attn2 = CrossAttention(
@@ -1183,58 +1057,11 @@ class BasicTransformerBlock(nn.Module):
                 )
                 self.ray_posterior_fusion = None
 
-    def _build_temporal(self, latent_hw, x):
-        """Consume the previous frame's cached fused posterior, transported to
-        this module's resolution. Called OUTSIDE gradient checkpointing so the
-        recompute pass sees identical tensors; the cache itself is never
-        touched here."""
-        payload = self.temporal_hub.payload if self.temporal_hub is not None else None
-        delta = self.frozen_fused_delta if self.frozen_fused_delta is not None else self.last_fused_delta
-        if payload is None or delta is None or "transport" not in payload:
-            return None, None
-        b, n, c = x.shape
-        h, w = int(latent_hw[0]), int(latent_hw[1])
-        grid, validity = payload["transport"]((h, w), x.device, x.dtype)
-        delta_map = delta.reshape(b, h, w, c).permute(0, 3, 1, 2)
-        warped = F.grid_sample(
-            delta_map, grid.to(dtype=delta_map.dtype), mode="bilinear", padding_mode="zeros", align_corners=False
-        )
-        temporal_ref = warped.permute(0, 2, 3, 1).reshape(b, n, c)
-        strength = float(payload.get("strength", 1.0))
-        if strength != 1.0:
-            temporal_ref = temporal_ref * strength
-        return temporal_ref, validity
-
-    def _build_sat_temporal(self, latent_hw, x):
-        """Route-C payload fetch, outside checkpointing: previous frame's
-        satellite tokens + this frame's ego-motion shift. Snapshot semantics:
-        payload data is stashed once per frame boundary and reused for every
-        DDIM step of the frame."""
-        payload = self.temporal_hub.payload if self.temporal_hub is not None else None
-        if payload is None or self.sat_temporal_attn is None:
-            return None
-        if "sat_tokens_prev" not in payload or payload.get("sat_tokens_prev") is None:
-            return None
-        key = (id(payload), )
-        if self._sat_payload_cache is not None and self._sat_payload_cache[0] == key:
-            pack = self._sat_payload_cache[1]
-        else:
-            pack = {
-                "tokens": payload["sat_tokens_prev"],
-                "shift": payload.get("sat_shift_xy"),
-                "grid": payload.get("sat_token_grid", (14, 14)),
-            }
-            self._sat_payload_cache = (key, pack)
-        import os as _os
-        if _os.environ.get("SAT_TEMPORAL_DEBUG"):
-            print(f"[sat-dbg] fetch tokens={pack['tokens'].shape} "
-                  f"requires_grad={pack['tokens'].requires_grad} data_ptr={pack['tokens'].data_ptr()}", flush=True)
-        return pack
-
     def _build_history_pack(self):
-        """v2 history payload fetch (pre-checkpoint, like the v1/route-C packs).
-        No cross-step caching: tokens are freshly built per frame boundary."""
-        payload = self.temporal_hub.payload if self.temporal_hub is not None else None
+        """History payload fetch. Called outside gradient checkpointing so the
+        recompute pass sees identical tensors; no cross-step caching, the
+        payload is rebuilt once per frame boundary."""
+        payload = self.history_hub.payload if self.history_hub is not None else None
         if payload is None or self.history_attn is None or "history_tokens" not in payload:
             return None
         pack = {
@@ -1251,23 +1078,13 @@ class BasicTransformerBlock(nn.Module):
 
     def forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
         if self.use_lidar_cross_attention and lidar_context is not None:
-            temporal_ref, temporal_validity = self._build_temporal(latent_hw, x)
-            sat_pack = self._build_sat_temporal(latent_hw, x)
             hist_pack = self._build_history_pack()
-            out = checkpoint(
+            return checkpoint(
                 self._forward,
-                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, temporal_ref, temporal_validity, sat_pack, hist_pack),
+                (x, context, lidar_context, lidar_evidence, lidar_geometry_mask, latent_hw, left_camera_k, gt_shift_x, gt_shift_y, theta, hist_pack),
                 self.parameters(),
                 self.checkpoint,
             )
-            # Promote outside the checkpointed region: a recompute pass may
-            # overwrite _pending_delta, but the recomputed value is identical
-            # (checkpoint preserves RNG), so promotion is re-run safe.
-            pending = getattr(self, "_pending_delta", None)
-            if pending is not None:
-                self.last_fused_delta = pending
-                self._pending_delta = None
-            return out
         return checkpoint(
             self._forward_without_lidar,
             (x, context, left_camera_k, gt_shift_x, gt_shift_y, theta),
@@ -1281,7 +1098,7 @@ class BasicTransformerBlock(nn.Module):
         x = self.ff(self.norm3(x)) + x
         return x
 
-    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, temporal_ref=None, temporal_validity=None, sat_pack=None, hist_pack=None):
+    def _forward(self, x, context=None, lidar_context=None, lidar_evidence=None, lidar_geometry_mask=None, latent_hw=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, hist_pack=None):
         x = self.attn1(self.norm1(x)) + x
         x_base = x
         sat_delta = self.attn2(
@@ -1294,19 +1111,6 @@ class BasicTransformerBlock(nn.Module):
             ray_depth_evidence=lidar_evidence,
         )
         lidar_delta = self.attn_lidar(self.norm_lidar(x_base), lidar_context, query_hw=latent_hw)
-        sat_temporal_delta = None
-        if sat_pack is not None:
-            n = x_base.shape[1]
-            qh = int(latent_hw[0]) if latent_hw is not None else 16
-            qw = n // qh
-            sat_temporal_delta = self.sat_temporal_attn(
-                x_base, sat_pack["tokens"], sat_pack["shift"],
-                token_grid=sat_pack["grid"], query_hw=(qh, qw),
-            )
-            import os as _os
-            if _os.environ.get("SAT_TEMPORAL_DEBUG") and sat_temporal_delta is not None:
-                print(f"[sat-dbg] fwd delta requires_grad={sat_temporal_delta.requires_grad} "
-                      f"absmax={float(sat_temporal_delta.abs().max())}", flush=True)
         if self.ray_fusion_mode == "ray_posterior":
             fused_delta = self.ray_posterior_fusion(
                 self.norm_evidence(x_base),
@@ -1314,9 +1118,6 @@ class BasicTransformerBlock(nn.Module):
                 lidar_delta,
                 query_hw=latent_hw,
                 lidar_geometry_mask=lidar_geometry_mask,
-                temporal_ref=temporal_ref,
-                temporal_validity=temporal_validity,
-                sat_temporal_ref=sat_temporal_delta,
             )
         else:
             fused_delta = self.ray_evidence_attn(
@@ -1326,29 +1127,21 @@ class BasicTransformerBlock(nn.Module):
                 query_hw=latent_hw,
                 lidar_geometry_mask=lidar_geometry_mask,
             )
-        # v2 history readout: the query sees the current conditions' fused
-        # summary (detached — routing signal only), the residual is added on
-        # top of the fused delta. Zero-init keeps this inert until trained.
+        # History readout: the query sees the current conditions' fused summary
+        # (detached — routing signal only) and the residual is added on top of
+        # the fused delta. Without history the module returns an exact zero.
         hist_delta = None
         if hist_pack is not None and self.history_attn is not None:
-            if getattr(self.history_attn, "uses_geometry", False):
-                hist_delta = self.history_attn(
-                    x_base,
-                    fused_delta.detach(),
-                    hist_pack["history_tokens"],
-                    has_history=hist_pack["has_history"],
-                    history_grid=hist_pack.get("history_grid"),
-                    history_valid=hist_pack.get("history_valid"),
-                    query_hw=latent_hw,
-                    history_hw=hist_pack.get("history_hw"),
-                )
-            else:
-                hist_delta = self.history_attn(
-                    x_base,
-                    fused_delta.detach(),
-                    hist_pack["history_tokens"],
-                    has_history=hist_pack["has_history"],
-                )
+            hist_delta = self.history_attn(
+                x_base,
+                fused_delta.detach(),
+                hist_pack["history_tokens"],
+                has_history=hist_pack["has_history"],
+                history_grid=hist_pack.get("history_grid"),
+                history_valid=hist_pack.get("history_valid"),
+                query_hw=latent_hw,
+                history_hw=hist_pack.get("history_hw"),
+            )
         if hist_delta is not None:
             with torch.no_grad():
                 denom = float(fused_delta.detach().float().norm(dim=-1).mean())
@@ -1359,12 +1152,6 @@ class BasicTransformerBlock(nn.Module):
         else:
             x = x_base + fused_delta
         x = self.ff(self.norm3(x)) + x
-        # Stash the fused posterior for the next frame's temporal evidence.
-        # The caller (forward) promotes it to last_fused_delta OUTSIDE the
-        # checkpointed region, so gradient-checkpoint recomputes can never
-        # corrupt the previous frame's cache.
-        if self.temporal_hub is not None and self.ray_fusion_mode == "ray_posterior":
-            self._pending_delta = fused_delta.detach()
         return x
 
 

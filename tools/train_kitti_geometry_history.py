@@ -1,14 +1,26 @@
-"""Small geometry-local history adapter, with drive-held-out fixed probes.
+"""Geometry-local history adapter (temporal v3, live design), with drive-held-out
+fixed probes.
 
-The frozen CFG backbone and old temporal experiments are not modified. Each
-rank uses one frame pair; only encoder/selected history attention are trained.
-Geometry injection defaults to after-bottleneck decoder fusion so the history
-residual is not a depth-feature channel. Appearance is transported by a
-non-zero bilinear skip at projected cells; invalid cells stay exact zero.
-Generator mode additionally reads previous RGB latent as temporal K/V, unfreezes
-the host feed-forward tail, and adds a masked x0 appearance loss.
+The frozen CFG backbone and the paused v1/v2 temporal experiments are not
+modified. Each rank uses one frame pair; only the history encoder and the
+selected history attention are trained, plus optionally the host feed-forward
+tail.
+
+Current design (Stage F, see docs/temporal_design_map.md):
+  - history is the previous frame's RGB latent, read as temporal K/V by
+    GeometryHistoryAttention, gated by the LiDAR/pose correspondence;
+  - injection is the finest 640-d decoder fusion block (after the bottleneck
+    depth head), so the residual is not a depth-feature channel;
+  - the history encoder output is used in every step, including the no-history
+    condition, which routes it through a learned null token and multiplies the
+    residual by an exact zero (first frames stay identical to single-frame);
+  - --unfreeze-host trains the injected block's ff/norm3 so generation can act
+    on the retrieved appearance, and --appearance-x0-weight adds a masked
+    reconstruction term (current-frame x0 on correspondence cells, not a
+    previous-frame colour identity loss).
 """
 import argparse
+from collections import defaultdict
 from contextlib import contextmanager
 import hashlib
 import json
@@ -35,8 +47,6 @@ from omegaconf import OmegaConf
 from dataloader.KITTI_raw_sat_lidar import SatLidarRawDataset
 from utils.util import instantiate_from_config
 from generate_kitti_raea_samples import load_checkpoint_into_model
-from train_kitti_temporal import build_stream_plan, move_batch_to_device
-from train_kitti_temporal_v2 import grad_l2
 from train_kitti_raea import synchronized_loss_finite
 from temporal_history import (
     AFTER_BOTTLENECK,
@@ -49,6 +59,56 @@ from temporal_history import (
 from temporal_history_geometry import build_pair_geometry
 
 MODE_GENERATOR = "geometry_history_v1_generator"
+
+
+def build_stream_plan(rows):
+    """Ordered (prev_idx, cur_idx, cache_valid) triples.
+
+    Each drive is split into maximal strictly-consecutive frame runs. The
+    geometry history trainer consumes only prev/cur; cache_valid is carried for
+    compatibility with the streaming contract it was introduced for.
+    """
+    by_drive = defaultdict(list)
+    for i, r in enumerate(rows):
+        try:
+            fi = int(r["frame_index"])
+        except (KeyError, ValueError):
+            continue
+        by_drive[r.get("drive")].append((fi, i))
+
+    def emit_run(run, out):
+        for k in range(1, len(run)):
+            out.append((run[k - 1], run[k], k > 1))
+
+    plan = []
+    for drive in sorted(by_drive):
+        idxs = [i for _, i in sorted(by_drive[drive])]
+        run = []
+        for k, i in enumerate(idxs):
+            if run and int(rows[i]["frame_index"]) - int(rows[run[-1]]["frame_index"]) != 1:
+                emit_run(run, plan)
+                run = []
+            run.append(i)
+        emit_run(run, plan)
+    return plan
+
+
+def move_batch_to_device(batch, device):
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {k: move_batch_to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(move_batch_to_device(v, device) for v in batch)
+    return batch
+
+
+def grad_l2(parameters):
+    total = 0.0
+    for param in parameters:
+        if param.grad is not None:
+            total += float(param.grad.detach().float().square().sum())
+    return total ** 0.5
 
 
 def split_drive_pairs(rows, val_drives=None):
@@ -259,7 +319,7 @@ def main():
     model = instantiate_from_config(cfg.model).cuda().eval()
     load_checkpoint_into_model(model, args.ckpt)
     hub, encoder, blocks = enable_history_attention(
-        model, geometry=True, block_indices=index_spec,
+        model, block_indices=index_spec,
         history_dim=args.history_dim, heads=4, dim_head=32)
     indices = tuple(block.history_block_index for block in blocks)
     model.cuda().eval()

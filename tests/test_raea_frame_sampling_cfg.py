@@ -1,14 +1,14 @@
-"""Check CFG wiring without loading a checkpoint or using CUDA."""
+"""Check CFG wiring of the shared frame sampler without a checkpoint or CUDA."""
 from types import SimpleNamespace
 from unittest.mock import Mock
 import unittest
 
 import torch
 
-from tools.generate_kitti_raea_noise_modes import sample_frame
+from tools.raea_frame_sampling import sample_frame
 
 
-class NoiseModesCFGTest(unittest.TestCase):
+class FrameSamplingCFGTest(unittest.TestCase):
     def setUp(self):
         self.latent = torch.zeros(1, 4, 2, 2)
         self.sampler = SimpleNamespace(ddim_sampling=Mock(return_value=(self.latent, {})))

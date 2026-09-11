@@ -282,20 +282,13 @@ def encode_rgb_history_latent(model, target):
 def enable_geometry_history_attention(model, args, payload=None):
     from temporal_history import AFTER_BOTTLENECK, enable_history_attention
 
-    try:
-        hub, encoder, blocks = enable_history_attention(
-            model,
-            geometry=True,
-            block_indices=args.block_indices,
-            history_dim=args.history_dim,
-            heads=args.heads,
-            dim_head=args.dim_head,
-        )
-    except TypeError as exc:
-        raise RuntimeError(
-            "temporal_history.enable_history_attention must support "
-            "geometry=True and block_indices for geometry-history rollout"
-        ) from exc
+    hub, encoder, blocks = enable_history_attention(
+        model,
+        block_indices=args.block_indices,
+        history_dim=args.history_dim,
+        heads=args.heads,
+        dim_head=args.dim_head,
+    )
     args.block_indices = tuple(block.history_block_index for block in blocks)
     return hub, encoder, blocks
 
@@ -356,9 +349,10 @@ def main():
         make_condition_rgb,
         make_lidar_overlay,
         make_panel,
+        sample_to_batch,
         save_tensor_image,
     )
-    from generate_kitti_raea_noise_modes import prepare_frame_inputs, sample_frame, sample_to_batch
+    from raea_frame_sampling import prepare_frame_inputs, sample_frame
     from temporal_history_geometry import build_pair_geometry
 
     args = parse_args()
