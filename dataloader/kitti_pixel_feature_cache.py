@@ -1,5 +1,6 @@
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
@@ -8,6 +9,8 @@ import numpy as np
 
 PIXEL_CACHE_FORMAT = "kitti_utonia_pixel_cache_v1"
 PIXEL_MEMMAP_FORMAT = "kitti_pixel_feature_ragged_memmap_v1"
+PIXEL_CACHE_KIND_NPZ = "npz"
+PIXEL_CACHE_KIND_RAGGED_MEMMAP = "ragged_memmap"
 PIXEL_FEATURE_KEY = "utonia_pixel_features"
 PIXEL_INDEX_KEY = "pixel_index"
 PIXEL_DEPTH_KEY = "depth"
@@ -321,7 +324,7 @@ def preflight_pixel_ragged_cache(
     root = Path(root)
     meta_path = root / PixelFeatureRaggedMemmapCache.META_NAME
     if not meta_path.is_file():
-        raise FileNotFoundError(f"Required pixel ragged memmap metadata not found: {meta_path}")
+        return preflight_pixel_npz_cache(root, feature_dim, image_size, manifests)
     meta = json.loads(meta_path.read_text())
     validate_pixel_ragged_memmap_meta(meta, root, feature_dim, image_size)
     features = np.load(root / meta["features_file"], mmap_mode="r", allow_pickle=False)
@@ -342,7 +345,51 @@ def preflight_pixel_ragged_cache(
             f"examples: {examples}"
         )
     return {
+        "lidar_pixel_cache_format": PIXEL_CACHE_KIND_RAGGED_MEMMAP,
         "lidar_pixel_cache_rows": len(index),
+        "lidar_pixel_cache_required_rows": len(required_ids),
+        "lidar_pixel_cache_total_points": total_points,
+        "lidar_pixel_cache_root": str(root),
+    }
+
+
+def preflight_pixel_npz_cache(
+    root: Path,
+    feature_dim: int,
+    image_size: Tuple[int, int],
+    manifests: Iterable[object] = (),
+) -> Dict[str, object]:
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Required pixel NPZ cache root not found: {root}")
+    required_ids = required_safe_ids_from_manifests(manifests)
+    if required_ids:
+        sample_ids = sorted(required_ids)
+    else:
+        sample_ids = sorted(path.stem for path in root.glob("*.npz"))
+    if not sample_ids:
+        raise FileNotFoundError(f"No pixel NPZ cache files found in: {root}")
+
+    paths = [root / f"{safe_id}.npz" for safe_id in sample_ids]
+    missing = [path.stem for path in paths if not path.is_file()]
+    if missing:
+        examples = ", ".join(missing[:5])
+        raise RuntimeError(
+            f"pixel NPZ cache misses {len(missing)}/{len(sample_ids)} required samples; "
+            f"examples: {examples}"
+        )
+
+    def validate_and_count(path):
+        arrays = load_npz_pixel_cache(path, image_size, feature_dim)
+        return int(arrays[PIXEL_INDEX_KEY].shape[0])
+
+    # Only eight frames are inflated at once; futures return counts, not arrays.
+    # Decompression/NumPy checks release the GIL and avoid a long DDP startup wait.
+    with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
+        total_points = sum(pool.map(validate_and_count, paths))
+    return {
+        "lidar_pixel_cache_format": PIXEL_CACHE_KIND_NPZ,
+        "lidar_pixel_cache_rows": len(sample_ids),
         "lidar_pixel_cache_required_rows": len(required_ids),
         "lidar_pixel_cache_total_points": total_points,
         "lidar_pixel_cache_root": str(root),

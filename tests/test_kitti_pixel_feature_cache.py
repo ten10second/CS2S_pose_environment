@@ -140,6 +140,48 @@ class KittiPixelFeatureCacheTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 convert_pixel_cache(source, output, (4, 4), feature_dim=2, workers=1)
 
+    def test_npz_preflight_streams_required_manifest_samples(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "npz"
+            root.mkdir()
+            manifest = Path(temp_dir) / "manifest.jsonl"
+            manifest.write_text(
+                "\n".join(
+                    json.dumps({"sample_id": sample_id})
+                    for sample_id in ("drive/frame0", "drive/frame1")
+                )
+            )
+            for frame, depth in (("frame0", 4.0), ("frame1", 6.0)):
+                payload = {
+                    PIXEL_FEATURE_KEY: np.ones((1, 2), dtype=np.float16),
+                    PIXEL_INDEX_KEY: np.asarray([0], dtype=np.int64),
+                    PIXEL_DEPTH_KEY: np.asarray([depth], dtype=np.float32),
+                }
+                np.savez(
+                    root / f"drive__{frame}.npz",
+                    format=np.asarray(PIXEL_CACHE_FORMAT),
+                    image_height=4,
+                    image_width=4,
+                    **payload,
+                )
+
+            stats = preflight_pixel_ragged_cache(root, feature_dim=2, image_size=(4, 4), manifests=[manifest])
+
+            self.assertEqual(stats["lidar_pixel_cache_format"], "npz")
+            self.assertEqual(stats["lidar_pixel_cache_rows"], 2)
+            self.assertEqual(stats["lidar_pixel_cache_required_rows"], 2)
+            self.assertEqual(stats["lidar_pixel_cache_total_points"], 2)
+
+    def test_npz_preflight_fails_on_missing_manifest_sample(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "npz"
+            root.mkdir()
+            manifest = Path(temp_dir) / "manifest.jsonl"
+            manifest.write_text(json.dumps({"sample_id": "drive/frame0"}))
+
+            with self.assertRaisesRegex(RuntimeError, "pixel NPZ cache misses"):
+                preflight_pixel_ragged_cache(root, feature_dim=2, image_size=(4, 4), manifests=[manifest])
+
     def test_ragged_memmap_rejects_corrupt_offsets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

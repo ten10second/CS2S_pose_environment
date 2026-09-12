@@ -27,7 +27,7 @@ Pixel cache memmap uses ragged visible-pixel storage:
 - format: `kitti_pixel_feature_ragged_memmap_v1`
 - arrays: `features.npy`, `pixel_index.npy`, `depth.npy`, `offsets.npy`
 
-The training launcher validates this ragged metadata and manifest coverage. It does not expect dense `kitti_feature_memmap_v1` feature/mask files.
+The training launcher accepts this ragged format or the original lossless per-frame NPZ directory. NPZ preflight validates every required sample using at most eight concurrent decompressions, returning only counts; in DDP, rank 0 validates once and broadcasts the result. Neither path expects dense `kitti_feature_memmap_v1` feature/mask files.
 
 The old V2 8x32 semantic cache cannot be converted back into V2.1 pixel features: its per-point feature identity has been averaged away. V2's separate 128x512 depth/hit evidence still exists. Rebuild the semantic cache from the original single-scan point features.
 
@@ -49,7 +49,7 @@ The launcher is guarded and exits without starting training unless `RUN_V21_PIXE
 
 ## Build pixel features before a full run
 
-Use the Utonia environment for extraction and the training environment for conversion/training. Run extraction separately on the final train and test manifests, writing into the same pixel NPZ directory. `--num-shards` / `--shard-index` partition extraction when needed; `--skip-existing` resumes extraction. Then convert once into an empty ragged-cache directory:
+Use the Utonia environment for extraction and the training environment for conversion/training. Run extraction separately on the final train and test manifests, writing into the same pixel NPZ directory. `--num-shards` / `--shard-index` partition extraction when needed; `--skip-existing` resumes extraction. The NPZ directory can be used directly as the training pixel cache. If storage permits and mmap is preferred, optionally convert once into an empty ragged-cache directory:
 
 ```bash
 python tools/build_kitti_utonia_pixel_cache.py \
@@ -80,3 +80,20 @@ Validation on the server's ControlS2S environment:
 - The saved checkpoint generated finite 128x512 RGB outputs with two DDIM steps and guidance 7.5. Both satellite branches ran with batch 2; all four LiDAR pyramid levels were duplicated correctly. All four spatial projections produced nonzero messages with normal input and exactly zero messages with the zero-LiDAR probe.
 
 Server validation artifacts are under `/home/shizhm/CS2S_run_control/v21_validation_20260912/` (`tests_final.log`, `ddp_amp_2step.log`, `check_cfg.py`, `cfg_smoke_report.json`). These are functional checks on one training sample, not evidence of generation quality or geometric improvement. The full pixel cache has not been built, and full V2/V2.1 training remains stopped.
+
+
+## Full training and supervision monitoring
+
+The four-card launcher now defaults to the lossless NPZ cache under `/home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_all_fp16`. The 64-frame size audit estimated 476.8 GiB for uncompressed all-split pixel arrays, while one representative compressed NPZ was 1.25 MiB. This is a storage/I/O change; feature values, depth, masks and the V2.1 network are unchanged. No full memmap is created on the nearly full data disk.
+
+The run remains 0–3 GPUs, 300,000 steps, one sample per rank, AMP, learning rate 1e-5, satellite dropout 0.1, depth weight 0.1, semantic weight 0.2. Checkpoints retain the latest two step files; the output disk floor is 50 GiB. `PIXEL_CACHE_ROOT` and `SAMPLE_MANIFEST` override the server paths. The launcher accepts trailing training CLI overrides for bounded smoke tests or explicit resume.
+
+Monitoring has three separate scopes:
+
+- Train log: depth/semantic losses, observation support, spatial injection strength and AMP skipped steps. These do not prove RGB geometry quality.
+- Fixed training images: every 1,000 steps, normal/zero-LiDAR generations use the same per-image seed, eta 0 and satellite CFG 7.5. AMP sampling is supported with the optimizer still resident, and sampling restores the training RNG state. The diagnostic samples are drawn from the existing training split; they are not a new held-out validation set.
+- `tools/probe_kitti_pixel_supervision.py`: a fresh SD baseline and subsequent checkpoints use fixed training samples, seeds and timesteps `[50,250,500,750]`. The probe captures the actual depth targets/masks passed into `p_losses`, checks invalid zeros before clamping, and checks reconstructed depth loss against training's recorded value. It measures weighted depth and remaining-loss gradients with respect to the shared U-Net bottleneck feature, including their norm ratio and cosine. This is not a gradient ratio over all model parameters. The semantic head is upstream of this bottleneck and has no direct gradient with respect to that feature. The probe performs no optimizer updates.
+
+Server control files are under `/home/shizhm/CS2S_run_control/v21_300k_cfg_20260912/`. A detached supervisor waits for all cache shards and the verified launch marker, runs the initial diagnostic, and then starts training. It records health once per minute and schedules checkpoint probes on GPU 5 only when that GPU is idle. A `user_stop_request.json` stops this pipeline; failures are recorded rather than silently restarting training. No loss weights are changed automatically.
+
+Functional validation of this startup support: the NPZ path completed two-rank AMP training with two data-loader workers per rank, live-optimizer CFG sampling for normal/zero conditions, and checkpoint saving. Both fresh-model and checkpoint supervision probes are checked separately. Long-run supervision benefit and fine-object image geometry remain measurements to be established.

@@ -26,6 +26,12 @@ from tools.train_kitti_raea import (
     validate_memmap_cache,
     validate_pixel_ragged_cache,
 )
+from dataloader.kitti_pixel_feature_cache import (
+    PIXEL_CACHE_FORMAT,
+    PIXEL_DEPTH_KEY,
+    PIXEL_FEATURE_KEY,
+    PIXEL_INDEX_KEY,
+)
 
 
 class _TinyTrainingModel(torch.nn.Module):
@@ -246,7 +252,47 @@ class KittiDistributedTrainingTest(unittest.TestCase):
             np.save(root / "offsets.npy", np.array([0, 2, 3], dtype=np.int64))
             (root / "pixel_memmap_meta.json").write_text(json.dumps(metadata))
             stats = validate_pixel_ragged_cache(root, 576, (128, 512), [manifest])
+            self.assertEqual(stats["lidar_pixel_cache_format"], "ragged_memmap")
             self.assertEqual(stats["lidar_pixel_cache_required_rows"], 2)
+
+    def test_pixel_npz_cache_must_cover_every_manifest_sample(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "npz"
+            root.mkdir()
+            manifest = Path(temp_dir) / "train.jsonl"
+            manifest.write_text(
+                "\n".join(
+                    json.dumps({"sample_id": sample_id})
+                    for sample_id in ("drive/frame0", "drive/frame1")
+                )
+            )
+            payload = {
+                PIXEL_FEATURE_KEY: np.ones((1, 576), dtype=np.float16),
+                PIXEL_INDEX_KEY: np.asarray([0], dtype=np.int64),
+                PIXEL_DEPTH_KEY: np.asarray([8.0], dtype=np.float32),
+            }
+            np.savez(
+                root / "drive__frame0.npz",
+                format=np.asarray(PIXEL_CACHE_FORMAT),
+                image_height=128,
+                image_width=512,
+                **payload,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "misses 1/2 required samples"):
+                validate_pixel_ragged_cache(root, 576, (128, 512), [manifest])
+
+            np.savez(
+                root / "drive__frame1.npz",
+                format=np.asarray(PIXEL_CACHE_FORMAT),
+                image_height=128,
+                image_width=512,
+                **payload,
+            )
+            stats = validate_pixel_ragged_cache(root, 576, (128, 512), [manifest])
+            self.assertEqual(stats["lidar_pixel_cache_format"], "npz")
+            self.assertEqual(stats["lidar_pixel_cache_required_rows"], 2)
+            self.assertEqual(stats["lidar_pixel_cache_total_points"], 2)
 
     def test_fresh_run_refuses_non_empty_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:

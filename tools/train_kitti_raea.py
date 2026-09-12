@@ -143,6 +143,8 @@ def parse_args():
         help="Comma-separated inline sample probes. Supported probes: normal,zero.",
     )
     parser.add_argument("--sample-seed", type=int, default=2026)
+    parser.add_argument("--sample-fixed-seed", action="store_true", help="Reuse the same generation noise across checkpoints.")
+    parser.add_argument("--sample-eta", type=float, default=1.0)
     parser.add_argument(
         "--keep-step-checkpoints",
         type=int,
@@ -838,17 +840,26 @@ def run_inline_samples(model, sample_dataset, args, out_dir, step):
             batch = sample_to_batch(sample)
             try:
                 for probe in probes:
-                    pred, _, attention_stats, key_structure_stats = generate_prediction(
-                        model,
-                        batch,
-                        probe=probe,
-                        ddim_steps=int(args.sample_ddim_steps),
-                        seed=int(args.sample_seed) + int(step) + idx,
-                        guidance_scale=7.5,
-                        eta=1.0,
-                        temperature=1.0,
-                        key_stats_max_tokens=256,
-                    )
+                    sample_seed = int(args.sample_seed) + idx
+                    if not getattr(args, "sample_fixed_seed", False):
+                        sample_seed += int(step)
+                    # Monitoring must not change subsequent training noise, and
+                    # AMP sampling must fit alongside the live optimizer state.
+                    rng_devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+                    with torch.random.fork_rng(devices=rng_devices), autocast(
+                        enabled=bool(args.amp and torch.cuda.is_available())
+                    ):
+                        pred, _, attention_stats, key_structure_stats = generate_prediction(
+                            model,
+                            batch,
+                            probe=probe,
+                            ddim_steps=int(args.sample_ddim_steps),
+                            seed=sample_seed,
+                            guidance_scale=7.5,
+                            eta=float(getattr(args, "sample_eta", 1.0)),
+                            temperature=1.0,
+                            key_stats_max_tokens=256,
+                        )
                     pred_path = sample_out / "images" / probe / f"{safe_id}.png"
                     save_tensor_image(pred[0], pred_path)
                     image_paths[f"trained:{probe}"] = pred_path
@@ -1229,9 +1240,36 @@ def validate_pixel_ragged_cache(root, feature_dim, image_size, manifests):
     return preflight_pixel_ragged_cache(root, feature_dim, image_size, manifests)
 
 
+def validate_pixel_cache_distributed(root, feature_dim, image_size, manifests, distributed, is_main):
+    if not distributed:
+        return validate_pixel_ragged_cache(root, feature_dim, image_size, manifests)
+    payload = [None]
+    if is_main:
+        try:
+            payload[0] = {
+                "ok": True,
+                "metadata": validate_pixel_ragged_cache(root, feature_dim, image_size, manifests),
+            }
+        except Exception as exc:
+            payload[0] = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+    dist.broadcast_object_list(payload, src=0)
+    result = payload[0]
+    if not result.get("ok", False):
+        raise RuntimeError(
+            f"Rank-0 pixel cache preflight failed with {result.get('error_type', 'Exception')}: "
+            f"{result.get('error', '')}"
+        )
+    return result["metadata"]
+
+
 def new_metric_window():
     return {
         "steps": 0,
+        "optimizer_skipped_steps": 0,
         "lidar_support_image_mask_coverage": 0.0,
         "lidar_support_latent_mask_coverage": 0.0,
         "lidar_bottleneck_depth_log_l1": 0.0,
@@ -1273,11 +1311,13 @@ def run_training(args, dist_info):
     cache_metadata = {}
     if use_lidar_pixel:
         cache_metadata.update(
-            validate_pixel_ragged_cache(
+            validate_pixel_cache_distributed(
                 args.lidar_pixel_feature_cache_root,
                 LIDAR_POINT_FEATURE_DIM,
                 LIDAR_PIXEL_SIZE,
                 cache_manifests,
+                distributed,
+                is_main,
             )
         )
     else:
@@ -1498,8 +1538,11 @@ def run_training(args, dist_info):
                         torch.cuda.empty_cache()
             scaler.unscale_(optimizer)
             router_grad_stats = ray_fusion_grad_stats(model)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            optimizer_skipped = scaler.get_scale() < scale_before
+            window["optimizer_skipped_steps"] += int(optimizer_skipped)
 
             lidar_support_stats = lidar_support_mask_stats(batch, dilation=args.lidar_support_dilation)
             window["steps"] += 1
@@ -1544,6 +1587,8 @@ def run_training(args, dist_info):
                     "lidar_support_loss_weight": args.lidar_support_loss_weight,
                     **lidar_support_stats,
                     "window_steps": window_steps,
+                    "optimizer_skipped_steps_in_window": window["optimizer_skipped_steps"],
+                    "amp_scale": float(scaler.get_scale()),
                     "window_lidar_support_image_mask_coverage_mean": window[
                         "lidar_support_image_mask_coverage"
                     ]

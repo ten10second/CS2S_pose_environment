@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 MANIFEST_REPO="${MANIFEST_REPO:-/mnt/shizhm/CS2S_pose_environment_sat-lidar-ray-posterior-evidence}"
+PIXEL_CACHE_ROOT="${PIXEL_CACHE_ROOT:-/home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_all_fp16}"
+SAMPLE_MANIFEST="${SAMPLE_MANIFEST:-${MANIFEST_REPO}/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/train_manifest.jsonl}"
 
 if [[ "${RUN_V21_PIXEL_CFGDROP10:-0}" != "1" ]]; then
     cat <<'EOF'
@@ -34,8 +36,8 @@ exec env \
     --batch-size 1 \
     --num-workers 2 \
     --dataloader-timeout 180 \
-    --dist-timeout-seconds 600 \
-    --min-free-disk-gb 100 \
+    --dist-timeout-seconds 1800 \
+    --min-free-disk-gb 50 \
     --min-free-host-memory-gb 12 \
     --lr 1e-05 \
     --shuffle --amp \
@@ -43,13 +45,14 @@ exec env \
     --save-every 5000 \
     --keep-step-checkpoints 2 \
     --sample-every 1000 \
-    --sample-manifest "$MANIFEST_REPO/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/test_manifest.jsonl" \
+    --sample-manifest "$SAMPLE_MANIFEST" \
     --sample-num-samples 2 \
     --sample-ddim-steps 50 \
     --sample-seed 2026 \
-    --sample-probes normal \
+    --sample-fixed-seed --sample-eta 0.0 \
+    --sample-probes normal,zero \
     --seed 3407 \
-    --lidar-pixel-feature-cache-root /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/utonia_pixel_lidar_v21_all_fp16 \
+    --lidar-pixel-feature-cache-root "$PIXEL_CACHE_ROOT" \
     --image-semantic-cache-root /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/dino_vits14_8x32_all_fp16 \
     --lidar-depth-loss-weight 0.1 \
     --lidar-support-loss-weight 1.0 \
@@ -59,4 +62,4 @@ exec env \
     --lidar-evidence-dilation 4 \
     --lidar-evidence-free-space-dilation 14 \
     --lidar-support-dilation 8 \
-    --lidar-depth-log-eps 0.001
+    --lidar-depth-log-eps 0.001 "$@"
