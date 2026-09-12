@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -499,22 +500,35 @@ def lidar_key_structure_stats(model, lidar_context, max_tokens=256):
     }
 
 
-def make_panel(out_dir, sample_id, image_paths):
+def make_panel(out_dir, sample_id, image_paths, guidance_scale=7.5):
+    if all(key in image_paths for key in ("Satellite input", "LiDAR projection on RGB", "GT", "trained:normal")):
+        image_paths = {
+            "Satellite input": image_paths["Satellite input"],
+            "LiDAR projection on RGB (near red, far blue)": image_paths["LiDAR projection on RGB"],
+            "GT": image_paths["GT"],
+            f"CFG (scale={float(guidance_scale):g})": image_paths["trained:normal"],
+        }
     labels = list(image_paths.keys())
-    images = [Image.open(path).convert("RGB") for path in image_paths.values()]
-    width, height = images[0].size
+    images = []
+    for path in image_paths.values():
+        with Image.open(path) as source:
+            images.append(source.convert("RGB"))
+    height = images[labels.index("GT")].height if "GT" in labels else images[0].height
+    widths = [max(1, round(image.width * height / image.height)) for image in images]
     label_h = 22
-    panel = Image.new("RGB", (width * len(images), height + label_h), (255, 255, 255))
+    gap = 8
+    panel = Image.new("RGB", (sum(widths) + gap * (len(images) - 1), height + label_h), (255, 255, 255))
     draw = ImageDraw.Draw(panel)
-    for idx, (label, image) in enumerate(zip(labels, images)):
-        image.thumbnail((width, height), Image.BILINEAR)
-        image_x = idx * width + (width - image.width) // 2
-        image_y = label_h + (height - image.height) // 2
-        panel.paste(image, (image_x, image_y))
-        draw.text((idx * width + 4, 4), label, fill=(0, 0, 0))
+    image_x = 0
+    for label, image, width in zip(labels, images, widths):
+        panel.paste(image.resize((width, height), Image.BILINEAR), (image_x, label_h))
+        draw.text((image_x + 4, 4), label, fill=(0, 0, 0))
+        image_x += width + gap
     panel_path = out_dir / "panels" / f"{safe_sample_id(sample_id)}.png"
     panel_path.parent.mkdir(parents=True, exist_ok=True)
-    panel.save(panel_path)
+    temp_path = panel_path.with_name(f".{panel_path.stem}.{os.getpid()}.tmp.png")
+    panel.save(temp_path)
+    os.replace(temp_path, panel_path)
     for image in images:
         image.close()
     return panel_path
@@ -702,8 +716,7 @@ def main():
 
         image_paths = {
             "Satellite input": sat_path,
-            "LiDAR depth (near red, far blue)": cond_path,
-            "LiDAR depth on GT": overlay_path,
+            "LiDAR projection on RGB": overlay_path,
             "GT": gt_path,
         }
         image_paths_by_id[sample_id] = image_paths
@@ -737,7 +750,7 @@ def main():
             }
             del pred
             torch.cuda.empty_cache()
-        panel_path = make_panel(out_dir, sample_id, image_paths)
+        panel_path = make_panel(out_dir, sample_id, image_paths, guidance_scale=args.guidance_scale)
         records.append(
             {
                 "sample_id": sample_id,

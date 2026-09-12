@@ -827,15 +827,21 @@ def run_inline_samples(model, sample_dataset, args, out_dir, step):
             sample_id = sample["sample_id"]
             safe_id = safe_sample_id(sample_id)
             gt_path = sample_out / "images" / "gt" / f"{safe_id}.png"
+            sat_path = sample_out / "images" / "satellite" / f"{safe_id}.png"
             overlay_path = sample_out / "images" / "lidar_overlay" / f"{safe_id}.png"
             cond_path = sample_out / "images" / "lidar_cond" / f"{safe_id}.png"
             target = sample["grd_left_imgs"].unsqueeze(0).clamp(0.0, 1.0)
             save_tensor_image(target[0], gt_path)
+            save_tensor_image(sample["sat_map"], sat_path)
             overlay_path.parent.mkdir(parents=True, exist_ok=True)
             make_lidar_overlay(target[0], sample["lidar_cond"]).save(overlay_path)
             save_tensor_image(make_condition_rgb(sample["lidar_cond"]), cond_path)
 
-            image_paths = {"GT": gt_path, "LiDAR depth (near red, far blue)": overlay_path}
+            image_paths = {
+                "Satellite input": sat_path,
+                "LiDAR projection on RGB": overlay_path,
+                "GT": gt_path,
+            }
             attention_by_probe = {}
             batch = sample_to_batch(sample)
             try:
