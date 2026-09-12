@@ -141,7 +141,7 @@ data:
         kitti_root: /mnt/shizhm/DATA/KITTI/KITTI_RAW
         lidar_point_feature_cache_root: ''
         lidar_point_feature_dim: 0
-        lidar_pixel_feature_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/utonia_pixel_lidar_v21_all_fp16
+        lidar_pixel_feature_cache_root: /home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_fp64_all_fp16
         lidar_pixel_feature_cache_suffix: .npz
         lidar_pixel_feature_dim: 576
         image_semantic_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/dino_vits14_8x32_all_fp16
@@ -168,7 +168,7 @@ data:
         kitti_root: /mnt/shizhm/DATA/KITTI/KITTI_RAW
         lidar_point_feature_cache_root: ''
         lidar_point_feature_dim: 0
-        lidar_pixel_feature_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/utonia_pixel_lidar_v21_all_fp16
+        lidar_pixel_feature_cache_root: /home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_fp64_all_fp16
         lidar_pixel_feature_cache_suffix: .npz
         lidar_pixel_feature_dim: 576
         image_semantic_cache_root: /mnt/shizhm/DATA/KITTI/CS2S_cache_memmap/dino_vits14_8x32_all_fp16

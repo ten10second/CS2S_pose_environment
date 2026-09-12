@@ -32,6 +32,7 @@ CONDITION_CHANNELS_BY_MODE = {
 
 KITTI_RANGE_FOV_UP_DEG = 2.0
 KITTI_RANGE_FOV_DOWN_DEG = -24.9
+LIDAR_PROJECTION_VERSION = "float64_einsum_v1"
 
 
 @dataclass(frozen=True)
@@ -508,15 +509,27 @@ def build_raw_lidar_point_samples(
     }
 
 
+def _velo_to_rect_homogeneous(points_xyz: np.ndarray, calib: Dict[str, np.ndarray]) -> np.ndarray:
+    # Pixel ownership is discrete: FP32 BLAS differences at x/y = n + 0.5
+    # can move a cached feature to a different pixel in the training environment.
+    # Keep projection in FP64 and avoid backend-dependent BLAS contractions.
+    pts_h = np.concatenate(
+        [np.asarray(points_xyz[:, :3], dtype=np.float64), np.ones((points_xyz.shape[0], 1))],
+        axis=1,
+    ).T
+    transform = np.einsum(
+        "ij,jk->ik",
+        np.asarray(calib["R_rect_00_ext"], dtype=np.float64),
+        np.asarray(calib["Tr_velo_to_cam"], dtype=np.float64),
+        optimize=False,
+    )
+    return np.einsum("ij,jk->ik", transform, pts_h, optimize=False)
+
+
 def velo_to_rect(points_xyz: np.ndarray, calib: Dict[str, np.ndarray]) -> np.ndarray:
     if points_xyz.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
-    pts_h = np.concatenate(
-        [points_xyz[:, :3], np.ones((points_xyz.shape[0], 1), dtype=np.float32)],
-        axis=1,
-    ).T
-    rect = (calib["R_rect_00_ext"] @ calib["Tr_velo_to_cam"] @ pts_h).T
-    return rect[:, :3].astype(np.float32)
+    return _velo_to_rect_homogeneous(points_xyz, calib)[:3].T.astype(np.float32)
 
 
 def project_velo_to_image(
@@ -534,18 +547,19 @@ def project_velo_to_image(
     out_h, out_w = output_size
     src_w, src_h = calib["S_rect_02"]
 
-    rect_xyz = velo_to_rect(points_xyz, calib)
-    rect_h = np.concatenate(
-        [rect_xyz, np.ones((rect_xyz.shape[0], 1), dtype=np.float32)],
-        axis=1,
-    ).T
-    pix = calib["P_rect_02"] @ rect_h
+    rect_h = _velo_to_rect_homogeneous(points_xyz, calib)
+    pix = np.einsum(
+        "ij,jk->ik", np.asarray(calib["P_rect_02"], dtype=np.float64), rect_h, optimize=False
+    )
 
     depth = pix[2]
     safe_depth = np.where(np.abs(depth) < 1e-6, 1e-6, depth)
     uv = (pix[:2] / safe_depth).T
-    uv[:, 0] *= out_w / src_w
-    uv[:, 1] *= out_h / src_h
+    uv[:, 0] *= float(out_w) / float(src_w)
+    uv[:, 1] *= float(out_h) / float(src_h)
+    # All consumers (cache, z-buffer, and rasterizers) see the same FP32 values.
+    uv = uv.astype(np.float32)
+    depth = depth.astype(np.float32)
 
     valid = (
         (depth > 0.0)

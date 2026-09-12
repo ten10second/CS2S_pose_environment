@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 MANIFEST_REPO="${MANIFEST_REPO:-/mnt/shizhm/CS2S_pose_environment_sat-lidar-ray-posterior-evidence}"
-PIXEL_CACHE_ROOT="${PIXEL_CACHE_ROOT:-/home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_all_fp16}"
+PIXEL_CACHE_ROOT="${PIXEL_CACHE_ROOT:-/home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_fp64_all_fp16}"
 SAMPLE_MANIFEST="${SAMPLE_MANIFEST:-${MANIFEST_REPO}/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/train_manifest.jsonl}"
 
 if [[ "${RUN_V21_PIXEL_CFGDROP10:-0}" != "1" ]]; then

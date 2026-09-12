@@ -84,7 +84,19 @@ Server validation artifacts are under `/home/shizhm/CS2S_run_control/v21_validat
 
 ## Full training and supervision monitoring
 
-The four-card launcher now defaults to the lossless NPZ cache under `/home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_all_fp16`. The 64-frame size audit estimated 476.8 GiB for uncompressed all-split pixel arrays, while one representative compressed NPZ was 1.25 MiB. This is a storage/I/O change; feature values, depth, masks and the V2.1 network are unchanged. No full memmap is created on the nearly full data disk.
+The four-card launcher defaults to the lossless NPZ cache under `/home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_fp64_all_fp16`. The 64-frame size audit estimated 476.8 GiB for uncompressed all-split pixel arrays, while one representative compressed NPZ was 1.25 MiB. NPZ compression preserves feature values. No full memmap is created on the nearly full data disk.
+
+### Projection consistency repair (2026-09-12)
+
+The initial 16-frame supervision probe stopped before formal V2.1 training: cached pixel 36902 was absent from the runtime hit mask in `2011_09_26/2011_09_26_drive_0095_sync/0000000155`. Raw point 28554 had the same coordinates, calibration and depth (10.45220947265625 m) in both environments. However, FP32 matrix products produced x=38.5 under the cache environment (NumPy 2.2.6) and x=38.5000114440918 under the training environment (NumPy 1.24.3). Nearest-pixel rounding selected columns 38 and 39 respectively. Differences already existed before image scaling; making the scale dtype explicit alone was insufficient.
+
+The shared projection now uses FP64, non-BLAS `einsum` contractions (`optimize=False`), explicit Python-float image scales, and one final FP32 conversion before visibility checks and pixel rounding. Camera-coordinate point maps share the same transform. The strict hit/depth validation remains enabled. New caches record `projection_version=float64_einsum_v1` and `source_point_index`.
+
+All 24,597 old cache frames reproduced exactly in their original NumPy environment. With canonical projection, 20,626 frames can reuse existing per-point features; 3,971 require extraction because some newly visible source points have no stored feature row. Migration must validate legacy pixel/depth arrays exactly, remap by original scan index, and defer frames with missing features for complete extraction. Never discard newly visible points or assign a neighbouring point's feature. Keep the old cache and write the repaired cache into a separate root; `--skip-existing` alone does not migrate legacy caches.
+
+The full cross-environment audit found different legacy pixel-index arrays in 2,845 frames. Canonical geometry hashes (visible source indices, pixel indices, and FP32 depths) agreed for all 24,597 frames across NumPy 2.2.6 and 1.24.3. A frame count is not a count of incorrect pixels: the reproduced diagnostic failure involved one boundary point.
+
+This repairs projection and cache consistency. It does not change the V2.1 network, `masked_area` supervision, depth loss weight 0.1, or satellite CFG. It is not evidence that generated RGB geometry has improved; that requires subsequent evaluation.
 
 The run remains 0–3 GPUs, 300,000 steps, one sample per rank, AMP, learning rate 1e-5, satellite dropout 0.1, depth weight 0.1, semantic weight 0.2. Checkpoints retain the latest two step files; the output disk floor is 50 GiB. `PIXEL_CACHE_ROOT` and `SAMPLE_MANIFEST` override the server paths. The launcher accepts trailing training CLI overrides for bounded smoke tests or explicit resume.
 

@@ -20,6 +20,7 @@ from dataloader.kitti_pixel_feature_cache import (  # noqa: E402
     validate_pixel_arrays,
 )
 from dataloader.kitti_raw_lidar_utils import (  # noqa: E402
+    LIDAR_PROJECTION_VERSION,
     load_raw_calibration,
     load_velodyne_points,
     project_velo_to_image,
@@ -127,6 +128,8 @@ def process_record(record, model, transform, device, args):
         PIXEL_FEATURE_KEY: pixel_payload[PIXEL_FEATURE_KEY],
         PIXEL_INDEX_KEY: pixel_payload[PIXEL_INDEX_KEY],
         PIXEL_DEPTH_KEY: pixel_payload[PIXEL_DEPTH_KEY],
+        "source_point_index": kept_raw_indices,
+        "projection_version": np.asarray(LIDAR_PROJECTION_VERSION),
         "format": np.asarray(PIXEL_CACHE_FORMAT),
         "image_height": np.asarray(int(args.image_height), dtype=np.int32),
         "image_width": np.asarray(int(args.image_width), dtype=np.int32),
