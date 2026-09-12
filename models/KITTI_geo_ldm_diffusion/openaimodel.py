@@ -18,6 +18,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.KITTI_attention import SpatialTransformer
+from models.KITTI_geo_ldm.lidar_pixel_condition import LidarSpatialResidual
 
 
 # dummy replace
@@ -475,6 +476,7 @@ class UNetModel(nn.Module):
         lidar_posterior_log_depth_sigma=0.35,
         lidar_posterior_strength=2.0,
         lidar_message_gate_bias=-2.0,
+        lidar_spatial_channels=None,
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
     ):
@@ -524,6 +526,21 @@ class UNetModel(nn.Module):
         self.lidar_posterior_log_depth_sigma = float(lidar_posterior_log_depth_sigma)
         self.lidar_posterior_strength = float(lidar_posterior_strength)
         self.lidar_message_gate_bias = float(lidar_message_gate_bias)
+        self.lidar_spatial_channels = tuple(lidar_spatial_channels or ())
+        if self.lidar_spatial_channels:
+            if dims != 2 or len(self.lidar_spatial_channels) != len(channel_mult):
+                raise ValueError("LiDAR spatial channels must match all 2D U-Net scales")
+            if self.use_lidar_cross_attention:
+                raise ValueError("V2.1 spatial conditioning replaces the old LiDAR token attention")
+            if num_res_blocks < 1:
+                raise ValueError("spatial conditioning requires at least one residual block per scale")
+        self.lidar_spatial_residuals = nn.ModuleDict({
+            str(level * (num_res_blocks + 1) + 1): LidarSpatialResidual(
+                condition_channels, model_channels * channel_mult[level],
+                gate_bias=self.lidar_message_gate_bias,
+            )
+            for level, condition_channels in enumerate(self.lidar_spatial_channels)
+        })
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -806,6 +823,16 @@ class UNetModel(nn.Module):
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
         hs = []
+        spatial_context = None
+        if self.lidar_spatial_channels:
+            if not isinstance(lidar_context, dict) or set(lidar_context) != {"features", "masks"}:
+                raise ValueError("V2.1 requires the pixel encoder's spatial feature/mask pyramid")
+            if any(len(lidar_context[key]) != len(self.lidar_spatial_channels) for key in ("features", "masks")):
+                raise ValueError("LiDAR pyramid must contain one feature and mask per U-Net scale")
+            spatial_context = lidar_context
+            lidar_context = None
+        elif isinstance(lidar_context, dict):
+            raise ValueError("pixel feature pyramids require lidar_spatial_channels in the U-Net config")
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
@@ -814,8 +841,14 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
-        for module in self.input_blocks:
+        spatial_level = 0
+        for block_index, module in enumerate(self.input_blocks):
             h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            if spatial_context is not None and str(block_index) in self.lidar_spatial_residuals:
+                h = self.lidar_spatial_residuals[str(block_index)](
+                    h, spatial_context["features"][spatial_level], spatial_context["masks"][spatial_level],
+                )
+                spatial_level += 1
             hs.append(h)
         h = self.middle_block(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         self.last_lidar_bottleneck_depth_pred = th.sigmoid(

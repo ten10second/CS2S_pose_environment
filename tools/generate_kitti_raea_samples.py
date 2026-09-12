@@ -32,7 +32,12 @@ def parse_args():
         help="Optional KITTI_RAW root used to rebase paths stored in the manifest.",
     )
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--lidar-ray-feature-cache-root", required=True)
+    parser.add_argument("--lidar-ray-feature-cache-root", default="")
+    parser.add_argument(
+        "--lidar-pixel-feature-cache-root",
+        default="",
+        help="Optional V2.1 float16 cache containing pixel LiDAR [576,128,512] features.",
+    )
     parser.add_argument("--image-semantic-cache-root", required=True)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--num-samples", type=int, default=6)
@@ -57,7 +62,7 @@ def safe_sample_id(sample_id):
 
 def save_tensor_image(tensor, path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    transforms.functional.to_pil_image(tensor.detach().cpu().clamp(0, 1)).save(path)
+    transforms.functional.to_pil_image(tensor.detach().float().cpu().clamp(0, 1)).save(path)
 
 
 def sample_to_batch(sample):
@@ -276,7 +281,21 @@ def lidar_attention_stats(model):
                     value = float(value.detach().float().cpu())
                 values.append(float(value))
 
+    spatial_modules = [
+        module for module in model.DDPM.denoise_model.modules()
+        if module.__class__.__name__ == "LidarSpatialResidual"
+    ]
+    spatial_stats = {"lidar_spatial_modules": len(spatial_modules)}
+    for metric, attr in (
+        ("lidar_spatial_confidence_mean", "last_lidar_confidence"),
+        ("lidar_spatial_support_mean", "last_lidar_mask_mean"),
+        ("lidar_spatial_message_ratio_mean", "last_lidar_message_ratio"),
+    ):
+        values = [float(getattr(module, attr).detach().float().cpu()) for module in spatial_modules]
+        spatial_stats[metric] = sum(values) / len(values) if values else 0.0
+
     posterior_stats = {
+        **spatial_stats,
         "ray_posterior_modules": int(len(posterior_hit)),
         "ray_posterior_hit_coverage_mean": sum(posterior_hit) / float(len(posterior_hit)) if posterior_hit else 0.0,
         "ray_posterior_prior_entropy_mean": sum(posterior_prior_entropy) / float(len(posterior_prior_entropy)) if posterior_prior_entropy else 0.0,
@@ -359,6 +378,8 @@ def empty_token_structure_stats(prefix):
 def token_structure_stats(tokens, prefix, max_tokens=256):
     if tokens is None or int(max_tokens) <= 0:
         return empty_token_structure_stats(prefix)
+    if isinstance(tokens, dict):
+        return empty_token_structure_stats(prefix)
     x = tokens.detach().float()
     if x.ndim != 3:
         return empty_token_structure_stats(prefix)
@@ -426,6 +447,15 @@ def lidar_key_structure_stats(model, lidar_context, max_tokens=256):
     if lidar_context is None or int(max_tokens) <= 0:
         return {
             "enabled": False,
+            "raw_lidar_tokens": empty_token_structure_stats("raw_lidar_tokens"),
+            "prepared_lidar_tokens": empty_token_structure_stats("prepared_lidar_tokens"),
+            "projected_key_summary": {"projected_key_module_count": 0},
+            "projected_key_modules": [],
+        }
+    if isinstance(lidar_context, dict):
+        return {
+            "enabled": True,
+            "spatial_lidar_context": True,
             "raw_lidar_tokens": empty_token_structure_stats("raw_lidar_tokens"),
             "prepared_lidar_tokens": empty_token_structure_stats("prepared_lidar_tokens"),
             "projected_key_summary": {"projected_key_module_count": 0},
@@ -517,6 +547,15 @@ def generate_prediction(
     lidar_ray_features_mask = (
         batch["lidar_ray_features_mask"].cuda().float() if "lidar_ray_features_mask" in batch else None
     )
+    lidar_pixel_features = batch["lidar_pixel_features"].cuda().float() if "lidar_pixel_features" in batch else None
+    lidar_pixel_features_mask = (
+        batch["lidar_pixel_features_mask"].cuda().float() if "lidar_pixel_features_mask" in batch else None
+    )
+    lidar_pixel_features_available = (
+        batch["lidar_pixel_features_available"].cuda().float()
+        if "lidar_pixel_features_available" in batch
+        else None
+    )
     camera_to_lidar = model.get_input(batch, "camera_to_lidar").squeeze(-1).cuda()
     left_camera_k = model.get_input(batch, "left_camera_k").squeeze(-1).cuda()
     gt_shift_x = batch["gt_shift_x"].cuda()
@@ -532,6 +571,9 @@ def generate_prediction(
     lidar_point_features_mask = apply_probe_tensor(lidar_point_features_mask, probe)
     lidar_ray_features = apply_probe_tensor(lidar_ray_features, probe)
     lidar_ray_features_mask = apply_probe_tensor(lidar_ray_features_mask, probe)
+    lidar_pixel_features = apply_probe_tensor(lidar_pixel_features, probe)
+    lidar_pixel_features_mask = apply_probe_tensor(lidar_pixel_features_mask, probe)
+    lidar_pixel_features_available = apply_probe_tensor(lidar_pixel_features_available, probe)
 
     inputs = inputs * 2 - 1
     outputs = outputs * 2 - 1
@@ -548,6 +590,9 @@ def generate_prediction(
         lidar_point_features_mask=lidar_point_features_mask,
         lidar_ray_features=lidar_ray_features,
         lidar_ray_features_mask=lidar_ray_features_mask,
+        lidar_pixel_features=lidar_pixel_features,
+        lidar_pixel_features_mask=lidar_pixel_features_mask,
+        lidar_pixel_features_available=lidar_pixel_features_available,
     )
     lidar_evidence = model.make_lidar_evidence(lidar_cond)
     lidar_geometry_mask = make_lidar_geometry_mask_for_sampling(model, lidar_evidence)
@@ -614,6 +659,9 @@ def main():
         lidar_ray_depth_bins=int(cfg_value("lidar_ray_depth_bins", 4)),
         lidar_ray_height=int(cfg_value("lidar_ray_height", 8)),
         lidar_ray_width=int(cfg_value("lidar_ray_width", 32)),
+        lidar_pixel_feature_cache_root=args.lidar_pixel_feature_cache_root,
+        lidar_pixel_feature_cache_suffix=str(cfg_value("lidar_pixel_feature_cache_suffix", ".npz")),
+        lidar_pixel_feature_dim=int(cfg_value("lidar_pixel_feature_dim", 576)),
         image_semantic_cache_root=args.image_semantic_cache_root,
         image_semantic_cache_suffix=str(cfg_value("image_semantic_cache_suffix", ".npz")),
         image_semantic_feature_key=str(cfg_value("image_semantic_feature_key", "dino_feat")),

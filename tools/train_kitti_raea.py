@@ -37,17 +37,32 @@ from utils.util import instantiate_from_config  # noqa: E402
 CONDITION_MODE = "raw_lidar_pointmap"
 LIDAR_GEOM_MODE = "ray_depth_inv"
 LIDAR_CONTEXT_BACKBONE = "utonia_zbuffer_visible_ray"
+LIDAR_PIXEL_CONTEXT_BACKBONE = "utonia_pixel_lidar_v21"
 LIDAR_POINT_IN_CHANNELS = 10
 LIDAR_POINT_FEATURE_DIM = 576
 LIDAR_RAY_CACHE_PLANES = 1
+LIDAR_PIXEL_SIZE = (128, 512)
 IMAGE_SEMANTIC_DIM = 384
 IMAGE_SEMANTIC_SIZE = (8, 32)
 LIDAR_TOKEN_DIM = 768
 LIDAR_TOKEN_HIDDEN_CHANNELS = 128
 LIDAR_TOKEN_GRID = (8, 32)
+LIDAR_PIXEL_PYRAMID_CHANNELS = (64, 128, 256, 256)
+LIDAR_PIXEL_HIDDEN_CHANNELS = 64
 LIDAR_SEMANTIC_MASK_MODE = "lidar_hit"
 RAY_EVIDENCE_MASK_MODE = "lidar_hit"
 LIDAR_TOKEN_OUTPUT_NORM = "center_layernorm"
+LIDAR_PIXEL_CONTEXT_TARGET = "models.KITTI_geo_ldm.lidar_pixel_condition.LidarPixelConditionEncoder"
+
+
+def is_lidar_pixel_config(cfg):
+    target = OmegaConf.select(cfg, "model.params.Lidar_context_config.target")
+    return str(target) == LIDAR_PIXEL_CONTEXT_TARGET
+
+
+def delete_config_key(config, key):
+    if key in config:
+        del config[key]
 
 
 def parse_args():
@@ -153,6 +168,11 @@ def parse_args():
         "--lidar-ray-feature-cache-root",
         default="",
         help="Required float16 cache containing z-buffer-visible Utonia [576,1,8,32] features.",
+    )
+    parser.add_argument(
+        "--lidar-pixel-feature-cache-root",
+        default="",
+        help="Required by V2.1 configs: float16 cache containing pixel LiDAR [576,128,512] features.",
     )
     parser.add_argument(
         "--image-semantic-cache-root",
@@ -309,15 +329,20 @@ def load_training_checkpoint_safely(
     world_size,
     parallel_model_init,
     min_free_host_memory_gb,
+    expected_architecture=None,
 ):
     if not distributed or parallel_model_init:
         require_host_memory(min_free_host_memory_gb, "checkpoint resume")
-        return load_training_checkpoint(model, optimizer, ckpt_path, scaler=scaler)
+        return load_training_checkpoint(
+            model, optimizer, ckpt_path, scaler=scaler, expected_architecture=expected_architecture
+        )
     start_step = 0
     for owner_rank in range(world_size):
         if rank == owner_rank:
             require_host_memory(min_free_host_memory_gb, f"checkpoint resume on rank {rank}")
-            start_step = load_training_checkpoint(model, optimizer, ckpt_path, scaler=scaler)
+            start_step = load_training_checkpoint(
+                model, optimizer, ckpt_path, scaler=scaler, expected_architecture=expected_architecture
+            )
         distributed_barrier(distributed)
     return start_step
 
@@ -446,6 +471,7 @@ def resource_metrics():
 
 
 def configure_cfg(cfg, args):
+    use_lidar_pixel = is_lidar_pixel_config(cfg)
     cfg.model.base_learning_rate = args.lr
     cfg.model.params.pre_sat2grd_model_path = None
     cfg.model.params.pre_ldm_model_path = args.sd_base_ckpt
@@ -469,37 +495,58 @@ def configure_cfg(cfg, args):
     unet = cfg.model.params.DDPM_config.params.unet_config.params
     unet.use_checkpoint = False
     cfg.model.params.DDPM_config.params.control_grd = None
-    unet.use_lidar_cross_attention = True
-    unet.lidar_context_dim = LIDAR_TOKEN_DIM
-    unet.lidar_reference_window = int(args.lidar_reference_window)
     unet.ray_fusion_mode = "ray_posterior"
     unet.use_lidar_ray_posterior = True
     unet.lidar_posterior_log_depth_sigma = 0.35
     unet.lidar_posterior_strength = 2.0
     unet.lidar_message_gate_bias = -2.0
-    cfg.model.params.Lidar_context_config = {
-        "target": "models.KITTI_geo_ldm.lidar_condition_model.LidarVisibleRaySemanticTokenEncoder",
-        "params": {
-            "point_in_channels": LIDAR_POINT_IN_CHANNELS,
-            "front_in_channels": 5,
-            "hidden_channels": LIDAR_TOKEN_HIDDEN_CHANNELS,
-            "token_dim": LIDAR_TOKEN_DIM,
-            "token_grid": list(LIDAR_TOKEN_GRID),
-            "image_size": [
-                int(cfg.data.params.train.params.image_height),
-                int(cfg.data.params.train.params.image_width),
-            ],
-            "use_evidence_maps": True,
-            "evidence_dilation": int(args.lidar_evidence_dilation),
-            "evidence_free_space_dilation": int(args.lidar_evidence_free_space_dilation),
-            "token_output_norm": LIDAR_TOKEN_OUTPUT_NORM,
-            "token_structure_target_ratio": float(args.lidar_token_structure_target_ratio),
-            "use_pointmap_pe": True,
-            "point_pretrained_ckpt": "",
-            "point_feature_dim": LIDAR_POINT_FEATURE_DIM,
-            "semantic_feature_dim": IMAGE_SEMANTIC_DIM,
-        },
-    }
+    if use_lidar_pixel:
+        unet.use_lidar_cross_attention = False
+        unet.lidar_spatial_channels = list(LIDAR_PIXEL_PYRAMID_CHANNELS)
+        delete_config_key(unet, "lidar_context_dim")
+        delete_config_key(unet, "lidar_reference_window")
+        unet.ray_fusion_mode = "ray_posterior"
+        unet.use_lidar_ray_posterior = True
+        cfg.model.params.Lidar_context_config = {
+            "target": LIDAR_PIXEL_CONTEXT_TARGET,
+            "params": {
+                "point_feature_dim": LIDAR_POINT_FEATURE_DIM,
+                "hidden_channels": LIDAR_PIXEL_HIDDEN_CHANNELS,
+                "pyramid_channels": list(LIDAR_PIXEL_PYRAMID_CHANNELS),
+                "image_size": list(LIDAR_PIXEL_SIZE),
+                "token_grid": list(LIDAR_TOKEN_GRID),
+                "semantic_feature_dim": IMAGE_SEMANTIC_DIM,
+                "evidence_dilation": int(args.lidar_evidence_dilation),
+                "evidence_free_space_dilation": int(args.lidar_evidence_free_space_dilation),
+            },
+        }
+    else:
+        unet.use_lidar_cross_attention = True
+        unet.lidar_context_dim = LIDAR_TOKEN_DIM
+        unet.lidar_reference_window = int(args.lidar_reference_window)
+        cfg.model.params.Lidar_context_config = {
+            "target": "models.KITTI_geo_ldm.lidar_condition_model.LidarVisibleRaySemanticTokenEncoder",
+            "params": {
+                "point_in_channels": LIDAR_POINT_IN_CHANNELS,
+                "front_in_channels": 5,
+                "hidden_channels": LIDAR_TOKEN_HIDDEN_CHANNELS,
+                "token_dim": LIDAR_TOKEN_DIM,
+                "token_grid": list(LIDAR_TOKEN_GRID),
+                "image_size": [
+                    int(cfg.data.params.train.params.image_height),
+                    int(cfg.data.params.train.params.image_width),
+                ],
+                "use_evidence_maps": True,
+                "evidence_dilation": int(args.lidar_evidence_dilation),
+                "evidence_free_space_dilation": int(args.lidar_evidence_free_space_dilation),
+                "token_output_norm": LIDAR_TOKEN_OUTPUT_NORM,
+                "token_structure_target_ratio": float(args.lidar_token_structure_target_ratio),
+                "use_pointmap_pe": True,
+                "point_pretrained_ckpt": "",
+                "point_feature_dim": LIDAR_POINT_FEATURE_DIM,
+                "semantic_feature_dim": IMAGE_SEMANTIC_DIM,
+            },
+        }
 
     cfg.data.params.batch_size = int(args.batch_size)
     cfg.data.params.num_workers = int(args.num_workers)
@@ -514,12 +561,23 @@ def configure_cfg(cfg, args):
         params.include_raw_lidar_points = False
         params.lidar_point_feature_cache_root = ""
         params.lidar_point_feature_dim = 0
-        params.lidar_ray_feature_cache_root = args.lidar_ray_feature_cache_root
-        params.lidar_ray_feature_cache_suffix = ".npz"
-        params.lidar_ray_feature_dim = LIDAR_POINT_FEATURE_DIM
-        params.lidar_ray_depth_bins = LIDAR_RAY_CACHE_PLANES
-        params.lidar_ray_height = LIDAR_TOKEN_GRID[0]
-        params.lidar_ray_width = LIDAR_TOKEN_GRID[1]
+        if use_lidar_pixel:
+            for key in (
+                "lidar_ray_feature_cache_root",
+                "lidar_ray_feature_cache_suffix",
+                "lidar_ray_feature_dim",
+                "lidar_ray_depth_bins",
+                "lidar_ray_height",
+                "lidar_ray_width",
+            ):
+                delete_config_key(params, key)
+        else:
+            params.lidar_ray_feature_cache_root = args.lidar_ray_feature_cache_root
+            params.lidar_ray_feature_cache_suffix = ".npz"
+            params.lidar_ray_feature_dim = LIDAR_POINT_FEATURE_DIM
+            params.lidar_ray_depth_bins = LIDAR_RAY_CACHE_PLANES
+            params.lidar_ray_height = LIDAR_TOKEN_GRID[0]
+            params.lidar_ray_width = LIDAR_TOKEN_GRID[1]
         params.image_semantic_cache_root = args.image_semantic_cache_root
         params.image_semantic_cache_suffix = ".npz"
         params.image_semantic_feature_key = "dino_feat"
@@ -527,10 +585,14 @@ def configure_cfg(cfg, args):
         params.image_semantic_height = IMAGE_SEMANTIC_SIZE[0]
         params.image_semantic_width = IMAGE_SEMANTIC_SIZE[1]
         params.include_tracklets = False
+        if use_lidar_pixel:
+            params.lidar_pixel_feature_cache_root = getattr(args, "lidar_pixel_feature_cache_root", "")
+            params.lidar_pixel_feature_cache_suffix = ".npz"
+            params.lidar_pixel_feature_dim = LIDAR_POINT_FEATURE_DIM
     return cfg
 
 
-def load_training_checkpoint(model, optimizer, ckpt_path, scaler=None):
+def load_training_checkpoint(model, optimizer, ckpt_path, scaler=None, expected_architecture=None):
     payload = torch.load(ckpt_path, map_location="cpu")
     required = {
         "denoise_model",
@@ -546,6 +608,14 @@ def load_training_checkpoint(model, optimizer, ckpt_path, scaler=None):
             "Checkpoint is not a current ray-posterior training checkpoint; "
             f"missing keys: {missing}"
         )
+    if expected_architecture is not None:
+        metadata = payload.get("metadata", {})
+        actual_architecture = metadata.get("architecture") if isinstance(metadata, dict) else None
+        if actual_architecture != expected_architecture:
+            raise RuntimeError(
+                "Checkpoint architecture mismatch for strict resume: "
+                f"expected {expected_architecture!r}, got {actual_architecture!r}"
+            )
     model.DDPM.denoise_model.load_state_dict(payload["denoise_model"], strict=True)
     model.condition_model_sat.load_state_dict(payload["condition_model_sat"], strict=True)
     if model.lidar_context_model is None:
@@ -695,9 +765,10 @@ def ensure_output_disk_space_distributed(path, min_free_disk_gb, distributed, is
         raise RuntimeError(error_message)
 
 
-def build_inline_sample_dataset(args):
+def build_inline_sample_dataset(args, use_lidar_pixel=False):
     if int(args.sample_every) <= 0 or not args.sample_manifest:
         return None
+    lidar_ray_feature_cache_root = "" if use_lidar_pixel else args.lidar_ray_feature_cache_root
     return SatLidarRawDataset(
         manifest=args.sample_manifest,
         condition_mode=CONDITION_MODE,
@@ -708,12 +779,15 @@ def build_inline_sample_dataset(args):
         align_satellite_to_camera=True,
         include_range_image=False,
         include_raw_lidar_points=False,
-        lidar_ray_feature_cache_root=args.lidar_ray_feature_cache_root,
+        lidar_ray_feature_cache_root=lidar_ray_feature_cache_root,
         lidar_ray_feature_cache_suffix=".npz",
         lidar_ray_feature_dim=LIDAR_POINT_FEATURE_DIM,
         lidar_ray_depth_bins=LIDAR_RAY_CACHE_PLANES,
         lidar_ray_height=LIDAR_TOKEN_GRID[0],
         lidar_ray_width=LIDAR_TOKEN_GRID[1],
+        lidar_pixel_feature_cache_root=getattr(args, "lidar_pixel_feature_cache_root", ""),
+        lidar_pixel_feature_cache_suffix=".npz",
+        lidar_pixel_feature_dim=LIDAR_POINT_FEATURE_DIM,
         image_semantic_cache_root=args.image_semantic_cache_root,
         image_semantic_cache_suffix=".npz",
         image_semantic_feature_key="dino_feat",
@@ -914,7 +988,21 @@ def lidar_attention_stats(model):
             posterior_lidar_mask.append(torch.tensor(module_stat_float(module, "last_lidar_mask_mean"), dtype=torch.float32))
             posterior_lidar_message_ratio.append(torch.tensor(module_stat_float(module, "last_lidar_message_ratio"), dtype=torch.float32))
 
+    spatial_modules = [
+        module for module in model.DDPM.denoise_model.modules()
+        if module.__class__.__name__ == "LidarSpatialResidual"
+    ]
+    spatial_stats = {"lidar_spatial_modules": len(spatial_modules)}
+    for metric, attr in (
+        ("lidar_spatial_confidence_mean", "last_lidar_confidence"),
+        ("lidar_spatial_support_mean", "last_lidar_mask_mean"),
+        ("lidar_spatial_message_ratio_mean", "last_lidar_message_ratio"),
+    ):
+        values = [float(getattr(module, attr).detach().float().cpu()) for module in spatial_modules]
+        spatial_stats[metric] = sum(values) / len(values) if values else 0.0
+
     posterior_stats = {
+        **spatial_stats,
         "ray_posterior_modules": len(posterior_hit),
         "ray_posterior_hit_coverage_mean": float(torch.stack(posterior_hit).mean()) if posterior_hit else 0.0,
         "ray_posterior_prior_entropy_mean": float(torch.stack(posterior_prior_entropy).mean()) if posterior_prior_entropy else 0.0,
@@ -1135,6 +1223,12 @@ def validate_memmap_cache(root, kind, feature_shape, mask_shape, manifests):
     }
 
 
+def validate_pixel_ragged_cache(root, feature_dim, image_size, manifests):
+    from dataloader.kitti_pixel_feature_cache import preflight_pixel_ragged_cache
+
+    return preflight_pixel_ragged_cache(root, feature_dim, image_size, manifests)
+
+
 def new_metric_window():
     return {
         "steps": 0,
@@ -1166,19 +1260,36 @@ def run_training(args, dist_info):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    cfg = configure_cfg(OmegaConf.load(args.config), args)
+    use_lidar_pixel = is_lidar_pixel_config(cfg)
+    architecture = (
+        "satellite_lidar_pixel_v21_ray_posterior"
+        if use_lidar_pixel
+        else "satellite_lidar_zbuffer_visible_ray_posterior"
+    )
     cache_manifests = [args.train_manifest]
     if int(args.sample_every) > 0 and args.sample_manifest:
         cache_manifests.append(args.sample_manifest)
     cache_metadata = {}
-    cache_metadata.update(
-        validate_memmap_cache(
-            args.lidar_ray_feature_cache_root,
-            "ray",
-            (LIDAR_POINT_FEATURE_DIM, LIDAR_RAY_CACHE_PLANES, *LIDAR_TOKEN_GRID),
-            (1, LIDAR_RAY_CACHE_PLANES, *LIDAR_TOKEN_GRID),
-            cache_manifests,
+    if use_lidar_pixel:
+        cache_metadata.update(
+            validate_pixel_ragged_cache(
+                args.lidar_pixel_feature_cache_root,
+                LIDAR_POINT_FEATURE_DIM,
+                LIDAR_PIXEL_SIZE,
+                cache_manifests,
+            )
         )
-    )
+    else:
+        cache_metadata.update(
+            validate_memmap_cache(
+                args.lidar_ray_feature_cache_root,
+                "ray",
+                (LIDAR_POINT_FEATURE_DIM, LIDAR_RAY_CACHE_PLANES, *LIDAR_TOKEN_GRID),
+                (1, LIDAR_RAY_CACHE_PLANES, *LIDAR_TOKEN_GRID),
+                cache_manifests,
+            )
+        )
     cache_metadata.update(
         validate_memmap_cache(
             args.image_semantic_cache_root,
@@ -1189,8 +1300,8 @@ def run_training(args, dist_info):
         )
     )
 
-    cfg = configure_cfg(OmegaConf.load(args.config), args)
-    run_name = args.run_name or f"kitti_ray_posterior_sd14_fresh_{args.steps}step"
+    default_run_suffix = "pixel_lidar_v21" if use_lidar_pixel else "ray_posterior"
+    run_name = args.run_name or f"kitti_{default_run_suffix}_sd14_fresh_{args.steps}step"
     out_dir = Path(args.out_root) / run_name
     metrics_dir = out_dir / "metrics"
     ckpt_dir = out_dir / "checkpoints"
@@ -1215,7 +1326,7 @@ def run_training(args, dist_info):
 
     train_dataset = instantiate_from_config(cfg.data.params.train)
     loader, distributed_sampler = build_loader(train_dataset, args, rank=rank, world_size=world_size)
-    inline_sample_dataset = build_inline_sample_dataset(args) if is_main else None
+    inline_sample_dataset = build_inline_sample_dataset(args, use_lidar_pixel=use_lidar_pixel) if is_main else None
 
     model = instantiate_model_safely(
         cfg,
@@ -1241,11 +1352,13 @@ def run_training(args, dist_info):
             world_size,
             args.parallel_model_init,
             args.min_free_host_memory_gb,
+            expected_architecture=architecture,
         )
         if is_main:
             print(json.dumps({"resumed": args.resume_ckpt, "start_step": start_step}, sort_keys=True))
     model.train()
-    training_model = TrainingStepModule(model, args.lidar_token_structure_loss_weight).to(device)
+    token_structure_loss_weight = 0.0 if use_lidar_pixel else float(args.lidar_token_structure_loss_weight)
+    training_model = TrainingStepModule(model, token_structure_loss_weight).to(device)
     if distributed:
         ddp_kwargs = {
             "find_unused_parameters": bool(args.ddp_find_unused_parameters),
@@ -1263,7 +1376,8 @@ def run_training(args, dist_info):
     iterator = iter(loader)
 
     metadata = {
-        "architecture": "satellite_lidar_zbuffer_visible_ray_posterior",
+        "architecture": architecture,
+        "backbone": LIDAR_PIXEL_CONTEXT_BACKBONE if use_lidar_pixel else LIDAR_CONTEXT_BACKBONE,
         "sd_base_ckpt": args.sd_base_ckpt,
         "resume_ckpt": args.resume_ckpt,
         "start_step": int(start_step),
@@ -1290,10 +1404,10 @@ def run_training(args, dist_info):
         "parallel_model_init": bool(args.parallel_model_init),
         "min_free_disk_gb": float(args.min_free_disk_gb),
         "min_free_host_memory_gb": float(args.min_free_host_memory_gb),
-        "lidar_attention_mode": "local_reference",
+        "lidar_attention_mode": "spatial_pyramid" if use_lidar_pixel else "local_reference",
         "lidar_fusion_mode": "ray_posterior",
         "lidar_geom_mode": LIDAR_GEOM_MODE,
-        "lidar_context_backbone": LIDAR_CONTEXT_BACKBONE,
+        "lidar_context_backbone": LIDAR_PIXEL_CONTEXT_BACKBONE if use_lidar_pixel else LIDAR_CONTEXT_BACKBONE,
         "lidar_raw_point_count": "all_front_points_for_geometry",
         "lidar_point_in_channels": LIDAR_POINT_IN_CHANNELS,
         "lidar_point_feature_dim": LIDAR_POINT_FEATURE_DIM,
@@ -1304,10 +1418,12 @@ def run_training(args, dist_info):
         "use_lidar_cross_attention": bool(cfg.model.params.DDPM_config.params.unet_config.params.use_lidar_cross_attention),
         "optimizer_scope": "full_denoise_satellite_lidar",
         "base_lr": float(args.lr),
-        "lidar_token_output_norm": LIDAR_TOKEN_OUTPUT_NORM,
-        "lidar_token_structure_loss_weight": float(args.lidar_token_structure_loss_weight),
+        "lidar_token_output_norm": None if use_lidar_pixel else LIDAR_TOKEN_OUTPUT_NORM,
+        "lidar_token_structure_loss_weight": 0.0
+        if use_lidar_pixel
+        else float(args.lidar_token_structure_loss_weight),
         "lidar_token_structure_target_ratio": float(args.lidar_token_structure_target_ratio),
-        "lidar_reference_window": int(args.lidar_reference_window),
+        "lidar_reference_window": None if use_lidar_pixel else int(args.lidar_reference_window),
         "lidar_support_loss_weight": float(args.lidar_support_loss_weight),
         "lidar_support_dilation": int(args.lidar_support_dilation),
         "lidar_depth_loss_weight": float(args.lidar_depth_loss_weight),
@@ -1315,8 +1431,11 @@ def run_training(args, dist_info):
         "lidar_depth_output_scale": 0.0,
         "lidar_depth_bottleneck_scale": 1.0,
         "lidar_depth_log_eps": float(args.lidar_depth_log_eps),
-        "lidar_ray_feature_cache_root": args.lidar_ray_feature_cache_root,
-        "lidar_ray_cache_planes": LIDAR_RAY_CACHE_PLANES,
+        "lidar_ray_feature_cache_root": "" if use_lidar_pixel else args.lidar_ray_feature_cache_root,
+        "lidar_ray_cache_planes": 0 if use_lidar_pixel else LIDAR_RAY_CACHE_PLANES,
+        "lidar_pixel_feature_cache_root": getattr(args, "lidar_pixel_feature_cache_root", ""),
+        "lidar_pixel_size": list(LIDAR_PIXEL_SIZE),
+        "lidar_spatial_channels": list(LIDAR_PIXEL_PYRAMID_CHANNELS) if use_lidar_pixel else [],
         "image_semantic_cache_root": args.image_semantic_cache_root,
         "lidar_semantic_alignment_weight": float(args.lidar_semantic_alignment_weight),
         "lidar_semantic_alignment_mask_mode": LIDAR_SEMANTIC_MASK_MODE,
@@ -1350,7 +1469,7 @@ def run_training(args, dist_info):
                         loss = training_model(batch, step)
                         token_structure_loss = lidar_token_structure_loss_tensor(model)
                         token_structure_loss_contrib = (
-                            float(args.lidar_token_structure_loss_weight) * token_structure_loss
+                            token_structure_loss_weight * token_structure_loss
                         )
                     if not synchronized_loss_finite(loss, distributed):
                         raise FloatingPointError(
@@ -1471,8 +1590,8 @@ def run_training(args, dist_info):
                         "lidar_semantic_alignment_target_available"
                     ]
                     / window_steps,
-                    "lidar_token_output_norm": LIDAR_TOKEN_OUTPUT_NORM,
-                    "lidar_token_structure_loss_weight": float(args.lidar_token_structure_loss_weight),
+                    "lidar_token_output_norm": None if use_lidar_pixel else LIDAR_TOKEN_OUTPUT_NORM,
+                    "lidar_token_structure_loss_weight": token_structure_loss_weight,
                     "lidar_token_structure_target_ratio": float(args.lidar_token_structure_target_ratio),
                     "lidar_token_structure_loss": scalar(token_structure_loss),
                     "lidar_token_structure_loss_contrib": scalar(token_structure_loss_contrib),

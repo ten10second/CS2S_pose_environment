@@ -25,6 +25,55 @@ import torch.optim as optim
 
 default_noise = [torch.randn((1,4,16,64)) for _ in range(100)]
 
+
+def repeat_batch_conditioning(value, repeats=2):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return torch.cat([value] * repeats)
+    if isinstance(value, dict):
+        return {key: repeat_batch_conditioning(item, repeats=repeats) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(repeat_batch_conditioning(item, repeats=repeats) for item in value)
+    if isinstance(value, list):
+        return [repeat_batch_conditioning(item, repeats=repeats) for item in value]
+    raise TypeError(f"Unsupported DDIM conditioning value for batch repeat: {type(value).__name__}")
+
+
+def zero_like_conditioning(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return torch.zeros_like(value)
+    if isinstance(value, dict):
+        return {key: zero_like_conditioning(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(zero_like_conditioning(item) for item in value)
+    if isinstance(value, list):
+        return [zero_like_conditioning(item) for item in value]
+    raise TypeError(f"Unsupported DDIM conditioning value for zero CFG branch: {type(value).__name__}")
+
+
+def concat_conditioning_pair(unconditional, conditional):
+    if torch.is_tensor(conditional):
+        return torch.cat([unconditional, conditional])
+    if isinstance(conditional, dict):
+        return {
+            key: concat_conditioning_pair(unconditional[key], conditional[key])
+            for key in conditional.keys()
+        }
+    if isinstance(conditional, tuple):
+        return tuple(
+            concat_conditioning_pair(uncond_item, cond_item)
+            for uncond_item, cond_item in zip(unconditional, conditional)
+        )
+    if isinstance(conditional, list):
+        return [
+            concat_conditioning_pair(uncond_item, cond_item)
+            for uncond_item, cond_item in zip(unconditional, conditional)
+        ]
+    raise TypeError(f"Unsupported DDIM conditioning value for CFG concat: {type(conditional).__name__}")
+
 class AdamOptimizer:
     def __init__(self, lr=0.005, beta1=0.9, beta2=0.999, epsilon=1e-8):
         self.lr = lr 
@@ -570,12 +619,15 @@ class KITTI_DDIMSampler(object):
                 camera_k=left_camera_k,
                 image_size=tuple(cond_init_grd.shape[-2:]),
             )
+        if unconditional_conditioning is None and unconditional_guidance_scale != 1. and c is not None:
+            unconditional_conditioning = zero_like_conditioning(c)
+
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             e_t = self.model.denoise_model(x, t, context = c, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
-            c_in = torch.cat([unconditional_conditioning, c])
+            c_in = concat_conditioning_pair(unconditional_conditioning, c)
             left_camera_k_in = torch.cat([left_camera_k] * 2) if left_camera_k is not None else None
             gt_shift_x_in = torch.cat([gt_shift_x] * 2) if gt_shift_x is not None else None
             gt_shift_y_in = torch.cat([gt_shift_y] * 2) if gt_shift_y is not None else None
@@ -583,7 +635,7 @@ class KITTI_DDIMSampler(object):
             range_img_in = torch.cat([range_img] * 2) if range_img is not None else None
             range_mask_in = torch.cat([range_mask] * 2) if range_mask is not None else None
             camera_to_lidar_in = torch.cat([camera_to_lidar] * 2) if camera_to_lidar is not None else None
-            lidar_context_in = torch.cat([lidar_context] * 2) if lidar_context is not None else None
+            lidar_context_in = repeat_batch_conditioning(lidar_context, repeats=2)
             lidar_evidence_in = torch.cat([lidar_evidence] * 2) if lidar_evidence is not None else None
             lidar_geometry_mask_in = torch.cat([lidar_geometry_mask] * 2) if lidar_geometry_mask is not None else None
             control_grd_para = None

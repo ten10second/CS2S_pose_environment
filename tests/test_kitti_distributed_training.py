@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import TensorDataset
@@ -23,6 +24,7 @@ from tools.train_kitti_raea import (
     update_checkpoint_alias,
     validate_runtime_args,
     validate_memmap_cache,
+    validate_pixel_ragged_cache,
 )
 
 
@@ -68,6 +70,7 @@ class KittiDistributedTrainingTest(unittest.TestCase):
             val_manifest="test.jsonl",
             kitti_root="/data/KITTI_RAW",
             lidar_ray_feature_cache_root="/cache/utonia_ray",
+            lidar_pixel_feature_cache_root="",
             image_semantic_cache_root="/cache/dino",
         )
         config_path = (
@@ -79,7 +82,7 @@ class KittiDistributedTrainingTest(unittest.TestCase):
         self.assertIsNone(OmegaConf.select(cfg, "model.params.freeze_for_lidar_control"))
         self.assertEqual(
             cfg.model.params.Lidar_context_config.target,
-            "models.KITTI_geo_ldm.lidar_condition_model.LidarRayDepthSemanticTokenEncoder",
+            "models.KITTI_geo_ldm.lidar_condition_model.LidarVisibleRaySemanticTokenEncoder",
         )
         self.assertEqual(cfg.model.params.DDPM_config.params.unet_config.params.lidar_context_dim, 768)
         self.assertEqual(cfg.model.params.DDPM_config.params.unet_config.params.ray_fusion_mode, "ray_posterior")
@@ -89,6 +92,46 @@ class KittiDistributedTrainingTest(unittest.TestCase):
         self.assertIsNone(OmegaConf.select(cfg, "model.params.dynamic_point_x0_loss_weight"))
         self.assertIsNone(OmegaConf.select(cfg, "model.params.foreground_image_loss_weight"))
         self.assertIsNone(OmegaConf.select(cfg, "model.params.lidar_counterfactual_weight"))
+
+    def test_pixel_config_stays_on_v21_target(self):
+        args = SimpleNamespace(
+            lr=1e-5,
+            sd_base_ckpt="sd-v1-4.ckpt",
+            lidar_support_loss_weight=1.0,
+            lidar_support_dilation=8,
+            lidar_depth_loss_weight=0.1,
+            lidar_depth_log_eps=1e-3,
+            lidar_semantic_alignment_weight=0.2,
+            lidar_reference_window=3,
+            lidar_evidence_dilation=4,
+            lidar_evidence_free_space_dilation=14,
+            lidar_token_structure_target_ratio=0.08,
+            batch_size=2,
+            num_workers=2,
+            train_manifest="train.jsonl",
+            val_manifest="test.jsonl",
+            kitti_root="/data/KITTI_RAW",
+            lidar_ray_feature_cache_root="/cache/old_ray",
+            lidar_pixel_feature_cache_root="/cache/pixel",
+            image_semantic_cache_root="/cache/dino",
+        )
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "configs/Boost_Sat2Den/train/KITTI_raw_sat_lidar_pixel_cfgdrop10.yaml"
+        )
+        cfg = configure_cfg(OmegaConf.load(config_path), args)
+        unet = cfg.model.params.DDPM_config.params.unet_config.params
+
+        self.assertEqual(
+            cfg.model.params.Lidar_context_config.target,
+            "models.KITTI_geo_ldm.lidar_pixel_condition.LidarPixelConditionEncoder",
+        )
+        self.assertFalse(unet.use_lidar_cross_attention)
+        self.assertEqual(list(unet.lidar_spatial_channels), [64, 128, 256, 256])
+        self.assertIsNone(OmegaConf.select(cfg, "model.params.DDPM_config.params.unet_config.params.lidar_reference_window"))
+        self.assertIsNone(OmegaConf.select(cfg, "data.params.train.params.lidar_ray_feature_cache_root"))
+        self.assertIsNone(OmegaConf.select(cfg, "data.params.train.params.lidar_ray_feature_dim"))
+        self.assertEqual(cfg.data.params.train.params.lidar_pixel_feature_cache_root, "/cache/pixel")
 
     def test_training_step_wrapper_preserves_gradients(self):
         model = _TinyTrainingModel()
@@ -166,6 +209,45 @@ class KittiDistributedTrainingTest(unittest.TestCase):
             stats = validate_memmap_cache(root, "point", (4, 3), (4,), [manifest])
             self.assertEqual(stats["point_cache_required_rows"], 2)
 
+    def test_pixel_ragged_cache_must_cover_every_manifest_sample(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "cache"
+            root.mkdir()
+            np.save(root / "features.npy", np.ones((3, 576), dtype=np.float16))
+            np.save(root / "pixel_index.npy", np.arange(3, dtype=np.int64))
+            np.save(root / "depth.npy", np.ones(3, dtype=np.float32))
+            np.save(root / "offsets.npy", np.array([0, 3], dtype=np.int64))
+            manifest = Path(temp_dir) / "train.jsonl"
+            manifest.write_text(
+                "\n".join(
+                    json.dumps({"sample_id": sample_id})
+                    for sample_id in ("drive/frame0", "drive/frame1")
+                )
+            )
+            metadata = {
+                "format": "kitti_pixel_feature_ragged_memmap_v1",
+                "count": 1,
+                "total_points": 3,
+                "feature_dim": 576,
+                "image_size": [128, 512],
+                "features_file": "features.npy",
+                "pixel_index_file": "pixel_index.npy",
+                "depth_file": "depth.npy",
+                "offsets_file": "offsets.npy",
+                "index": {"drive__frame0": 0},
+            }
+            (root / "pixel_memmap_meta.json").write_text(json.dumps(metadata))
+
+            with self.assertRaisesRegex(RuntimeError, "misses 1/2 required samples"):
+                validate_pixel_ragged_cache(root, 576, (128, 512), [manifest])
+
+            metadata["index"]["drive__frame1"] = 1
+            metadata["count"] = 2
+            np.save(root / "offsets.npy", np.array([0, 2, 3], dtype=np.int64))
+            (root / "pixel_memmap_meta.json").write_text(json.dumps(metadata))
+            stats = validate_pixel_ragged_cache(root, 576, (128, 512), [manifest])
+            self.assertEqual(stats["lidar_pixel_cache_required_rows"], 2)
+
     def test_fresh_run_refuses_non_empty_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir) / "run"
@@ -199,6 +281,15 @@ class KittiDistributedTrainingTest(unittest.TestCase):
             torch.save({"step": 12, "denoise_model_trainable": {}}, legacy)
             with self.assertRaisesRegex(RuntimeError, "not a current ray-posterior"):
                 load_training_checkpoint(model, optimizer, legacy, scaler=scaler)
+
+            with self.assertRaisesRegex(RuntimeError, "architecture mismatch"):
+                load_training_checkpoint(
+                    model,
+                    optimizer,
+                    checkpoint,
+                    scaler=scaler,
+                    expected_architecture="satellite_lidar_pixel_v21_ray_posterior",
+                )
 
     def test_checkpoint_is_atomic_and_last_alias_reuses_storage(self):
         model = _StrictResumeModel()

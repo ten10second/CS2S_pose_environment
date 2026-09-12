@@ -1035,14 +1035,14 @@ class BasicTransformerBlock(nn.Module):
             )
         return checkpoint(
             self._forward_without_lidar,
-            (x, context, left_camera_k, gt_shift_x, gt_shift_y, theta),
+            (x, context, left_camera_k, gt_shift_x, gt_shift_y, theta, lidar_evidence),
             self.parameters(),
             self.checkpoint,
         )
 
-    def _forward_without_lidar(self, x, context=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None):
+    def _forward_without_lidar(self, x, context=None, left_camera_k=None,  gt_shift_x=None, gt_shift_y=None, theta=None, lidar_evidence=None):
         x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta) + x
+        x = self.attn2(self.norm2(x), context=context, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, ray_depth_evidence=lidar_evidence) + x
         x = self.ff(self.norm3(x)) + x
         return x
 

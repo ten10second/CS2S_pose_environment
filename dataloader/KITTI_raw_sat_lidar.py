@@ -11,6 +11,12 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 
 from dataloader import KITTI_utils as kitti_utils
+from dataloader.kitti_pixel_feature_cache import (
+    PixelFeatureRaggedMemmapCache,
+    load_npz_pixel_cache,
+    rasterize_pixel_features,
+    validate_against_lidar_cond,
+)
 from dataloader.kitti_raw_lidar_utils import (
     build_kitti_range_image,
     build_raw_lidar_point_samples,
@@ -104,6 +110,9 @@ class SatLidarRawDataset(Dataset):
         lidar_ray_depth_bins: int = 4,
         lidar_ray_height: int = 8,
         lidar_ray_width: int = 32,
+        lidar_pixel_feature_cache_root: str = "",
+        lidar_pixel_feature_cache_suffix: str = ".npz",
+        lidar_pixel_feature_dim: int = 576,
         image_semantic_cache_root: str = "",
         image_semantic_cache_suffix: str = ".npz",
         image_semantic_feature_key: str = "image_semantic_feat",
@@ -149,6 +158,17 @@ class SatLidarRawDataset(Dataset):
             int(lidar_ray_width),
         )
         self.lidar_ray_mask_shape = (1, *self.lidar_ray_feature_shape[1:])
+        self.lidar_pixel_feature_cache_root = (
+            Path(lidar_pixel_feature_cache_root) if lidar_pixel_feature_cache_root else None
+        )
+        self.lidar_pixel_feature_cache_suffix = lidar_pixel_feature_cache_suffix
+        self.lidar_pixel_feature_dim = int(lidar_pixel_feature_dim)
+        self.lidar_pixel_feature_shape = (
+            self.lidar_pixel_feature_dim,
+            int(image_height),
+            int(image_width),
+        )
+        self.lidar_pixel_mask_shape = (1, int(image_height), int(image_width))
         self.image_semantic_cache_root = Path(image_semantic_cache_root) if image_semantic_cache_root else None
         self.image_semantic_cache_suffix = image_semantic_cache_suffix
         self.image_semantic_feature_key = image_semantic_feature_key
@@ -182,6 +202,15 @@ class SatLidarRawDataset(Dataset):
                 mask_shape=self.lidar_ray_mask_shape,
             )
             if self.lidar_ray_feature_cache_root is not None and self.lidar_ray_feature_dim > 0
+            else None
+        )
+        self._lidar_pixel_feature_memmap = (
+            PixelFeatureRaggedMemmapCache(
+                self.lidar_pixel_feature_cache_root,
+                output_size=self.image_size,
+                feature_dim=self.lidar_pixel_feature_dim,
+            )
+            if self.lidar_pixel_feature_cache_root is not None and self.lidar_pixel_feature_dim > 0
             else None
         )
         self.include_tracklets = bool(include_tracklets)
@@ -370,6 +399,39 @@ class SatLidarRawDataset(Dataset):
             "lidar_ray_features": torch.from_numpy(features).float(),
             "lidar_ray_features_mask": torch.from_numpy(mask).float(),
             "lidar_ray_features_available": torch.from_numpy(available).float(),
+        }
+
+    def _lidar_pixel_feature_cache(self, sample_id: str, lidar_cond: np.ndarray) -> Dict[str, torch.Tensor]:
+        if self.lidar_pixel_feature_cache_root is None or self.lidar_pixel_feature_dim <= 0:
+            return {}
+        arrays = None
+        if self._lidar_pixel_feature_memmap is not None and self._lidar_pixel_feature_memmap.enabled:
+            arrays = self._lidar_pixel_feature_memmap.get(sample_id)
+            if arrays is None:
+                raise FileNotFoundError(f"Pixel feature memmap is missing sample: {sample_id}")
+        else:
+            cache_path = self._cache_path(
+                self.lidar_pixel_feature_cache_root,
+                sample_id,
+                self.lidar_pixel_feature_cache_suffix,
+            )
+            if not cache_path.is_file():
+                raise FileNotFoundError(f"Missing LiDAR pixel feature cache: {cache_path}")
+            arrays = load_npz_pixel_cache(
+                cache_path,
+                output_size=self.image_size,
+                feature_dim=self.lidar_pixel_feature_dim,
+            )
+        validate_against_lidar_cond(arrays, lidar_cond, self.image_size, self.max_depth)
+        features, mask = rasterize_pixel_features(
+            arrays,
+            output_size=self.image_size,
+            feature_dim=self.lidar_pixel_feature_dim,
+        )
+        return {
+            "lidar_pixel_features": torch.from_numpy(features),
+            "lidar_pixel_features_mask": torch.from_numpy(mask).float(),
+            "lidar_pixel_features_available": torch.ones(1, dtype=torch.float32),
         }
 
     def _image_semantic_cache(self, sample_id: str) -> Dict[str, torch.Tensor]:
@@ -604,6 +666,7 @@ class SatLidarRawDataset(Dataset):
             )
             sample.update(self._lidar_point_feature_cache(record["sample_id"]))
         sample.update(self._lidar_ray_feature_cache(record["sample_id"]))
+        sample.update(self._lidar_pixel_feature_cache(record["sample_id"], lidar["lidar_cond"]))
         sample.update(self._image_semantic_cache(record["sample_id"]))
         return sample
 
