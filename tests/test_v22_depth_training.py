@@ -1,4 +1,3 @@
-import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +7,7 @@ from unittest.mock import patch
 import torch
 from omegaconf import OmegaConf
 
-from tools.train_kitti_raea import configure_cfg, initialize_v22_from_v21, load_training_checkpoint, parse_args
+from tools.train_kitti_raea import configure_cfg, load_training_checkpoint, parse_args
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,43 +40,17 @@ class V22DepthTrainingTests(unittest.TestCase):
             lidar_context_model=torch.nn.Linear(2, 2),
         )
 
-    def test_weights_initialization_keeps_fresh_head_and_rejects_unrelated_missing_keys(self):
-        model = self.fake_model()
-        fresh = copy.deepcopy(model.DDPM.denoise_model.lidar_pixel_depth_head.state_dict())
-        payload = {
-            "metadata": {"architecture": "satellite_lidar_pixel_v21_ray_posterior"},
-            "step": 20000,
-            "denoise_model": {
-                key: torch.full_like(value, 0.75)
-                for key, value in model.DDPM.denoise_model.state_dict().items()
-                if not key.startswith("lidar_pixel_depth_head.")
-            },
-            "condition_model_sat": model.condition_model_sat.state_dict(),
-            "lidar_context_model": model.lidar_context_model.state_dict(),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "v21.pt"
-            torch.save(payload, path)
-            info = initialize_v22_from_v21(model, path)
-            self.assertEqual(info["source_step"], 20000)
-            self.assertTrue(info["optimizer_reset"])
-            self.assertTrue(torch.equal(model.DDPM.denoise_model.body.weight, torch.full((2, 2), 0.75)))
-            for key, value in fresh.items():
-                self.assertTrue(torch.equal(value, model.DDPM.denoise_model.lidar_pixel_depth_head.state_dict()[key]))
-            del payload["denoise_model"]["body.weight"]
-            torch.save(payload, path)
-            with self.assertRaisesRegex(RuntimeError, "key mismatch"):
-                initialize_v22_from_v21(model, path)
+    def test_init_ckpt_is_not_a_v22_training_entrypoint(self):
+        with patch("sys.argv", ["train", "--init-ckpt", "/tmp/v21.pt"]):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
-    def test_strict_v22_resume_preserves_v21_initialization_provenance(self):
+    def test_strict_v22_resume_restores_same_version_training_state_only(self):
         model = self.fake_model()
         optimizer = torch.optim.Adam(model.DDPM.denoise_model.parameters())
-        origin = {"source_step": 20000, "optimizer_reset": True}
         payload = {
             "metadata": {
                 "architecture": "satellite_lidar_pixel_v22_ray_posterior",
-                "init_ckpt": "/v21/step_020000.pt",
-                "initialization": origin,
             },
             "step": 2,
             "denoise_model": model.DDPM.denoise_model.state_dict(),
@@ -91,8 +64,7 @@ class V22DepthTrainingTests(unittest.TestCase):
             torch.save(payload, path)
             step = load_training_checkpoint(model, optimizer, path, expected_architecture="satellite_lidar_pixel_v22_ray_posterior")
             self.assertEqual(step, 2)
-            self.assertEqual(model._checkpoint_initialization_origin["initialization"], origin)
-            self.assertEqual(model._checkpoint_initialization_origin["init_ckpt"], "/v21/step_020000.pt")
+            self.assertFalse(hasattr(model, "_checkpoint_initialization_origin"))
 
 
 if __name__ == "__main__":

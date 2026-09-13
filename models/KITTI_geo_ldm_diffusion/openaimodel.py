@@ -700,11 +700,12 @@ class UNetModel(nn.Module):
         self._feature_size += ch
         middle_ch = ch
 
-        self.lidar_bottleneck_depth_head = nn.Sequential(
-            normalization(middle_ch),
-            nn.SiLU(),
-            conv_nd(dims, middle_ch, 1, 3, padding=1),
-        )
+        if self.lidar_depth_head_mode == "latent":
+            self.lidar_bottleneck_depth_head = nn.Sequential(
+                normalization(middle_ch),
+                nn.SiLU(),
+                conv_nd(dims, middle_ch, 1, 3, padding=1),
+            )
 
         self.output_blocks = nn.ModuleList([])
         self.output_block_channels = []
@@ -785,13 +786,14 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
         )
-        self.lidar_depth_head = nn.Sequential(
-            normalization(ch),
-            nn.SiLU(),
-            conv_nd(dims, ch, 1, 3, padding=1),
-        )
         if self.lidar_depth_head_mode == "pixel":
             self.lidar_pixel_depth_head = LidarPixelDepthHead(ch, dims=dims)
+        else:
+            self.lidar_depth_head = nn.Sequential(
+                normalization(ch),
+                nn.SiLU(),
+                conv_nd(dims, ch, 1, 3, padding=1),
+            )
         self.last_lidar_depth_pred = None
         self.last_lidar_bottleneck_depth_pred = None
         if self.predict_codebook_ids:
@@ -858,9 +860,12 @@ class UNetModel(nn.Module):
                 spatial_level += 1
             hs.append(h)
         h = self.middle_block(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
-        self.last_lidar_bottleneck_depth_pred = th.sigmoid(
-            self.lidar_bottleneck_depth_head(h.float())
-        ).type_as(h)
+        if self.lidar_depth_head_mode == "latent":
+            self.last_lidar_bottleneck_depth_pred = th.sigmoid(
+                self.lidar_bottleneck_depth_head(h.float())
+            ).type_as(h)
+        else:
+            self.last_lidar_bottleneck_depth_pred = None
 
         def add_control(feature):
             residual = control_grd.pop()

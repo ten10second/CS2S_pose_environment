@@ -83,14 +83,14 @@ class LidarPixelDepthHeadTest(unittest.TestCase):
     def test_unet_pixel_mode_predicts_full_resolution_depth(self):
         model = self._unet(lidar_depth_head_mode="pixel")
 
-        self.assertTrue(hasattr(model, "lidar_depth_head"))
-        self.assertTrue(hasattr(model, "lidar_bottleneck_depth_head"))
+        self.assertFalse(hasattr(model, "lidar_depth_head"))
+        self.assertFalse(hasattr(model, "lidar_bottleneck_depth_head"))
         self.assertTrue(hasattr(model, "lidar_pixel_depth_head"))
 
         out = model(torch.randn(1, 4, 16, 64), torch.tensor([1]))
         self.assertEqual(tuple(out.shape), (1, 4, 16, 64))
         self.assertEqual(tuple(model.last_lidar_depth_pred.shape), (1, 1, 128, 512))
-        self.assertEqual(tuple(model.last_lidar_bottleneck_depth_pred.shape), (1, 1, 2, 8))
+        self.assertIsNone(model.last_lidar_bottleneck_depth_pred)
 
     def test_unet_rejects_unknown_depth_head_mode(self):
         with self.assertRaisesRegex(ValueError, "lidar_depth_head_mode"):

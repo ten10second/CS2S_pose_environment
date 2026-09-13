@@ -157,7 +157,6 @@ def parse_args():
     )
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--resume-ckpt", default="")
-    parser.add_argument("--init-ckpt", default="", help="Initialize V2.2 weights from V2.1; keep the new depth head fresh and reset optimizer/step.")
     parser.add_argument(
         "--min-free-disk-gb",
         type=float,
@@ -634,38 +633,10 @@ def load_training_checkpoint(model, optimizer, ckpt_path, scaler=None, expected_
     optimizer.load_state_dict(payload["optimizer"])
     if scaler is not None:
         scaler.load_state_dict(payload["grad_scaler"])
-    source_metadata = payload.get("metadata", {})
-    model._checkpoint_initialization_origin = {
-        "init_ckpt": source_metadata.get("init_ckpt", ""),
-        "initialization": source_metadata.get("initialization"),
-    }
     step = int(payload.get("step", 0))
     del payload
     gc.collect()
     return step
-
-
-def initialize_v22_from_v21(model, ckpt_path):
-    """Explicit weights-only migration; strict resume remains same-version only."""
-    if getattr(model.DDPM.denoise_model, "lidar_depth_head_mode", "latent") != "pixel":
-        raise ValueError("--init-ckpt is reserved for V2.1 to V2.2 pixel-depth initialization")
-    payload = torch.load(ckpt_path, map_location="cpu")
-    if payload.get("metadata", {}).get("architecture") != "satellite_lidar_pixel_v21_ray_posterior":
-        raise ValueError("--init-ckpt requires a V2.1 pixel LiDAR checkpoint")
-    current = model.DDPM.denoise_model.state_dict()
-    saved = payload["denoise_model"]
-    expected_new = {key for key in current if key.startswith("lidar_pixel_depth_head.")}
-    missing = set(current) - set(saved)
-    unexpected = set(saved) - set(current)
-    if not expected_new or missing != expected_new or unexpected:
-        raise RuntimeError(f"V2.1 to V2.2 initialization key mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
-    result = model.DDPM.denoise_model.load_state_dict(saved, strict=False)
-    model.condition_model_sat.load_state_dict(payload["condition_model_sat"], strict=True)
-    model.lidar_context_model.load_state_dict(payload["lidar_context_model"], strict=True)
-    info = {"source_step": int(payload["step"]), "fresh_parameters": list(result.missing_keys), "optimizer_reset": True}
-    del payload
-    gc.collect()
-    return info
 
 
 def free_disk_gb(path):
@@ -1335,9 +1306,6 @@ def run_training(args, dist_info):
     local_rank = dist_info["local_rank"]
     device = dist_info["device"]
     is_main = dist_info["is_main"]
-    init_ckpt = getattr(args, "init_ckpt", "")
-    if init_ckpt and args.resume_ckpt:
-        raise ValueError("--init-ckpt and --resume-ckpt are mutually exclusive")
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -1429,16 +1397,6 @@ def run_training(args, dist_info):
         args.min_free_host_memory_gb,
     )
     model.learning_rate = args.lr
-    initialization = None
-    if init_ckpt:
-        # Serialize checkpoint reads to avoid loading four 11-GB payloads at once.
-        for owner_rank in range(world_size if distributed else 1):
-            if rank == owner_rank:
-                require_host_memory(args.min_free_host_memory_gb, "V2.2 weights initialization")
-                initialization = initialize_v22_from_v21(model, init_ckpt)
-            distributed_barrier(distributed)
-        if is_main:
-            print(json.dumps({"initialized_from": init_ckpt, **initialization}, sort_keys=True))
     optimizer = model.configure_optimizers()[0]
     scaler = GradScaler(enabled=bool(args.amp and torch.cuda.is_available()))
     start_step = 0
@@ -1481,8 +1439,6 @@ def run_training(args, dist_info):
         "backbone": LIDAR_PIXEL_CONTEXT_BACKBONE if use_lidar_pixel else LIDAR_CONTEXT_BACKBONE,
         "sd_base_ckpt": args.sd_base_ckpt,
         "resume_ckpt": args.resume_ckpt,
-        "init_ckpt": init_ckpt or getattr(model, "_checkpoint_initialization_origin", {}).get("init_ckpt", ""),
-        "initialization": initialization or getattr(model, "_checkpoint_initialization_origin", {}).get("initialization"),
         "start_step": int(start_step),
         "strict_same_version_resume": True,
         "keep_step_checkpoints": int(args.keep_step_checkpoints),
