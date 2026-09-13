@@ -157,10 +157,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
         self.lidar_depth_bottleneck_scale = float(lidar_depth_bottleneck_scale)
         self.lidar_depth_log_eps = float(lidar_depth_log_eps)
         self.lidar_depth_resample_mode = str(lidar_depth_resample_mode or "masked_area")
-        if self.lidar_depth_resample_mode not in {"legacy_nearest", "masked_area"}:
+        if self.lidar_depth_resample_mode not in {"legacy_nearest", "masked_area", "native"}:
             raise ValueError(
-                "lidar_depth_resample_mode must be either "
-                f"'legacy_nearest' or 'masked_area', got {self.lidar_depth_resample_mode!r}"
+                "lidar_depth_resample_mode must be one of "
+                f"'legacy_nearest', 'masked_area' or 'native', got {self.lidar_depth_resample_mode!r}"
             )
         self.lidar_semantic_alignment_weight = float(lidar_semantic_alignment_weight)
         self.lidar_semantic_alignment_key = str(lidar_semantic_alignment_key or "image_semantic_feat")
@@ -305,6 +305,10 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
             return None, None
         hit = lidar_cond[:, 1:2].float().clamp(0.0, 1.0)
         depth = lidar_cond[:, 2:3].float().clamp(0.0, 1.0) * hit
+        if self.lidar_depth_resample_mode == "native":
+            # Keep the original z-buffer hit locations; do not average even to
+            # the VAE latent grid before the pixel-resolution loss sees them.
+            return depth, hit
         target_h, target_w = latent_shape[-2:]
         if hit.shape[-2] % target_h == 0 and hit.shape[-1] % target_w == 0:
             kernel = (hit.shape[-2] // target_h, hit.shape[-1] // target_w)
@@ -1620,6 +1624,7 @@ class Boost_Sat2Den_ddpm(pl.LightningModule):
                     or ".lidar_depth_head." in name
                     or ".lidar_bottleneck_depth_head." in name
                     or name.startswith("lidar_depth_head.")
+                    or name.startswith("lidar_pixel_depth_head.")
                     or name.startswith("lidar_bottleneck_depth_head.")
                     or name.endswith(".lidar_gate")
                 ):

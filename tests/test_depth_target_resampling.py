@@ -2,6 +2,7 @@ import ast
 from pathlib import Path
 
 import unittest
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
@@ -25,8 +26,9 @@ def load_depth_helpers():
     ast.fix_missing_locations(module)
     namespace = {
         "F": F,
+        "torch": torch,
         "ValueError": ValueError,
-        "LIDAR_DEPTH_RESAMPLE_MODES": {"legacy_nearest", "masked_area"},
+        "LIDAR_DEPTH_RESAMPLE_MODES": {"legacy_nearest", "masked_area", "native"},
     }
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace["resize_masked_lidar_depth"]
@@ -182,6 +184,69 @@ def test_valid_depth_correction_reverses_wrong_gradient_direction():
         gradients.append(pred.grad.item())
     assert gradients[0] > 0  # Gradient descent wrongly drives depth down.
     assert gradients[1] < 0  # Correct 0.5 target drives prediction upward.
+
+
+def test_native_keeps_adjacent_foreground_and_background_hits_distinct():
+    depth = torch.zeros(1, 1, 128, 512)
+    mask = torch.zeros_like(depth)
+    depth[..., 40, 100] = 10.0 / 80.0
+    depth[..., 40, 101] = 30.0 / 80.0
+    mask[..., 40, 100:102] = 1.0
+    target, support = resize_masked_lidar_depth(depth, mask, (128, 512), mode="native")
+    assert torch.equal(target, depth)
+    assert torch.equal(support, mask)
+    # Swapping two nearby surfaces used to be invisible to a coarse mean.
+    pred = target.clone()
+    pred[..., 40, 100:102] = target[..., 40, 100:102].flip(-1)
+    pred.requires_grad_()
+    loss = masked_log_l1(pred, target, support)
+    loss.backward()
+    assert loss.item() > 0.0
+    assert pred.grad[..., 40, 100].item() > 0.0
+    assert pred.grad[..., 40, 101].item() < 0.0
+    assert torch.count_nonzero(pred.grad * (1 - mask)) == 0
+
+
+def test_native_rejects_coarsened_or_invalid_targets():
+    depth = torch.full((1, 1, 16, 64), 0.25)
+    mask = torch.ones_like(depth)
+    with unittest.TestCase().assertRaises(ValueError):
+        resize_masked_lidar_depth(depth, mask, (128, 512), mode="native")
+    for value in (0.0, float("nan"), float("inf"), 1.1):
+        with unittest.TestCase().assertRaises(ValueError):
+            resize_masked_lidar_depth(torch.full_like(depth, value), mask, (16, 64), mode="native")
+
+
+def test_native_empty_pixels_do_not_supervise_or_backpropagate():
+    depth = torch.zeros(1, 1, 4, 8)
+    mask = torch.zeros_like(depth)
+    target, support = resize_masked_lidar_depth(depth, mask, (4, 8), mode="native")
+    pred = torch.full_like(depth, 0.25, requires_grad=True)
+    loss = masked_log_l1(pred, target, support)
+    loss.backward()
+    assert loss.item() == 0.0
+    assert torch.isfinite(pred.grad).all()
+    assert torch.count_nonzero(pred.grad) == 0
+
+
+def test_native_training_target_bypasses_latent_pooling():
+    source = SOURCE.parents[1] / "KITTI_geo_ldm" / "txt_control.py"
+    tree = ast.parse(source.read_text())
+    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "lidar_depth_target_mask")
+    module = ast.Module(body=[method], type_ignores=[])
+    namespace = {"F": F}
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    cond = torch.zeros(1, 3, 128, 512)
+    cond[:, 1, 40, 100:102] = 1.0
+    cond[:, 2, 40, 100:102] = torch.tensor([0.125, 0.375])
+    make_target = namespace["lidar_depth_target_mask"]
+    target, mask = make_target(SimpleNamespace(lidar_depth_resample_mode="native"), cond, (1, 4, 16, 64))
+    assert target.shape == (1, 1, 128, 512)
+    assert torch.equal(target, cond[:, 2:3])
+    assert torch.equal(mask, cond[:, 1:2])
+    old_target, old_mask = make_target(SimpleNamespace(lidar_depth_resample_mode="masked_area"), cond, (1, 4, 16, 64))
+    assert old_target.shape == (1, 1, 16, 64)
+    assert torch.allclose(old_target[old_mask > 0], torch.tensor([0.25]))
 
 
 def load_tests(loader, tests, pattern):

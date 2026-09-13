@@ -15,7 +15,7 @@ from utils.util import instantiate_from_config
 import torch.nn.functional as F
 
 
-LIDAR_DEPTH_RESAMPLE_MODES = {"legacy_nearest", "masked_area"}
+LIDAR_DEPTH_RESAMPLE_MODES = {"legacy_nearest", "masked_area", "native"}
 
 
 def _as_nchw_depth_tensor(tensor):
@@ -37,6 +37,9 @@ def resize_masked_lidar_depth(depth, mask, size, mode="masked_area"):
     masked_area computes area_pool(depth * hit) / area_pool(hit) at the target
     size. Its returned mask is the same hit support used for the target; empty
     cells get zero mask and are excluded from the depth loss.
+
+    native preserves individual hit pixels and refuses spatial resizing. It is
+    used by the V2.2 image-resolution head so nearby surfaces are not averaged.
     """
     mode = str(mode or "masked_area")
     if mode not in LIDAR_DEPTH_RESAMPLE_MODES:
@@ -46,6 +49,13 @@ def resize_masked_lidar_depth(depth, mask, size, mode="masked_area"):
         )
     depth = _as_nchw_depth_tensor(depth).float()
     mask = _as_nchw_depth_tensor(mask).float().clamp(0.0, 1.0)
+    if mode == "native":
+        if depth.shape != mask.shape or depth.shape[-2:] != tuple(size):
+            raise ValueError("native depth supervision requires prediction, target and mask at the same resolution")
+        valid_depth = depth[mask > 0.0]
+        if not torch.isfinite(valid_depth).all() or (valid_depth <= 0.0).any() or (valid_depth > 1.0).any():
+            raise ValueError("native depth supervision requires finite normalized depth in (0, 1] at valid hits")
+        return torch.where(mask > 0.0, depth, torch.zeros_like(depth)), mask
     if mode == "legacy_nearest":
         resized_depth = depth
         if depth.shape[-2:] != tuple(size):
@@ -422,7 +432,11 @@ class DDPM(pl.LightningModule):
             record_loss(coverage_name, depth_mask.mean())
             record_loss(pred_mean_name, (depth_pred * depth_mask).sum() / denom)
             record_loss(target_mean_name, (depth_target * depth_mask).sum() / denom)
-            record_loss(mode_name, 1.0 if str(lidar_depth_resample_mode or "masked_area") == "masked_area" else 0.0)
+            record_loss(mode_name, {"legacy_nearest": 0.0, "masked_area": 1.0, "native": 2.0}[str(lidar_depth_resample_mode or "masked_area")])
+            head_prefix = f"lidar_{prefix}_depth" if prefix else "lidar_depth"
+            record_loss(f"{head_prefix}_height", depth_pred.shape[-2])
+            record_loss(f"{head_prefix}_width", depth_pred.shape[-1])
+            record_loss(f"{head_prefix}_valid_count", (depth_mask > 0.0).sum())
             return depth_weight * lidar_depth_loss
 
         if (

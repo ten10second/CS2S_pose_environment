@@ -60,6 +60,10 @@ def is_lidar_pixel_config(cfg):
     return str(target) == LIDAR_PIXEL_CONTEXT_TARGET
 
 
+def uses_native_depth_head(cfg):
+    return OmegaConf.select(cfg, "model.params.DDPM_config.params.unet_config.params.lidar_depth_head_mode") == "pixel"
+
+
 def delete_config_key(config, key):
     if key in config:
         del config[key]
@@ -153,6 +157,7 @@ def parse_args():
     )
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--resume-ckpt", default="")
+    parser.add_argument("--init-ckpt", default="", help="Initialize V2.2 weights from V2.1; keep the new depth head fresh and reset optimizer/step.")
     parser.add_argument(
         "--min-free-disk-gb",
         type=float,
@@ -474,6 +479,9 @@ def resource_metrics():
 
 def configure_cfg(cfg, args):
     use_lidar_pixel = is_lidar_pixel_config(cfg)
+    native_depth = uses_native_depth_head(cfg)
+    if native_depth and not use_lidar_pixel:
+        raise ValueError("The V2.2 native depth head requires the pixel LiDAR configuration")
     cfg.model.base_learning_rate = args.lr
     cfg.model.params.pre_sat2grd_model_path = None
     cfg.model.params.pre_ldm_model_path = args.sd_base_ckpt
@@ -481,13 +489,13 @@ def configure_cfg(cfg, args):
     cfg.model.params.use_lidar_cond = True
     cfg.model.params.lidar_geom_mode = LIDAR_GEOM_MODE
 
-    # Current compact objective: global eps + LiDAR-hit eps + bottleneck depth + DINO alignment.
+    # Global eps + LiDAR-hit eps + the selected depth head + DINO alignment.
     cfg.model.params.dynamic_point_loss_weight = float(args.lidar_support_loss_weight)
     cfg.model.params.dynamic_point_dilation = int(args.lidar_support_dilation)
     cfg.model.params.lidar_depth_loss_weight = float(args.lidar_depth_loss_weight)
-    cfg.model.params.lidar_depth_resample_mode = "masked_area"
-    cfg.model.params.lidar_depth_output_scale = 0.0
-    cfg.model.params.lidar_depth_bottleneck_scale = 1.0
+    cfg.model.params.lidar_depth_resample_mode = "native" if native_depth else "masked_area"
+    cfg.model.params.lidar_depth_output_scale = 1.0 if native_depth else 0.0
+    cfg.model.params.lidar_depth_bottleneck_scale = 0.0 if native_depth else 1.0
     cfg.model.params.lidar_depth_log_eps = float(args.lidar_depth_log_eps)
     cfg.model.params.ray_evidence_mask_mode = RAY_EVIDENCE_MASK_MODE
     cfg.model.params.lidar_semantic_alignment_weight = float(args.lidar_semantic_alignment_weight)
@@ -626,10 +634,38 @@ def load_training_checkpoint(model, optimizer, ckpt_path, scaler=None, expected_
     optimizer.load_state_dict(payload["optimizer"])
     if scaler is not None:
         scaler.load_state_dict(payload["grad_scaler"])
+    source_metadata = payload.get("metadata", {})
+    model._checkpoint_initialization_origin = {
+        "init_ckpt": source_metadata.get("init_ckpt", ""),
+        "initialization": source_metadata.get("initialization"),
+    }
     step = int(payload.get("step", 0))
     del payload
     gc.collect()
     return step
+
+
+def initialize_v22_from_v21(model, ckpt_path):
+    """Explicit weights-only migration; strict resume remains same-version only."""
+    if getattr(model.DDPM.denoise_model, "lidar_depth_head_mode", "latent") != "pixel":
+        raise ValueError("--init-ckpt is reserved for V2.1 to V2.2 pixel-depth initialization")
+    payload = torch.load(ckpt_path, map_location="cpu")
+    if payload.get("metadata", {}).get("architecture") != "satellite_lidar_pixel_v21_ray_posterior":
+        raise ValueError("--init-ckpt requires a V2.1 pixel LiDAR checkpoint")
+    current = model.DDPM.denoise_model.state_dict()
+    saved = payload["denoise_model"]
+    expected_new = {key for key in current if key.startswith("lidar_pixel_depth_head.")}
+    missing = set(current) - set(saved)
+    unexpected = set(saved) - set(current)
+    if not expected_new or missing != expected_new or unexpected:
+        raise RuntimeError(f"V2.1 to V2.2 initialization key mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
+    result = model.DDPM.denoise_model.load_state_dict(saved, strict=False)
+    model.condition_model_sat.load_state_dict(payload["condition_model_sat"], strict=True)
+    model.lidar_context_model.load_state_dict(payload["lidar_context_model"], strict=True)
+    info = {"source_step": int(payload["step"]), "fresh_parameters": list(result.missing_keys), "optimizer_reset": True}
+    del payload
+    gc.collect()
+    return info
 
 
 def free_disk_gb(path):
@@ -1278,6 +1314,9 @@ def new_metric_window():
         "optimizer_skipped_steps": 0,
         "lidar_support_image_mask_coverage": 0.0,
         "lidar_support_latent_mask_coverage": 0.0,
+        "lidar_depth_log_l1": 0.0,
+        "lidar_depth_log_l1_contrib": 0.0,
+        "lidar_depth_mask_coverage": 0.0,
         "lidar_bottleneck_depth_log_l1": 0.0,
         "lidar_bottleneck_depth_log_l1_contrib": 0.0,
         "lidar_bottleneck_depth_mask_coverage": 0.0,
@@ -1296,6 +1335,9 @@ def run_training(args, dist_info):
     local_rank = dist_info["local_rank"]
     device = dist_info["device"]
     is_main = dist_info["is_main"]
+    init_ckpt = getattr(args, "init_ckpt", "")
+    if init_ckpt and args.resume_ckpt:
+        raise ValueError("--init-ckpt and --resume-ckpt are mutually exclusive")
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -1307,6 +1349,9 @@ def run_training(args, dist_info):
     cfg = configure_cfg(OmegaConf.load(args.config), args)
     use_lidar_pixel = is_lidar_pixel_config(cfg)
     architecture = (
+        "satellite_lidar_pixel_v22_ray_posterior"
+        if uses_native_depth_head(cfg)
+        else
         "satellite_lidar_pixel_v21_ray_posterior"
         if use_lidar_pixel
         else "satellite_lidar_zbuffer_visible_ray_posterior"
@@ -1346,7 +1391,7 @@ def run_training(args, dist_info):
         )
     )
 
-    default_run_suffix = "pixel_lidar_v21" if use_lidar_pixel else "ray_posterior"
+    default_run_suffix = "pixel_lidar_v22" if uses_native_depth_head(cfg) else ("pixel_lidar_v21" if use_lidar_pixel else "ray_posterior")
     run_name = args.run_name or f"kitti_{default_run_suffix}_sd14_fresh_{args.steps}step"
     out_dir = Path(args.out_root) / run_name
     metrics_dir = out_dir / "metrics"
@@ -1384,6 +1429,16 @@ def run_training(args, dist_info):
         args.min_free_host_memory_gb,
     )
     model.learning_rate = args.lr
+    initialization = None
+    if init_ckpt:
+        # Serialize checkpoint reads to avoid loading four 11-GB payloads at once.
+        for owner_rank in range(world_size if distributed else 1):
+            if rank == owner_rank:
+                require_host_memory(args.min_free_host_memory_gb, "V2.2 weights initialization")
+                initialization = initialize_v22_from_v21(model, init_ckpt)
+            distributed_barrier(distributed)
+        if is_main:
+            print(json.dumps({"initialized_from": init_ckpt, **initialization}, sort_keys=True))
     optimizer = model.configure_optimizers()[0]
     scaler = GradScaler(enabled=bool(args.amp and torch.cuda.is_available()))
     start_step = 0
@@ -1426,6 +1481,8 @@ def run_training(args, dist_info):
         "backbone": LIDAR_PIXEL_CONTEXT_BACKBONE if use_lidar_pixel else LIDAR_CONTEXT_BACKBONE,
         "sd_base_ckpt": args.sd_base_ckpt,
         "resume_ckpt": args.resume_ckpt,
+        "init_ckpt": init_ckpt or getattr(model, "_checkpoint_initialization_origin", {}).get("init_ckpt", ""),
+        "initialization": initialization or getattr(model, "_checkpoint_initialization_origin", {}).get("initialization"),
         "start_step": int(start_step),
         "strict_same_version_resume": True,
         "keep_step_checkpoints": int(args.keep_step_checkpoints),
@@ -1473,9 +1530,10 @@ def run_training(args, dist_info):
         "lidar_support_loss_weight": float(args.lidar_support_loss_weight),
         "lidar_support_dilation": int(args.lidar_support_dilation),
         "lidar_depth_loss_weight": float(args.lidar_depth_loss_weight),
-        "lidar_depth_resample_mode": "masked_area",
-        "lidar_depth_output_scale": 0.0,
-        "lidar_depth_bottleneck_scale": 1.0,
+        "lidar_depth_resample_mode": cfg.model.params.lidar_depth_resample_mode,
+        "lidar_depth_output_scale": float(cfg.model.params.lidar_depth_output_scale),
+        "lidar_depth_bottleneck_scale": float(cfg.model.params.lidar_depth_bottleneck_scale),
+        "lidar_depth_head_mode": getattr(model.DDPM.denoise_model, "lidar_depth_head_mode", "latent"),
         "lidar_depth_log_eps": float(args.lidar_depth_log_eps),
         "lidar_ray_feature_cache_root": "" if use_lidar_pixel else args.lidar_ray_feature_cache_root,
         "lidar_ray_cache_planes": 0 if use_lidar_pixel else LIDAR_RAY_CACHE_PLANES,
@@ -1556,6 +1614,9 @@ def run_training(args, dist_info):
             window["lidar_support_latent_mask_coverage"] += lidar_support_stats["lidar_support_latent_mask_coverage"]
             loss_metrics = getattr(model.DDPM, "last_loss_metrics", {})
             semantic_metrics = getattr(model, "last_lidar_semantic_alignment_metrics", {})
+            window["lidar_depth_log_l1"] += float(loss_metrics.get("loss_lidar_depth_log_l1", 0.0))
+            window["lidar_depth_log_l1_contrib"] += float(loss_metrics.get("loss_lidar_depth_log_l1_contrib", 0.0))
+            window["lidar_depth_mask_coverage"] += float(loss_metrics.get("lidar_depth_mask_coverage", 0.0))
             window["lidar_bottleneck_depth_log_l1"] += float(
                 loss_metrics.get("loss_lidar_bottleneck_depth_log_l1", 0.0)
             )
@@ -1595,6 +1656,10 @@ def run_training(args, dist_info):
                     "window_steps": window_steps,
                     "optimizer_skipped_steps_in_window": window["optimizer_skipped_steps"],
                     "amp_scale": float(scaler.get_scale()),
+                    "lidar_depth_head_mode": getattr(model.DDPM.denoise_model, "lidar_depth_head_mode", "latent"),
+                    "window_lidar_depth_log_l1_mean": window["lidar_depth_log_l1"] / window_steps,
+                    "window_lidar_depth_log_l1_contrib_mean": window["lidar_depth_log_l1_contrib"] / window_steps,
+                    "window_lidar_depth_mask_coverage_mean": window["lidar_depth_mask_coverage"] / window_steps,
                     "window_lidar_support_image_mask_coverage_mean": window[
                         "lidar_support_image_mask_coverage"
                     ]
@@ -1616,8 +1681,8 @@ def run_training(args, dist_info):
                     ]
                     / window_steps,
                     "lidar_depth_loss_weight": float(args.lidar_depth_loss_weight),
-                    "lidar_depth_output_scale": 0.0,
-                    "lidar_depth_bottleneck_scale": 1.0,
+                    "lidar_depth_output_scale": float(cfg.model.params.lidar_depth_output_scale),
+                    "lidar_depth_bottleneck_scale": float(cfg.model.params.lidar_depth_bottleneck_scale),
                     "lidar_depth_log_eps": float(args.lidar_depth_log_eps),
                     "lidar_semantic_alignment_weight": float(args.lidar_semantic_alignment_weight),
                     "lidar_semantic_alignment_mask_mode": LIDAR_SEMANTIC_MASK_MODE,

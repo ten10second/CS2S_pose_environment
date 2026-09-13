@@ -54,17 +54,25 @@ def tensor_finite(value):
     return bool(torch.is_tensor(value) and torch.isfinite(value.detach()).all().item())
 
 
-def gradient_summary(g_depth, g_total):
+def gradient_summary(g_depth, g_total, prefix="bottleneck_h_grad"):
+    connected_key = f"{prefix}_connected"
+    depth_norm_key = f"{prefix}_depth_norm"
+    total_norm_key = f"{prefix}_total_norm"
+    other_norm_key = f"{prefix}_other_norm"
+    ratio_key = f"{prefix}_depth_to_other_ratio"
+    total_cosine_key = f"{prefix}_depth_total_cosine"
+    other_cosine_key = f"{prefix}_depth_other_cosine"
+    finite_key = f"{prefix}_finite"
     if g_depth is None or g_total is None:
         return {
-            "bottleneck_h_grad_connected": False,
-            "bottleneck_h_grad_depth_norm": 0.0,
-            "bottleneck_h_grad_total_norm": 0.0,
-            "bottleneck_h_grad_other_norm": 0.0,
-            "bottleneck_h_grad_depth_to_other_ratio": 0.0,
-            "bottleneck_h_grad_depth_total_cosine": 0.0,
-            "bottleneck_h_grad_depth_other_cosine": 0.0,
-            "bottleneck_h_grad_finite": False,
+            connected_key: False,
+            depth_norm_key: 0.0,
+            total_norm_key: 0.0,
+            other_norm_key: 0.0,
+            ratio_key: 0.0,
+            total_cosine_key: 0.0,
+            other_cosine_key: 0.0,
+            finite_key: False,
         }
     g_depth = g_depth.detach().float()
     g_total = g_total.detach().float()
@@ -79,14 +87,14 @@ def gradient_summary(g_depth, g_total):
     ratio = depth_norm / other_norm.clamp_min(1e-12)
     finite = torch.isfinite(g_depth).all() and torch.isfinite(g_total).all() and torch.isfinite(g_other).all()
     return {
-        "bottleneck_h_grad_connected": True,
-        "bottleneck_h_grad_depth_norm": scalar(depth_norm),
-        "bottleneck_h_grad_total_norm": scalar(total_norm),
-        "bottleneck_h_grad_other_norm": scalar(other_norm),
-        "bottleneck_h_grad_depth_to_other_ratio": scalar(ratio),
-        "bottleneck_h_grad_depth_total_cosine": scalar(cosine),
-        "bottleneck_h_grad_depth_other_cosine": scalar(other_cosine),
-        "bottleneck_h_grad_finite": bool(finite.item()),
+        connected_key: True,
+        depth_norm_key: scalar(depth_norm),
+        total_norm_key: scalar(total_norm),
+        other_norm_key: scalar(other_norm),
+        ratio_key: scalar(ratio),
+        total_cosine_key: scalar(cosine),
+        other_cosine_key: scalar(other_cosine),
+        finite_key: bool(finite.item()),
     }
 
 
@@ -112,8 +120,13 @@ def depth_loss_stats(
         mode=mode,
     )
     target = target.to(device=depth_pred.device, dtype=depth_pred.dtype)
-    resized_mask = F.interpolate(lidar_depth_mask.float(), size=depth_pred.shape[-2:], mode="area")
-    depth_mask = resized_mask.to(device=depth_pred.device, dtype=depth_pred.dtype)
+    if str(mode or "masked_area") == "native":
+        depth_mask = lidar_depth_mask.to(device=depth_pred.device, dtype=depth_pred.dtype)
+        if target.shape != depth_pred.shape or depth_mask.shape != depth_pred.shape:
+            raise ValueError("native probe depth loss requires pred/target/mask at identical resolution")
+    else:
+        resized_mask = F.interpolate(lidar_depth_mask.float(), size=depth_pred.shape[-2:], mode="area")
+        depth_mask = resized_mask.to(device=depth_pred.device, dtype=depth_pred.dtype)
     if target_support is not None:
         target_support = target_support.to(device=depth_pred.device, dtype=depth_pred.dtype)
         depth_mask = depth_mask * (target_support > 0.0).to(depth_mask.dtype)
@@ -127,6 +140,8 @@ def depth_loss_stats(
         "log_l1": log_l1,
         "target": target,
         "mask": depth_mask,
+        "target_shape": list(target.shape),
+        "mask_shape": list(depth_mask.shape),
         "invalid_zero_target_count_before_clamp": int(invalid_zero_targets.detach().cpu()),
         "support_count": int((depth_mask > 0.0).sum().detach().cpu()),
         "target_mean": scalar(masked_mean(target_clamped, depth_mask)),
@@ -155,10 +170,48 @@ def patch_cfg(cfg, args):
         params.include_raw_lidar_points = False
         params.include_tracklets = False
     cfg.model.params.lidar_depth_loss_weight = float(args.depth_loss_weight)
-    cfg.model.params.lidar_depth_output_scale = 0.0
-    cfg.model.params.lidar_depth_bottleneck_scale = 1.0
-    cfg.model.params.lidar_depth_resample_mode = "masked_area"
+    if not hasattr(cfg.model.params, "lidar_depth_output_scale"):
+        cfg.model.params.lidar_depth_output_scale = 0.0
+    if not hasattr(cfg.model.params, "lidar_depth_bottleneck_scale"):
+        cfg.model.params.lidar_depth_bottleneck_scale = 1.0
+    if not hasattr(cfg.model.params, "lidar_depth_resample_mode"):
+        cfg.model.params.lidar_depth_resample_mode = "masked_area"
     return cfg
+
+
+def active_depth_head_from_cfg(cfg):
+    params = cfg.model.params
+    output_scale = float(getattr(params, "lidar_depth_output_scale", 1.0))
+    bottleneck_scale = float(getattr(params, "lidar_depth_bottleneck_scale", 1.0))
+    enabled = []
+    if output_scale > 0.0:
+        enabled.append(
+            {
+                "name": "output",
+                "attr": "last_lidar_depth_pred",
+                "metric_prefix": "",
+                "scale": output_scale,
+                "gradient_scope": "output_decoder_h",
+                "gradient_prefix": "output_h_grad",
+            }
+        )
+    if bottleneck_scale > 0.0:
+        enabled.append(
+            {
+                "name": "bottleneck",
+                "attr": "last_lidar_bottleneck_depth_pred",
+                "metric_prefix": "bottleneck",
+                "scale": bottleneck_scale,
+                "gradient_scope": "bottleneck_feature_h",
+                "gradient_prefix": "bottleneck_h_grad",
+            }
+        )
+    if len(enabled) != 1:
+        raise ValueError(
+            "pixel supervision probe requires exactly one enabled LiDAR depth head; "
+            f"got output_scale={output_scale} and bottleneck_scale={bottleneck_scale}"
+        )
+    return enabled[0]
 
 
 def batch_to_device(sample, device):
@@ -182,6 +235,7 @@ def fixed_timestep(model, t_value):
             "lidar_depth_mask": kwargs.get("lidar_depth_mask"),
             "lidar_depth_loss_weight": kwargs.get("lidar_depth_loss_weight"),
             "lidar_depth_bottleneck_scale": kwargs.get("lidar_depth_bottleneck_scale"),
+            "lidar_depth_output_scale": kwargs.get("lidar_depth_output_scale"),
             "lidar_depth_resample_mode": kwargs.get("lidar_depth_resample_mode"),
             "lidar_depth_log_eps": kwargs.get("lidar_depth_log_eps"),
         }
@@ -209,6 +263,32 @@ def middle_block_capture(model):
         handle.remove()
 
 
+@contextmanager
+def output_decoder_capture(model):
+    state = {"h": None}
+
+    def hook(_module, inputs):
+        state["h"] = inputs[0] if inputs else None
+
+    handle = model.DDPM.denoise_model.out.register_forward_pre_hook(hook)
+    try:
+        yield state
+    finally:
+        handle.remove()
+
+
+@contextmanager
+def depth_gradient_capture(model, head_scope):
+    if head_scope == "output":
+        with output_decoder_capture(model) as state:
+            yield state
+    elif head_scope == "bottleneck":
+        with middle_block_capture(model) as state:
+            yield state
+    else:
+        raise ValueError(f"unknown head scope {head_scope!r}")
+
+
 def run_with_rng(device, seed):
     if device.type == "cuda":
         devices = [device.index if device.index is not None else torch.cuda.current_device()]
@@ -226,7 +306,7 @@ def metric_agreement(computed, reported, atol=2e-4):
     return {"reported": reported_value, "abs_error": error, "matches": bool(error <= float(atol))}
 
 
-def evaluate_sample(model, trainer, sample, sample_index, device, want_grad, args):
+def evaluate_sample(model, trainer, sample, sample_index, device, want_grad, args, head_spec):
     t_value = TIMESTEP_CYCLE[sample_index % len(TIMESTEP_CYCLE)]
     batch = batch_to_device(sample, device)
     seed = int(args.seed) + int(sample_index)
@@ -237,32 +317,37 @@ def evaluate_sample(model, trainer, sample, sample_index, device, want_grad, arg
         torch.manual_seed(seed)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
-        with grad_ctx, fixed_timestep(model, t_value) as captured_p_losses, middle_block_capture(model) as capture:
+        with grad_ctx, fixed_timestep(model, t_value) as captured_p_losses, depth_gradient_capture(model, head_spec["name"]) as capture:
             with autocast_ctx:
                 total_loss = trainer(batch, 0)
-            head = model.DDPM.denoise_model.last_lidar_bottleneck_depth_pred
+            head = getattr(model.DDPM.denoise_model, head_spec["attr"], None)
+            if head is None:
+                raise RuntimeError(f"active LiDAR depth head {head_spec['attr']} was not produced")
             depth_kwargs = captured_p_losses["kwargs"] or {}
             lidar_depth_target = depth_kwargs.get("lidar_depth_target")
             lidar_depth_mask = depth_kwargs.get("lidar_depth_mask")
             if lidar_depth_target is None or lidar_depth_mask is None:
                 raise RuntimeError("p_losses did not receive lidar_depth_target/lidar_depth_mask")
+            raw_target_shape = list(lidar_depth_target.shape)
+            raw_mask_shape = list(lidar_depth_mask.shape)
+            depth_resample_mode = str(depth_kwargs.get("lidar_depth_resample_mode") or "masked_area")
             stats = depth_loss_stats(
                 head,
                 lidar_depth_target,
                 lidar_depth_mask,
-                mode=str(depth_kwargs.get("lidar_depth_resample_mode") or "masked_area"),
+                mode=depth_resample_mode,
                 eps=float(depth_kwargs.get("lidar_depth_log_eps") or getattr(model, "lidar_depth_log_eps", 1e-3)),
                 weight=float(depth_kwargs.get("lidar_depth_loss_weight") or args.depth_loss_weight)
-                * float(depth_kwargs.get("lidar_depth_bottleneck_scale") or 1.0),
+                * float(depth_kwargs.get(f"lidar_depth_{head_spec['name']}_scale") or head_spec["scale"]),
             )
             grad_stats = {}
             if want_grad:
                 h = capture["h"]
                 if h is None or not torch.is_tensor(h):
-                    raise RuntimeError("middle_block hook did not capture a tensor output")
+                    raise RuntimeError(f"{head_spec['gradient_scope']} hook did not capture a tensor")
                 g_depth = torch.autograd.grad(stats["loss"], h, retain_graph=True, allow_unused=True)[0]
                 g_total = torch.autograd.grad(total_loss, h, retain_graph=False, allow_unused=True)[0]
-                grad_stats = gradient_summary(g_depth, g_total)
+                grad_stats = gradient_summary(g_depth, g_total, prefix=head_spec["gradient_prefix"])
             finite = {
                 "total_loss_finite": torch.isfinite(total_loss.detach()).item(),
                 "head_depth_finite": tensor_finite(head),
@@ -272,14 +357,22 @@ def evaluate_sample(model, trainer, sample, sample_index, device, want_grad, arg
         key: scalar(value) if torch.is_tensor(value) else value
         for key, value in getattr(model.DDPM, "last_loss_metrics", {}).items()
     }
+    metric_stem = "loss_lidar_depth" if not head_spec["metric_prefix"] else f"loss_lidar_{head_spec['metric_prefix']}_depth"
     log_l1_agreement = metric_agreement(
         scalar(stats["log_l1"]),
-        metrics.get("loss_lidar_bottleneck_depth_log_l1"),
+        metrics.get(f"{metric_stem}_log_l1"),
     )
     contrib_agreement = metric_agreement(
         scalar(stats["weighted_depth_contribution"]),
-        metrics.get("loss_lidar_bottleneck_depth_log_l1_contrib"),
+        metrics.get(f"{metric_stem}_log_l1_contrib"),
     )
+    raw_target_is_128x512 = depth_resample_mode != "native" or raw_target_shape[-2:] == [128, 512]
+    native_target_matches_input = True
+    if depth_resample_mode == "native":
+        input_hit = batch["lidar_cond"][:, 1:2].float().clamp(0.0, 1.0)
+        input_depth = batch["lidar_cond"][:, 2:3].float().clamp(0.0, 1.0) * input_hit
+        native_target_matches_input = torch.equal(lidar_depth_mask, input_hit) and torch.equal(lidar_depth_target, input_depth)
+    active_head_shape_matches_target = list(head.shape) == list(stats["target_shape"])
     record = {
         "sample_index": int(sample_index),
         "sample_id": str(sample.get("sample_id", "")),
@@ -287,18 +380,31 @@ def evaluate_sample(model, trainer, sample, sample_index, device, want_grad, arg
         "timestep": int(t_value),
         "reported_total_loss": scalar(total_loss),
         "reported_loss_metrics": metrics,
+        "head_scope": head_spec["name"],
+        "metric_scope": metric_stem,
+        "depth_resample_mode": depth_resample_mode,
         "head_depth_shape": list(head.shape),
+        "raw_lidar_depth_target_shape": raw_target_shape,
+        "raw_lidar_depth_mask_shape": raw_mask_shape,
+        "depth_loss_target_shape": stats["target_shape"],
+        "depth_loss_mask_shape": stats["mask_shape"],
         "head_depth_log_l1": scalar(stats["log_l1"]),
         "head_depth_weighted_contribution_at_0p1": scalar(stats["weighted_depth_contribution"]),
         "head_depth_pred_mean": stats["pred_mean"],
         "head_depth_target_mean": stats["target_mean"],
         "head_depth_support_count": int(stats["support_count"]),
         "invalid_zero_target_count_before_clamp": int(stats["invalid_zero_target_count_before_clamp"]),
-        "reported_bottleneck_depth_log_l1_agreement": log_l1_agreement,
-        "reported_bottleneck_depth_contrib_agreement": contrib_agreement,
+        "raw_target_is_128x512": bool(raw_target_is_128x512),
+        "native_target_matches_input": bool(native_target_matches_input),
+        "active_head_shape_matches_target": bool(active_head_shape_matches_target),
+        "reported_depth_log_l1_agreement": log_l1_agreement,
+        "reported_depth_contrib_agreement": contrib_agreement,
         "finite_checks": finite,
-        "gradient_scope": "bottleneck_feature_h" if want_grad else "not_computed",
+        "gradient_scope": head_spec["gradient_scope"] if want_grad else "not_computed",
     }
+    if head_spec["name"] == "bottleneck":
+        record["reported_bottleneck_depth_log_l1_agreement"] = log_l1_agreement
+        record["reported_bottleneck_depth_contrib_agreement"] = contrib_agreement
     record.update(grad_stats)
     return record
 
@@ -314,6 +420,12 @@ def aggregate(records):
         "bottleneck_h_grad_depth_to_other_ratio",
         "bottleneck_h_grad_depth_total_cosine",
         "bottleneck_h_grad_depth_other_cosine",
+        "output_h_grad_depth_norm",
+        "output_h_grad_total_norm",
+        "output_h_grad_other_norm",
+        "output_h_grad_depth_to_other_ratio",
+        "output_h_grad_depth_total_cosine",
+        "output_h_grad_depth_other_cosine",
     ]
     out = {"num_records": len(records)}
     for key in numeric_keys:
@@ -328,19 +440,16 @@ def aggregate(records):
         if values:
             out[f"reported_{key}_mean"] = sum(values) / len(values)
     out["finite_all"] = all(all(record.get("finite_checks", {}).values()) for record in records)
-    out["gradient_finite_all"] = all(
-        record.get("gradient_scope") != "bottleneck_feature_h" or bool(record.get("bottleneck_h_grad_finite", False))
-        for record in records
-    )
-    out["gradient_connected_all"] = all(
-        record.get("gradient_scope") != "bottleneck_feature_h" or bool(record.get("bottleneck_h_grad_connected", False))
-        for record in records
-    )
+    out["gradient_finite_all"] = all(gradient_check(record, "finite") for record in records)
+    out["gradient_connected_all"] = all(gradient_check(record, "connected") for record in records)
     out["reported_depth_metrics_match_all"] = all(
-        record.get("reported_bottleneck_depth_log_l1_agreement", {}).get("matches", False)
-        and record.get("reported_bottleneck_depth_contrib_agreement", {}).get("matches", False)
+        record.get("reported_depth_log_l1_agreement", record.get("reported_bottleneck_depth_log_l1_agreement", {})).get("matches", False)
+        and record.get("reported_depth_contrib_agreement", record.get("reported_bottleneck_depth_contrib_agreement", {})).get("matches", False)
         for record in records
     )
+    out["raw_target_is_128x512_all"] = all(bool(record.get("raw_target_is_128x512", True)) for record in records)
+    out["native_target_matches_input_all"] = all(bool(record.get("native_target_matches_input", True)) for record in records)
+    out["active_head_shape_matches_target_all"] = all(bool(record.get("active_head_shape_matches_target", True)) for record in records)
     out["invalid_zero_target_count_before_clamp_total"] = sum(
         int(record.get("invalid_zero_target_count_before_clamp", 0)) for record in records
     )
@@ -349,9 +458,23 @@ def aggregate(records):
         and bool(out["gradient_finite_all"])
         and bool(out["gradient_connected_all"])
         and bool(out["reported_depth_metrics_match_all"])
+        and bool(out["raw_target_is_128x512_all"])
+        and bool(out["native_target_matches_input_all"])
+        and bool(out["active_head_shape_matches_target_all"])
         and int(out["invalid_zero_target_count_before_clamp_total"]) == 0
     )
     return out
+
+
+def gradient_check(record, suffix):
+    if record.get("gradient_scope") == "not_computed":
+        return True
+    head_scope = record.get("head_scope", "bottleneck")
+    if head_scope == "output":
+        return bool(record.get(f"output_h_grad_{suffix}", False))
+    if head_scope == "bottleneck":
+        return bool(record.get(f"bottleneck_h_grad_{suffix}", False))
+    return False
 
 
 def main():
@@ -372,6 +495,7 @@ def main():
         torch.cuda.manual_seed_all(int(args.seed))
 
     cfg = patch_cfg(OmegaConf.load(args.config), args)
+    head_spec = active_depth_head_from_cfg(cfg)
     (out_dir / "probe_config.yaml").write_text(OmegaConf.to_yaml(cfg))
     dataset = instantiate_from_config(cfg.data.params.train)
     model = instantiate_from_config(cfg.model).to(device)
@@ -393,6 +517,7 @@ def main():
                     device,
                     want_grad=index < int(args.gradient_samples),
                     args=args,
+                    head_spec=head_spec,
                 )
                 records.append(record)
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -415,7 +540,12 @@ def main():
         "gradient_samples": min(int(args.gradient_samples), int(count)),
         "timestep_cycle": list(TIMESTEP_CYCLE),
         "depth_loss_weight_used_for_probe": float(args.depth_loss_weight),
-        "gradient_label": "bottleneck-feature gradient wrt UNet middle_block output h",
+        "head_scope": head_spec["name"],
+        "gradient_label": (
+            "output-head gradient wrt final decoder h captured at denoise_model.out"
+            if head_spec["name"] == "output"
+            else "bottleneck-head gradient wrt UNet middle_block output h"
+        ),
         "aggregate": aggregate_stats,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))

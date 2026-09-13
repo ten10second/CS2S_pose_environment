@@ -18,6 +18,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.KITTI_attention import SpatialTransformer
+from models.KITTI_geo_ldm.lidar_pixel_depth import LidarPixelDepthHead
 from models.KITTI_geo_ldm.lidar_pixel_condition import LidarSpatialResidual
 
 
@@ -477,6 +478,7 @@ class UNetModel(nn.Module):
         lidar_posterior_strength=2.0,
         lidar_message_gate_bias=-2.0,
         lidar_spatial_channels=None,
+        lidar_depth_head_mode="latent",
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
     ):
@@ -527,6 +529,9 @@ class UNetModel(nn.Module):
         self.lidar_posterior_strength = float(lidar_posterior_strength)
         self.lidar_message_gate_bias = float(lidar_message_gate_bias)
         self.lidar_spatial_channels = tuple(lidar_spatial_channels or ())
+        self.lidar_depth_head_mode = str(lidar_depth_head_mode or "latent")
+        if self.lidar_depth_head_mode not in {"latent", "pixel"}:
+            raise ValueError("lidar_depth_head_mode must be 'latent' or 'pixel'")
         if self.lidar_spatial_channels:
             if dims != 2 or len(self.lidar_spatial_channels) != len(channel_mult):
                 raise ValueError("LiDAR spatial channels must match all 2D U-Net scales")
@@ -785,6 +790,8 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             conv_nd(dims, ch, 1, 3, padding=1),
         )
+        if self.lidar_depth_head_mode == "pixel":
+            self.lidar_pixel_depth_head = LidarPixelDepthHead(ch, dims=dims)
         self.last_lidar_depth_pred = None
         self.last_lidar_bottleneck_depth_pred = None
         if self.predict_codebook_ids:
@@ -873,7 +880,11 @@ class UNetModel(nn.Module):
             h = th.cat([h, skip], dim=1)
             h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
         h = h.type(x.dtype)
-        self.last_lidar_depth_pred = th.sigmoid(self.lidar_depth_head(h.float())).type_as(h)
+        if self.lidar_depth_head_mode == "pixel":
+            lidar_depth_logits = self.lidar_pixel_depth_head(h.float())
+        else:
+            lidar_depth_logits = self.lidar_depth_head(h.float())
+        self.last_lidar_depth_pred = th.sigmoid(lidar_depth_logits).type_as(h)
         if self.predict_codebook_ids:
             return self.id_predictor(h)
         else:
