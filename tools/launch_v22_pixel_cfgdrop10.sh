@@ -7,8 +7,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 MANIFEST_REPO="${MANIFEST_REPO:-/mnt/shizhm/CS2S_pose_environment_sat-lidar-ray-posterior-evidence}"
+SPLIT_DIR="${SPLIT_DIR:-${MANIFEST_REPO}/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30}"
 PIXEL_CACHE_ROOT="${PIXEL_CACHE_ROOT:-/home/shizhm/CS2S_cache_npz/utonia_pixel_lidar_v21_fp64_all_fp16}"
-SAMPLE_MANIFEST="${SAMPLE_MANIFEST:-${MANIFEST_REPO}/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/train_manifest.jsonl}"
+SAMPLE_MANIFEST="${SAMPLE_MANIFEST:-${SPLIT_DIR}/fixed_test_sequences.jsonl}"
+SAMPLE_NUM_SAMPLES="${SAMPLE_NUM_SAMPLES:-32}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-5000}"
 
 if [[ "${RUN_V22_PIXEL_CFGDROP10:-0}" != "1" ]]; then
     cat <<'EOF'
@@ -29,8 +32,8 @@ exec env \
     --sd-base-ckpt /mnt/shizhm/BasicModel/checkpoints/sd-v1-4.ckpt \
     --kitti-root /mnt/shizhm/DATA/KITTI/KITTI_RAW \
     --allow-ddp-inline-sampling \
-    --train-manifest "$MANIFEST_REPO/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/train_manifest.jsonl" \
-    --val-manifest "$MANIFEST_REPO/dataset/KITTI_location/kitti_raw_sat_lidar_geofence_test2_buffer30/test_manifest.jsonl" \
+    --train-manifest "$SPLIT_DIR/train_manifest.jsonl" \
+    --val-manifest "$SPLIT_DIR/test_manifest.jsonl" \
     --out-root /mnt/shizhm/DATA/KITTI/CS2S_results/kitti_ray_posterior \
     --run-name pixel_lidar_v22_cfgdrop10 \
     --steps 300000 \
@@ -45,9 +48,9 @@ exec env \
     --log-every 20 \
     --save-every 5000 \
     --keep-step-checkpoints 2 \
-    --sample-every 1000 \
+    --sample-every "$SAMPLE_EVERY" \
     --sample-manifest "$SAMPLE_MANIFEST" \
-    --sample-num-samples 2 \
+    --sample-num-samples "$SAMPLE_NUM_SAMPLES" \
     --sample-ddim-steps 50 \
     --sample-seed 2026 \
     --sample-fixed-seed --sample-eta 0.0 \
