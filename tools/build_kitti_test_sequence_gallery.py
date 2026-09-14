@@ -146,9 +146,9 @@ def _gallery_html(metadata: Mapping[str, Any], clips: Sequence[Sequence[Record]]
       font-family: Arial, "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
     }}
     main {{
-      max-width: 1680px;
+      max-width: 1872px;
       margin: 0 auto;
-      padding: 22px 28px 34px;
+      padding: 22px 20px 34px;
     }}
     header {{
       display: flex;
@@ -210,7 +210,7 @@ def _gallery_html(metadata: Mapping[str, Any], clips: Sequence[Sequence[Record]]
     }}
     .grid {{
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: 256px repeat(3, minmax(0, 1fr));
       gap: 12px;
       align-items: stretch;
     }}
@@ -235,8 +235,8 @@ def _gallery_html(metadata: Mapping[str, Any], clips: Sequence[Sequence[Record]]
       font-weight: 400;
     }}
     .image-wrap {{
-      height: min(52vh, 560px);
-      min-height: 320px;
+      height: 256px;
+      min-height: 256px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -290,8 +290,8 @@ def _gallery_html(metadata: Mapping[str, Any], clips: Sequence[Sequence[Record]]
     .thumb img {{
       display: block;
       width: 100%;
-      aspect-ratio: 1 / 1;
-      object-fit: cover;
+      aspect-ratio: 4 / 1;
+      object-fit: contain;
       border: 1px solid var(--border);
     }}
     .thumb span {{
@@ -321,7 +321,7 @@ def _gallery_html(metadata: Mapping[str, Any], clips: Sequence[Sequence[Record]]
   <main>
     <header>
       <div>
-        <h1>KITTI test2 连续帧对比</h1>
+        <h1>V2.2 · KITTI test2 连续帧对比</h1>
         <div class="subhead">固定测试集片段，逐帧独立生成；片段内固定 seed。LiDAR 叠加 GT 仅用于查看投影，GT RGB 不作为生成条件。深度由近到远：红 → 黄 → 绿 → 青 → 蓝。</div>
       </div>
       <div class="subhead">checkpoint <strong>{html.escape(checkpoint_label)}</strong></div>
@@ -455,7 +455,7 @@ def _gallery_html(metadata: Mapping[str, Any], clips: Sequence[Sequence[Record]]
         img.src = record.sources.gt;
         img.alt = `frame ${{record.frame_index}} thumbnail`;
         const label = document.createElement("span");
-        label.textContent = String(index).padStart(2, "0");
+        label.textContent = String(record.frame_index);
         button.appendChild(img);
         button.appendChild(label);
         els.filmstrip.appendChild(button);
