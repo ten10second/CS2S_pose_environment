@@ -45,6 +45,13 @@ def parse_args():
     parser.add_argument("--ddim-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--guidance-scale", type=float, default=7.5)
+    parser.add_argument(
+        "--uncond-cfg",
+        type=float,
+        default=0.0,
+        help="When >0, pass zeros as unconditional_conditioning and use this as the CFG scale "
+        "(requires a condition-dropout checkpoint).",
+    )
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--probes", default="normal", help="Comma-separated probes. Supported probes: normal,zero.")
@@ -545,6 +552,7 @@ def generate_prediction(
     eta,
     temperature,
     key_stats_max_tokens=256,
+    uncond_cfg=0.0,
 ):
     inputs = model.get_input(batch, "sat_map").cuda()
     outputs = model.get_input(batch, "grd_left_imgs").cuda()
@@ -614,6 +622,11 @@ def generate_prediction(
     torch.manual_seed(seed)
     x_t = torch.randn((cond_label.shape[0], 4, 16, 64), device=inputs.device)
     sampler = KITTI_DDIMSampler(model.DDPM, model.pre_AE_model, model.scale_factor)
+    if uncond_cfg > 0:
+        guidance_scale = uncond_cfg
+        unconditional_conditioning = torch.zeros_like(cond_label)
+    else:
+        unconditional_conditioning = None
     samples_ddim, _ = sampler.sample(
         S=ddim_steps,
         cond_sat=None,
@@ -623,7 +636,7 @@ def generate_prediction(
         shape=[4, 16, 64],
         verbose=False,
         unconditional_guidance_scale=guidance_scale,
-        unconditional_conditioning=None,
+        unconditional_conditioning=unconditional_conditioning,
         eta=eta,
         x_T=x_t,
         temperature=temperature,
@@ -740,6 +753,7 @@ def main():
                 eta=args.eta,
                 temperature=args.temperature,
                 key_stats_max_tokens=args.key_stats_max_tokens,
+                uncond_cfg=args.uncond_cfg,
             )
             pred_path = out_dir / "images" / probe / f"{safe_id}.png"
             save_tensor_image(pred[0], pred_path)
@@ -750,7 +764,8 @@ def main():
             }
             del pred
             torch.cuda.empty_cache()
-        panel_path = make_panel(out_dir, sample_id, image_paths, guidance_scale=args.guidance_scale)
+            panel_path = make_panel(out_dir, sample_id, image_paths,
+                                    guidance_scale=args.uncond_cfg if args.uncond_cfg > 0 else args.guidance_scale)
         records.append(
             {
                 "sample_id": sample_id,
