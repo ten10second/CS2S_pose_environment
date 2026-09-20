@@ -6,6 +6,7 @@ from tqdm import tqdm
 from functools import partial
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
+from ldm.modules.persistent_history import validate_history, repeat_history
 from torchvision import transforms
 from torch import nn
 import kornia.augmentation as K
@@ -31,6 +32,8 @@ def repeat_batch_conditioning(value, repeats=2):
         return None
     if torch.is_tensor(value):
         return torch.cat([value] * repeats)
+    if isinstance(value, (bool, int, float, str)):
+        return value
     if isinstance(value, dict):
         return {key: repeat_batch_conditioning(item, repeats=repeats) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -482,9 +485,15 @@ class KITTI_DDIMSampler(object):
                lidar_evidence=None,
                lidar_geometry_mask=None,
                cond_init_grd=None,
+               history=None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
         **kwargs
                ):
+        unknown = set(kwargs) - {"cond_sat", "cond_grd"}
+        if unknown:
+            raise TypeError("Unsupported sampling arguments: " + ", ".join(sorted(unknown)))
+        if history is not None and (mask is not None or txt is not None or orin_sat_feat is not None):
+            raise ValueError("persistent history cannot be combined with mask or optimization guidance")
         if txt is not None:
             self.ensure_clip_model()
             txt = self.clip_model.encode_text(
@@ -526,7 +535,8 @@ class KITTI_DDIMSampler(object):
                                                     lidar_context=lidar_context,
                                                     lidar_evidence=lidar_evidence,
                                                     lidar_geometry_mask=lidar_geometry_mask,
-                                                    cond_init_grd = cond_init_grd
+                                                    cond_init_grd = cond_init_grd,
+                                                    history=history
                                                     )
         return samples, intermediates
 
@@ -541,7 +551,8 @@ class KITTI_DDIMSampler(object):
                       lidar_context=None,
                       lidar_evidence=None,
                       lidar_geometry_mask=None,
-                      cond_init_grd=None):
+                      cond_init_grd=None,
+                      history=None):
         device = self.model.device
         b = shape[0]
         if x_T is None:
@@ -555,15 +566,37 @@ class KITTI_DDIMSampler(object):
             subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
             timesteps = self.ddim_timesteps[:subset_end]
 
-        intermediates = {'x_inter': [img], 'pred_x0': [img]}
-        time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
-        total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
-        print(f"Running DDIM Sampling with {total_steps} timesteps")
+        if ddim_use_original_steps:
+            full_steps = list(range(int(timesteps)))
+            index_of = {step: step for step in full_steps}
+        else:
+            full_steps = [int(t) for t in timesteps]
+            index_of = {step: idx for idx, step in enumerate(full_steps)}
+        step_order = list(reversed(full_steps))
 
-        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+        # Cache only raw history encoding for this sampling call. Never trust a
+        # cache from a prior call: RGB interventions and checkpoints can change.
+        reader = getattr(getattr(self.model, "denoise_model", None), "temporal_history", None)
+        if history is not None and getattr(reader, "mode", None) in {"static_adaptive", "static_centered"}:
+            history = {key: value for key, value in history.items() if key != "dense_features"}
+            validate_history(history, b)
+            if reader.training:
+                raise ValueError("adaptive history sampling requires an eval-mode adapter")
+            history["dense_features"] = reader.encode_history(history).detach()
+        validate_history(history, b)
+        if history is not None and (mask is not None or txt_embed is not None or orin_sat_feat is not None):
+            raise ValueError("persistent history cannot be combined with optimization guidance")
+        intermediates = {"x_inter": [img], "pred_x0": [img]}
+        if history is not None:
+            intermediates["history"] = {"mode": "persistent_condition", "steps": len(step_order)}
+
+        total_steps = len(step_order)
+        print(f"Running DDIM Sampling with {total_steps} timesteps")
+        iterator = tqdm(step_order, desc='DDIM Sampler', total=total_steps)
 
         for i, step in enumerate(iterator):
-            index = total_steps - i - 1
+            step = int(step)
+            index = index_of[step]
             ts = torch.full((b,), step, device=device, dtype=torch.long)
 
             if mask is not None:
@@ -582,7 +615,7 @@ class KITTI_DDIMSampler(object):
                                       lidar_context=lidar_context,
                                       lidar_evidence=lidar_evidence,
                                       lidar_geometry_mask=lidar_geometry_mask,
-                                      cond_init_grd = cond_init_grd)
+                                      cond_init_grd = cond_init_grd, history=history)
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -602,7 +635,7 @@ class KITTI_DDIMSampler(object):
                       lidar_context=None,
                       lidar_evidence=None,
                       lidar_geometry_mask=None,
-                      cond_init_grd=None):
+                      cond_init_grd=None, history=None):
         b, *_, device = *x.shape, x.device
 
         control_model = getattr(self.model, "control_grd", None)
@@ -623,7 +656,7 @@ class KITTI_DDIMSampler(object):
             unconditional_conditioning = zero_like_conditioning(c)
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.denoise_model(x, t, context = c, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
+            e_t = self.model.denoise_model(x, t, context = c, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, **({"history": history} if history is not None else {}))
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
@@ -652,7 +685,7 @@ class KITTI_DDIMSampler(object):
                     camera_k=left_camera_k_in,
                     image_size=tuple(cond_init_grd.shape[-2:]),
                 )
-            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, context = c_in, lidar_context=lidar_context_in, lidar_evidence=lidar_evidence_in, lidar_geometry_mask=lidar_geometry_mask_in, control_grd = control_grd_para, left_camera_k = left_camera_k_in, gt_shift_x = gt_shift_x_in, gt_shift_y = gt_shift_y_in, theta = theta_in).chunk(2)
+            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, context = c_in, lidar_context=lidar_context_in, lidar_evidence=lidar_evidence_in, lidar_geometry_mask=lidar_geometry_mask_in, control_grd = control_grd_para, left_camera_k = left_camera_k_in, gt_shift_x = gt_shift_x_in, gt_shift_y = gt_shift_y_in, theta = theta_in, **({"history": repeat_history(history)} if history is not None else {})).chunk(2)
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:
@@ -692,7 +725,7 @@ class KITTI_DDIMSampler(object):
                       lidar_context=None,
                       lidar_evidence=None,
                       lidar_geometry_mask=None,
-                      cond_init_grd=None):
+                      cond_init_grd=None, history=None):
         if index<=1:
             txt_embed = None
             orin_sat_feat = None
@@ -753,5 +786,5 @@ class KITTI_DDIMSampler(object):
                                     lidar_context=lidar_context,
                                     lidar_evidence=lidar_evidence,
                                     lidar_geometry_mask=lidar_geometry_mask,
-                                    cond_init_grd = cond_init_grd)
+                                    cond_init_grd = cond_init_grd, history=history)
             return x_prev, pred_x0
