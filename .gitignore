@@ -2,7 +2,8 @@ ckpt/
 results/
 result/KITTI.ckpt
 todo/
-dataset/
+/dataset/*
+!/dataset/KITTI_location/
 yolo*.pt
 third_party/**/*.pt
 third_party/**/*.pth
