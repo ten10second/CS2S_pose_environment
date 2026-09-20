@@ -4,7 +4,7 @@
 Read-only report generator for the A/B/C centered-history decoder probe.  It
 does not start training, load a model, or require GPU access.
 
-Expected runner contract from `tools/train_centered_decoder_probe.py`:
+Historical artifact contract (the centered training runner has been retired):
   run_root/
     A/eval_metrics.jsonl
     B/eval_metrics.jsonl

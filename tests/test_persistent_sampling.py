@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import torch
 
-from ldm.modules.persistent_history import repeat_history, validate_history
+from ldm.modules.temporal_condition import repeat_history, validate_history
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "models/KITTI_geo_ldm_diffusion/ddim_KITTI.py"
@@ -55,7 +55,7 @@ class SamplingTests(unittest.TestCase):
     def test_history_is_read_at_every_step_without_changing_initial_state(self):
         sampler = Sampler()
         noise = torch.randn(2, 4, 4, 8)
-        history = {"latent": torch.randn_like(noise)}
+        history = {"latent": torch.randn_like(noise), "masks": torch.cat([torch.ones(2,2,4,8),torch.zeros(2,1,4,8)],1)}
         _, info = sampler.sample(8, 2, [4, 4, 8], x_T=noise, history=history)
         calls = sampler.model.denoise_model.calls
         self.assertEqual([int(c[1][0]) for c in calls], [701, 601, 501, 401, 301, 201, 101, 1])
@@ -75,12 +75,12 @@ class SamplingTests(unittest.TestCase):
         sampler = Sampler()
         noise = torch.randn(2, 4, 4, 8)
         history = {"latent": torch.stack([torch.ones_like(noise[0]), torch.ones_like(noise[0]) * 7]),
-                   "enabled": torch.tensor([True, False])}
+                   "masks": torch.cat([torch.ones(2,2,4,8),torch.zeros(2,1,4,8)],1)}
         sampler.sample(8, 2, [4, 4, 8], x_T=noise, conditioning=torch.ones(2, 16, 12),
                        unconditional_guidance_scale=7.5, history=history)
         for _, _, read in sampler.model.denoise_model.calls:
             self.assertTrue(torch.equal(read["latent"], torch.cat([history["latent"]] * 2)))
-            self.assertEqual(read["enabled"].tolist(), [True, False, True, False])
+            self.assertTrue(torch.equal(read["masks"], torch.cat([history["masks"]]*2)))
 
     def test_legacy_midpoint_history_rejected(self):
         with self.assertRaises(ValueError):

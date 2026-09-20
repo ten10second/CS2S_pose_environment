@@ -1,3 +1,5 @@
+> 2026-09-20：此实验已停止，adaptive/centered A1 实现与训练入口已删除。以下为历史记录，命令不适用于当前代码。
+
 > 历史实验记录：以下配置、结论和命令对应当时版本，不是当前启动指南。
 > 当前方案见 [时序说明](temporal_history.md) 和 [全量 B/C 协议](temporal_full_bc.md)。
 > 部分旧实验脚本已退役，原源码保留于服务器 `CS2S_run_control/temporal_cleanup_commit_20260920/before_source.tar.gz`。

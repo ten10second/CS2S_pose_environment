@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from tools.train_static_history import (
+from tools.temporal_data import (
     IMAGE_SIZE,
     evaluation_device,
     index_dataset,
@@ -30,7 +30,7 @@ from tools.train_static_history import (
     sample_from_entry_dataset,
     validate_pair_splits,
 )
-from tools.train_temporal_pairs import encode_conditions, encode_latent, load_base, stack_samples
+from tools.temporal_data import encode_conditions, encode_latent, load_base, stack_samples
 
 
 REFERENCE_ALIASES = ("reference_npz", "reference", "reference_path", "path", "npz")

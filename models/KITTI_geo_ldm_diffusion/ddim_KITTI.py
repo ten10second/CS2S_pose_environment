@@ -6,7 +6,7 @@ from tqdm import tqdm
 from functools import partial
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
-from ldm.modules.persistent_history import validate_history, repeat_history
+from ldm.modules.temporal_condition import validate_history, repeat_history
 from torchvision import transforms
 from torch import nn
 import kornia.augmentation as K
@@ -492,8 +492,9 @@ class KITTI_DDIMSampler(object):
         unknown = set(kwargs) - {"cond_sat", "cond_grd"}
         if unknown:
             raise TypeError("Unsupported sampling arguments: " + ", ".join(sorted(unknown)))
+        validate_history(history, batch_size)
         if history is not None and (mask is not None or txt is not None or orin_sat_feat is not None):
-            raise ValueError("persistent history cannot be combined with mask or optimization guidance")
+            raise ValueError("temporal history cannot be combined with mask or optimization guidance")
         if txt is not None:
             self.ensure_clip_model()
             txt = self.clip_model.encode_text(
@@ -574,21 +575,12 @@ class KITTI_DDIMSampler(object):
             index_of = {step: idx for idx, step in enumerate(full_steps)}
         step_order = list(reversed(full_steps))
 
-        # Cache only raw history encoding for this sampling call. Never trust a
-        # cache from a prior call: RGB interventions and checkpoints can change.
-        reader = getattr(getattr(self.model, "denoise_model", None), "temporal_history", None)
-        if history is not None and getattr(reader, "mode", None) in {"static_adaptive", "static_centered"}:
-            history = {key: value for key, value in history.items() if key != "dense_features"}
-            validate_history(history, b)
-            if reader.training:
-                raise ValueError("adaptive history sampling requires an eval-mode adapter")
-            history["dense_features"] = reader.encode_history(history).detach()
         validate_history(history, b)
         if history is not None and (mask is not None or txt_embed is not None or orin_sat_feat is not None):
-            raise ValueError("persistent history cannot be combined with optimization guidance")
+            raise ValueError("temporal history cannot be combined with optimization guidance")
         intermediates = {"x_inter": [img], "pred_x0": [img]}
         if history is not None:
-            intermediates["history"] = {"mode": "persistent_condition", "steps": len(step_order)}
+            intermediates["history"] = {"mode": "input_concat", "steps": len(step_order)}
 
         total_steps = len(step_order)
         print(f"Running DDIM Sampling with {total_steps} timesteps")
@@ -656,7 +648,7 @@ class KITTI_DDIMSampler(object):
             unconditional_conditioning = zero_like_conditioning(c)
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.denoise_model(x, t, context = c, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, **({"history": history} if history is not None else {}))
+            e_t = self.model.denoise_model(x, t, context = c, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, control_grd = control_grd_para, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta, history=history)
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
@@ -685,7 +677,7 @@ class KITTI_DDIMSampler(object):
                     camera_k=left_camera_k_in,
                     image_size=tuple(cond_init_grd.shape[-2:]),
                 )
-            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, context = c_in, lidar_context=lidar_context_in, lidar_evidence=lidar_evidence_in, lidar_geometry_mask=lidar_geometry_mask_in, control_grd = control_grd_para, left_camera_k = left_camera_k_in, gt_shift_x = gt_shift_x_in, gt_shift_y = gt_shift_y_in, theta = theta_in, **({"history": repeat_history(history)} if history is not None else {})).chunk(2)
+            e_t_uncond, e_t = self.model.denoise_model(x_in, t_in, context = c_in, lidar_context=lidar_context_in, lidar_evidence=lidar_evidence_in, lidar_geometry_mask=lidar_geometry_mask_in, control_grd = control_grd_para, left_camera_k = left_camera_k_in, gt_shift_x = gt_shift_x_in, gt_shift_y = gt_shift_y_in, theta = theta_in, history=repeat_history(history)).chunk(2)
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:

@@ -20,7 +20,7 @@ from ldm.modules.diffusionmodules.util import (
 from ldm.modules.KITTI_attention import SpatialTransformer
 from models.KITTI_geo_ldm.lidar_pixel_depth import LidarPixelDepthHead
 from models.KITTI_geo_ldm.lidar_pixel_condition import LidarSpatialResidual
-from ldm.modules.persistent_history import PersistentHistoryReader
+from ldm.modules.temporal_condition import validate_history
 
 
 # dummy replace
@@ -504,6 +504,9 @@ class UNetModel(nn.Module):
 
         self.image_size = image_size
         self.in_channels = in_channels
+        self._single_frame_in_channels = int(in_channels)
+        self._history_extra_channels = 7
+        self.history_input_configured = False
         self.model_channels = model_channels
         self.out_channels = out_channels
         self.num_res_blocks = num_res_blocks
@@ -709,8 +712,6 @@ class UNetModel(nn.Module):
                 conv_nd(dims, middle_ch, 1, 3, padding=1),
             )
 
-        self.temporal_history = None
-        self._temporal_context_dim = context_dim[0] if isinstance(context_dim, list) else context_dim
         self.output_blocks = nn.ModuleList([])
         self.output_block_channels = []
         for level, mult in list(enumerate(channel_mult))[::-1]:
@@ -807,41 +808,57 @@ class UNetModel(nn.Module):
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
 
-    def configure_temporal_history(self, enabled=True, mode="geometry", hidden_dim=64, input_variant="types"):
+    def configure_history_input(self, enabled=True):
         """Opt in after loading the exact single-frame state dict."""
         if not enabled:
-            self.temporal_history = None
+            if self.history_input_configured:
+                raise ValueError("configured history input cannot be disabled in-place")
             return
-        if mode not in {"static_dense", "static_adaptive", "static_centered"} and input_variant != "types":
-            raise ValueError("input_variant is only supported for dense static history")
-        if self.temporal_history is not None:
-            current_variant = getattr(self.temporal_history, "input_variant", "types")
-            if (self.temporal_history.mode != mode or self.temporal_history.hidden_dim != hidden_dim
-                    or current_variant != input_variant):
-                raise ValueError("history is already configured with different settings")
+        first = self.input_blocks[0][0]
+        expected = self._single_frame_in_channels + self._history_extra_channels
+        if first.in_channels == expected:
+            self.history_input_configured = True
+            self.in_channels = expected
             return
-        index = len(self.output_blocks) - (self.num_res_blocks + 1)
-        reference = next(self.parameters())
-        if mode == "static":
-            from ldm.modules.static_history import StaticHistoryAdapter
-            reader = StaticHistoryAdapter(self.output_block_channels[index], hidden_dim)
-        elif mode == "static_dense":
-            from ldm.modules.static_history import DenseStaticHistoryAdapter
-            reader = DenseStaticHistoryAdapter(self.output_block_channels[index], hidden_dim, input_variant=input_variant)
-        elif mode == "static_adaptive":
-            from ldm.modules.static_history import AdaptiveStaticHistoryAdapter
-            reader = AdaptiveStaticHistoryAdapter(
-                self.output_block_channels[index], self.time_embed_dim, hidden_dim, input_variant=input_variant)
-        elif mode == "static_centered":
-            from ldm.modules.static_history import CenteredStaticHistoryAdapter
-            reader = CenteredStaticHistoryAdapter(
-                self.output_block_channels[index], self.time_embed_dim, hidden_dim, input_variant=input_variant)
-        else:
-            reader = PersistentHistoryReader(self.output_block_channels[index],
-                                             self._temporal_context_dim or self.model_channels,
-                                             self.in_channels, hidden_dim, mode)
-        self.temporal_history = reader.to(device=reference.device, dtype=reference.dtype)
-        self.temporal_history.train(self.training)
+        if first.in_channels != self._single_frame_in_channels:
+            raise ValueError("unexpected first convolution input channels for history expansion")
+        expanded = conv_nd(first.weight.ndim - 2, expected, first.out_channels,
+                           first.kernel_size, stride=first.stride, padding=first.padding,
+                           dilation=first.dilation, groups=first.groups,
+                           bias=first.bias is not None, padding_mode=first.padding_mode)
+        expanded = expanded.to(device=first.weight.device, dtype=first.weight.dtype)
+        with th.no_grad():
+            expanded.weight.zero_()
+            expanded.weight[:, :self._single_frame_in_channels].copy_(first.weight)
+            if first.bias is not None:
+                expanded.bias.copy_(first.bias)
+        self.input_blocks[0][0] = expanded
+        self.history_input_configured = True
+        self.in_channels = expected
+
+    def configure_temporal_history(self, *args, **kwargs):
+        raise RuntimeError("configure_temporal_history was retired; use configure_history_input() with history {'latent','masks'}")
+
+    def _history_augmented_input(self, x, history):
+        if not self.history_input_configured:
+            if history is not None:
+                raise ValueError("configure_history_input before supplying history")
+            return x
+        if x.shape[1] != self._single_frame_in_channels:
+            raise ValueError("configured history input expects current noisy latent with 4 channels")
+        if history is None:
+            return th.cat([x, x.new_zeros(x.shape[0], self._history_extra_channels, *x.shape[2:])], dim=1)
+        validate_history(history, x.shape[0])
+        latent = history["latent"]
+        masks = history["masks"]
+        if latent.device != x.device:
+            raise ValueError("history and current latent must be on the same device")
+        if latent.shape[2:] != x.shape[2:] or masks.shape[2:] != x.shape[2:]:
+            raise ValueError("history latent and masks must match current latent spatial resolution")
+        valid = (masks[:, :1] > 0).to(dtype=x.dtype)
+        latent = latent.to(dtype=x.dtype) * valid
+        masks = masks.to(dtype=x.dtype)
+        return th.cat([x, latent, masks], dim=1)
 
     def convert_to_fp16(self):
         """
@@ -871,8 +888,6 @@ class UNetModel(nn.Module):
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
-        if history is not None and self.temporal_history is None:
-            raise ValueError("configure_temporal_history before supplying history")
         hs = []
         spatial_context = None
         if self.lidar_spatial_channels:
@@ -891,7 +906,7 @@ class UNetModel(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        h = x.type(self.dtype)
+        h = self._history_augmented_input(x, history).type(self.dtype)
         spatial_level = 0
         for block_index, module in enumerate(self.input_blocks):
             h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
@@ -926,11 +941,6 @@ class UNetModel(nn.Module):
                 skip = add_control(skip)
             h = th.cat([h, skip], dim=1)
             h = module(h, emb, context, lidar_context=lidar_context, lidar_evidence=lidar_evidence, lidar_geometry_mask=lidar_geometry_mask, left_camera_k = left_camera_k, gt_shift_x = gt_shift_x, gt_shift_y = gt_shift_y, theta = theta)
-            if self.temporal_history is not None and block_index == len(self.output_blocks) - (self.num_res_blocks + 1):
-                if getattr(self.temporal_history, "mode", None) in {"static_adaptive", "static_centered"}:
-                    h = self.temporal_history(h, context, history, temb=emb)
-                else:
-                    h = self.temporal_history(h, context, history)
         h = h.type(x.dtype)
         if self.lidar_depth_head_mode == "pixel":
             lidar_depth_logits = self.lidar_pixel_depth_head(h.float())
